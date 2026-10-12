@@ -193,6 +193,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     state_dir = Path(args.state_dir) if args.state_dir else (
         settings.state_path / "fast" if args.fast else settings.state_path)
     if args.fresh and state_dir.exists():
+        prof = Journal(state_dir, RealClock()).load_json(PROFILE_FILE, None)
+        if any(state_dir.iterdir()) and not (isinstance(prof, dict) and prof.get("clock") == "sim"):
+            print(f"--fresh sólo borra estados de simulaciones --fast y {state_dir} no lo es; bórralo a mano si "
+                  "de verdad quieres empezar de cero.", file=sys.stderr)
+            return 2
         shutil.rmtree(state_dir)
     settings.state_dir = str(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -249,11 +254,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 out(f"» {text}\n{desk.submit(text, source='consola')}")
         threading.Thread(target=console, name="consola", daemon=True).start()
 
-    desk.run_forever(args.cycles, before_cycle=before_cycle)
-    if args.fast:
-        data = journal.load_json(PROFILE_FILE, {}) or {}
-        data["clock_ts"] = clock.now()
-        journal.save_json(PROFILE_FILE, data)
+    try:
+        desk.run_forever(args.cycles, before_cycle=before_cycle)
+    finally:
+        if args.fast:                        # la próxima simulación continúa desde aquí
+            data = journal.load_json(PROFILE_FILE, {}) or {}
+            data["clock_ts"] = clock.now()
+            journal.save_json(PROFILE_FILE, data)
     out(desk.summary())
     return 0
 

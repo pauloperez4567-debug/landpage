@@ -620,6 +620,12 @@ def test_cli_rejects_fast_with_live_data(tmp_path, restore_logging, capsys):
                  "--env-file", str(tmp_path / "no.env")]) == 2
     assert main(["run", "--fresh", "--data", "sim", "--state-dir", str(tmp_path),
                  "--env-file", str(tmp_path / "no.env")]) == 2
+    keep = tmp_path / "importante"
+    keep.mkdir()
+    (keep / "notas.txt").write_text("no borrar", encoding="utf-8")
+    assert main(["run", "--fresh", "--fast", "--data", "sim", "--state-dir", str(keep), "--cycles", "1",
+                 "--no-input", "--env-file", str(tmp_path / "no.env")]) == 2
+    assert (keep / "notas.txt").exists()                     # --fresh no borra lo que no es una simulación
 
 
 def test_env_example_documents_every_setting_with_defaults():
