@@ -40,7 +40,7 @@ from typing import Any, Callable, Optional
 from .clock import Clock
 from .commands import HELP_TEXT, CommandParser, describe
 from .config import TUNABLE, Settings
-from .engine import EXIT_LABELS, PENDING, ClosedTrade, ExecutionEngine, fmt_px, fmt_size, fmt_usd
+from .engine import PENDING, ClosedTrade, ExecutionEngine, fmt_px, fmt_size, fmt_usd
 from .exchange.base import Broker, BrokerError, MarketData, MarketDataError, round_price
 from .exchange.intervals import interval_seconds
 from .journal import Journal
@@ -48,7 +48,7 @@ from .liquidity import LiquidityScanner
 from .models import (AccountState, Command, CommandAction, EntryMode, OrderStatus, RiskDecision, Side, Signal,
                      TradeIntent)
 from .risk import (EVENT_COOLDOWN_END, EVENT_COOLDOWN_START, EVENT_FLATTEN, EVENT_HALT_DAILY, EVENT_HALT_DRAWDOWN,
-                   EVENT_HALT_LIFTED, EVENT_NEW_DAY, HALT_DRAWDOWN, RiskManager)
+                   EVENT_HALT_LIFTED, EVENT_NEW_DAY, RiskManager)
 from .strategy import Strategy, build_strategies
 
 log = logging.getLogger(__name__)

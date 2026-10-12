@@ -17,7 +17,6 @@ from typing import Optional
 
 import pytest
 
-from desk.clock import SimClock
 from desk.commands import CommandParser
 from desk.config import load_settings
 from desk.desk import MAX_BACKOFF_S, TradingDesk
@@ -432,7 +431,7 @@ def test_set_stop_by_percent_and_validation(settings, market, clock):
 
 # --------------------------------------------------------------------------- operativa automática
 def test_auto_opens_on_signal_and_leaves_command_positions_alone(settings, market, clock):
-    settings.symbols = ["SOL", "HYPE"]
+    settings.symbols = ["SOL", "HYPE", "ETH"]
     out = Out()
     stub = StubStrategy(settings, clock, plan={"SOL": LONG, "HYPE": SHORT})
     desk = make_desk(settings, market, clock, strategies=[stub], auto=True, out=out)
@@ -445,11 +444,14 @@ def test_auto_opens_on_signal_and_leaves_command_positions_alone(settings, marke
     assert "HYPE" not in stub.calls                        # ni siquiera se evalúa
     assert "AUTO [stub] SOL LONG" in out.text and "Motivo: señal de prueba" in out.text
     assert tags(desk.broker, "SOL") == ["sl", "tp"]
-    # Una sola evaluación por vela: el siguiente minuto no repite.
-    n = len(stub.calls)
+    # Una sola evaluación por vela cerrada: ETH (sin señal) no se re-evalúa hasta la vela siguiente.
+    assert stub.calls.count("ETH") == 1
     clock.advance(60)
     desk.run_cycle()
-    assert len(stub.calls) == n
+    assert stub.calls.count("ETH") == 1
+    clock.advance(15 * 60)
+    desk.run_cycle()
+    assert stub.calls.count("ETH") == 2 and "ETH" not in desk.broker.account().positions
 
 
 def test_auto_respects_pause_and_auto_off(settings, market, clock):

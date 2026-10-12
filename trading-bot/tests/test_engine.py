@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
-from typing import Optional
-
 import pytest
 
 from desk.engine import CLOSING, OPEN, PENDING, PLACE_GRACE_S, ExecutionEngine, fmt_px, fmt_usd
@@ -289,6 +287,18 @@ def test_partial_exit_does_not_close_bracket(rengine, rec):
     closed = rengine.on_fills([rec.fill(sl_id, 7.72, 84.0, realized=-9.0, fee=0.3)])
     assert len(closed) == 1 and closed[0].exit_reason == "sl"
     assert closed[0].gross_pnl == pytest.approx(-14.0) and closed[0].pnl == pytest.approx(-14.3)
+
+
+def test_oco_cancels_sibling_explicitly(rengine, rec):
+    # A diferencia de paper, este broker NO barre las reduce-only al quedar plano: el OCO es del motor.
+    order = rengine.open(hype_intent(), hype_decision())
+    rengine.on_fills([rec.fill(order.id, 11.72, 85.288)])
+    br = rengine.brackets["HYPE"]
+    sl_id, tp_id = br.sl_order_id, br.tp_order_id
+    closed = rengine.on_fills([rec.fill(tp_id, 11.72, 87.846, realized=29.98, fee=0.46)])
+    assert closed[0].exit_reason == "tp" and closed[0].pnl == pytest.approx(29.52)
+    assert rec.orders[sl_id].status is OrderStatus.CANCELED and ("cancel", tp_id) not in rec.calls
+    assert rec.open_orders() == []
 
 
 def test_stop_out_with_partial_entry_cancels_rest_of_entry(rengine, rec):
