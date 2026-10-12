@@ -133,6 +133,8 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   (SET_PARAM con nombre canónico de `PARAM_ALIASES`), `si`/`confirmar`/`yes`/`confirm`, `no`/`cancelar`/`reject`,
   `ayuda`/`help`.
 - Monedas: mayúsculas; acepta prefijos HIP-3 tipo `xyz:GOLD`.
+- `SET_SL`/`SET_TP` llevan `price` (precio absoluto) **o** `sl_pct`/`tp_pct` (`sl HYPE 2%`: distancia desde la
+  entrada; la mesa lo convierte a precio). Sin moneda (`sl 2%`, `tp 3`) son `SET_PARAM` de los valores por defecto.
 - Fallback IA (`LLMCommandInterpreter`): sólo si la regex no entiende, `settings.llm_enabled` y el SDK
   `anthropic` + credenciales están disponibles. Modelo `settings.llm_model` (por defecto `claude-opus-5-5`),
   esfuerzo bajo, salida estructurada JSON (`output_config.format` json_schema) que mapea a `Command`,
@@ -156,35 +158,74 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   Tamaño redondeado con `round_size`. Las órdenes de reducción/cierre nunca pasan por aquí (siempre permitidas).
 
 ### `desk/engine.py` — `ExecutionEngine`
-- `ExecutionEngine(broker, market, settings, clock, journal)`; estado persistible de brackets.
-- `open(intent, decision) -> Order`: fija apalancamiento, coloca entrada (ZONE/LIMIT → LIMIT Gtc en
-  `decision.entry_px`; MARKET → MARKET), registra bracket pendiente {coin, sl, tp, origin, expires_ts}.
-- `on_fills(fills)`: cuando la entrada se ejecuta (total o parcial) coloca/ajusta STOP y TAKE_PROFIT
-  reduce-only por el tamaño de la posición; cuando se ejecuta SL o TP cancela el otro (OCO) y devuelve el
-  PnL realizado para `RiskManager.record_trade_result`.
-- `reconcile(account)`: caduca entradas no ejecutadas (`entry_ttl_minutes`), cancela órdenes reduce-only
-  huérfanas si la posición está plana, re-coloca SL/TP que falten en posiciones abiertas, adopta
-  posiciones sin bracket (p. ej. tras reinicio) poniéndoles SL por defecto.
-- `close(coin)`, `close_all()`, `set_stop(coin, px)`, `set_take_profit(coin, px)`, `cancel(coin|None)`.
+- `ExecutionEngine(broker, market, settings, clock, journal=None, *, load=True)`; estado persistible de brackets
+  (`journal.save_json("engine")`, se recarga al construir; un fichero ilegible se aparta y se ignora).
+- Un `Bracket` por moneda: `PENDING` (entrada enviada) → `OPEN` (posición con SL/TP) → `CLOSING` (cierre enviado)
+  → `ClosedTrade` (coin, side, origin, size, entry_px, exit_px, `pnl` neto = realizado − comisiones, gross_pnl,
+  fees, exit_reason `sl|tp|close|close_all|flatten|kill|no_sl|liquidation|external`, opened_ts, closed_ts).
+- `open(intent, decision, *, cmd_id="") -> Order`: fija apalancamiento (un `ValueError` del broker → orden
+  `REJECTED` local), coloca entrada (ZONE/LIMIT → LIMIT Gtc en `decision.entry_px`; MARKET → MARKET con peor
+  precio `entry_px ± market_slippage_bps`), registra bracket pendiente {coin, sl, tp, origin, expires_ts (sólo
+  límites, `entry_ttl_minutes`)}. Rechaza si ya hay un bracket en la moneda.
+- `on_fills(fills) -> list[ClosedTrade]`: identifica cada fill por id de orden (entrada/SL/TP/cierre) y, si no,
+  por etiqueta y dirección. Entrada (total o parcial) → coloca/ajusta STOP y TAKE_PROFIT reduce-only por el tamaño
+  abierto (la orden nueva antes de cancelar la vieja). Posición plana tras SL/TP/cierre → cancela la otra (OCO) y
+  el resto de entrada, escribe `trades.csv` y devuelve la operación (la mesa pasa `pnl` a
+  `RiskManager.record_trade_result`). Fills sin bracket → aviso y diario.
+- `reconcile(account) -> list[ClosedTrade]`: caduca entradas no ejecutadas; descarta entradas que desaparecen del
+  exchange (2 comprobaciones); da por abierta una entrada cuya posición aparece sin fill; cierra brackets cuya
+  posición desapareció (2 comprobaciones, `external`); re-coloca SL/TP que falten (con 5 s de gracia tras colocar);
+  cierra la posición si el SL se rechaza 3 veces; adopta posiciones sin bracket (origen `adopted`, reutiliza
+  STOP/TP reduce-only existentes o pone SL `default_sl_pct`); cancela reduce-only huérfanas sin posición.
+- `close(coin, reason="close", *, account=None) -> Order|None`, `close_all(reason="close_all") -> list[Order]`,
+  `set_stop(coin, px) -> str`, `set_take_profit(coin, px) -> str` (`ValueError` con el motivo si el nivel queda del
+  lado equivocado o no hay posición/entrada; sobre una entrada pendiente sólo cambia el nivel), `cancel(coin|None)
+  -> int` (sólo órdenes de entrada: los SL/TP de posiciones abiertas se mantienen), `reference_px(coin)`.
+- Mensajes legibles para el operador en `messages` / `pop_messages()`. Formato: `fmt_px`, `fmt_usd`, `fmt_size`.
 
 ### `desk/journal.py` — `Journal`
-- `Journal(state_dir)`: `event(kind, **data)` → `events.jsonl`; `fill(fill)` → `fills.csv`;
-  `equity(ts, equity)` → `equity.csv`; `save_json(name, obj)`/`load_json(name, default)` atómicos;
-  `outbox(cmd_id, text)` → `outbox.log` (respuestas a comandos).
+- `Journal(state_dir, clock=None)`: `event(kind, /, **data)` → `events.jsonl`; `fill(fill)` → `fills.csv`;
+  `trade(record)` → `trades.csv`; `equity(ts, equity, available=None, positions=None)` → `equity.csv`;
+  `save_json(name, obj)`/`load_json(name, default)` atómicos (tmp + fsync + rename; ilegible → `*.corrupt-<ts>`);
+  `outbox(cmd_id, text)` → `outbox.log`, un renglón por línea: `<fecha hora> [<id>] <texto>` (avisos: id `desk`);
+  `touch(name, text)`; `inbox_path`/`outbox_path`. `read_outbox(path, cmd_id, offset) -> (líneas, offset)`.
+- Añadir a un diario nunca lanza (error de disco → log); `save_json` sí lanza `OSError`.
 
 ### `desk/desk.py` — `TradingDesk`
-- `TradingDesk(settings, market, broker, clock, parser=None, journal=None)`; `run_forever()` y `run_cycle()`.
+- `TradingDesk(settings, market, broker, clock, parser=None, journal=None, *, strategies=None, scanner=None,
+  risk=None, engine=None, out=None)`; `run_forever(max_cycles=None, *, install_signals=True, before_cycle=None)
+  -> int` y `run_cycle() -> bool` (False si alguna etapa falló).
 - Ciclo (cada `loop_seconds`): leer comandos (cola en memoria + `state/inbox.txt` con offset persistido) →
   `broker.step()` → `poll_fills` → `engine.on_fills` → `account` → `risk.update` (halt/flatten) →
   `engine.reconcile` → cada `strategy_seconds`, si auto y no pausado/halted/cooldown: estrategias por
   símbolo → intents → riesgo → engine → guardar estado → línea de estado cada `status_every_seconds`.
-- Cada etapa en su propio try/except; fallos consecutivos → backoff exponencial (máx. 300 s); nunca muere.
-- `submit(text) -> str` (respuesta legible) para comandos interactivos; comandos de IA que abren
-  operaciones quedan pendientes de `confirmar` si `llm_confirm_trades`.
-- Las posiciones abiertas por comando (origen "command") no las toca la operativa automática.
-- SIGINT/SIGTERM → guardar estado y salir limpio (las órdenes SL/TP quedan en el exchange).
+- Cada etapa en su propio try/except; fallos en ciclos consecutivos → espera `loop_seconds·2^n` (máx. 300 s);
+  nunca muere. Tras abrir (comando o señal) se sincronizan los fills al momento: una entrada a mercado queda
+  protegida con SL/TP sin esperar al siguiente ciclo.
+- `submit(text, source="consola", cmd_id=None) -> str` (respuesta legible, también a `outbox.log` con el id),
+  `enqueue(text, cmd_id=None) -> id`. Inbox: offset guardado antes de ejecutar (como mucho una vez); líneas
+  `[id] texto` usan ese id; líneas a medio escribir esperan al salto de línea; `#` = comentario.
+- Comandos de IA (`source="llm"`) que no sean de sólo lectura/freno (estado, ayuda, pausa, auto off) quedan
+  pendientes de `si`/`no` 5 min si `llm_confirm_trades`.
+- `SET_SL`/`SET_TP` con `%` se convierten a precio desde la entrada de la posición (o de la entrada pendiente).
+- `SET_PARAM` y `auto on/off` se guardan en `desk.json` y se restauran al arrancar (`DESK_AUTO=false`/`--no-auto`
+  siempre arrancan en OFF).
+- KILL = `risk.halt("kill", flatten=True)` + cancelar entradas + `close_all("kill")`. Halts → cancelar entradas
+  pendientes; evento "flatten" → `close_all("flatten")` (se repite cada ciclo mientras quede exposición).
+- La operativa automática evalúa cada estrategia una vez por vela (por moneda) y sólo en símbolos sin posición,
+  sin entrada pendiente y sin bracket: las posiciones abiertas por comando (origen "command") no las toca.
+- `status_line()` (`equity | PnL día | posiciones | auto ON/OFF | halt`), `status_report()`, `summary()`,
+  `request_stop()`, `next_delay()`. Estado: `desk.json`, `risk.json`, `engine.json`, `status.json`, `heartbeat`.
+- SIGINT/SIGTERM → guardar estado y salir limpio (las órdenes SL/TP quedan en el exchange); segunda señal fuerza.
 
 ### `desk/__main__.py` — CLI
-- `python -m desk run [--mode paper|live] [--data hyperliquid|sim|replay:x.csv] [--symbols ...] [--no-auto] [--fast]`
-- `python -m desk send "long HYPE"` (añade al inbox y espera la respuesta en `outbox.log`)
-- `python -m desk status` (lee el estado guardado).
+- `python -m desk run [--mode paper|live] [--data hyperliquid|sim|replay:x.csv] [--symbols ...] [--no-auto]
+  [--fast] [--fresh] [--cycles N] [--loop-seconds S] [--cmd "N:texto"] [--state-dir DIR] [--no-input] [-v]`
+  - `--fast`: `SimClock` (sólo datos sim/replay); estado en `<state_dir>/fast`, continúa la simulación anterior
+    (`profile.json` guarda `clock_ts`) salvo `--fresh`.
+  - `profile.json` guarda modo/datos/reloj del estado: arrancar con otra configuración sobre el mismo estado se
+    rechaza (no mezclar posiciones paper de sim con datos reales, ni paper con live).
+  - Consola interactiva si stdin es un terminal (`salir` detiene la mesa).
+- `python -m desk send "long HYPE" [--timeout 30] [--no-wait] [--fast|--state-dir]` (añade `[cli-xxxx] texto` al
+  inbox y espera la respuesta con ese id en `outbox.log`).
+- `python -m desk status [--fast|--state-dir]` (lee `status.json` y la edad del `heartbeat`).
