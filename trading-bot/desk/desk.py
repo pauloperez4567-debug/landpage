@@ -193,7 +193,10 @@ class TradingDesk:
             reply = f"Error inesperado ejecutando '{text}': {type(e).__name__}: {e}"
         self.journal.outbox(cmd_id, reply)
         self.journal.event("reply", id=cmd_id, text=reply)
-        self._save_desk_state()
+        try:
+            self._save_desk_state()
+        except OSError as e:
+            log.error("no se pudo guardar el estado de la mesa: %s", e)
         return reply
 
     def _parse(self, text: str) -> Optional[Command]:
@@ -541,6 +544,7 @@ class TradingDesk:
         if end < 0:
             return []                            # línea a medio escribir: se espera al salto de línea
         chunk = data[:end + 1]
+        previous = self.inbox_offset
         self.inbox_offset += len(chunk)
         # Offset guardado ANTES de ejecutar: un comando del inbox se ejecuta como mucho una vez.
         out: list[tuple[str, str, str]] = []
@@ -551,7 +555,11 @@ class TradingDesk:
             m = INBOX_ID_RE.match(line)
             cid, text = (m.group(1), m.group(2).strip()) if m else (self._next_id(), line)
             out.append((cid, text, "inbox"))
-        self._save_desk_state()
+        try:
+            self._save_desk_state()
+        except OSError:
+            self.inbox_offset = previous          # sin offset guardado no se ejecuta: se reintenta luego
+            raise
         return out
 
     def _sync_fills(self, target: Optional[list[str]] = None) -> list[ClosedTrade]:
@@ -646,7 +654,7 @@ class TradingDesk:
         busy = {c for c, p in account.positions.items() if p.size != 0}
         busy |= {o.coin for o in account.open_orders if o.is_open and not o.reduce_only}
         busy |= set(self.engine.brackets)
-        if len({c for c in busy}) >= self.settings.max_open_positions:
+        if len(busy) >= self.settings.max_open_positions:
             return
         for coin in self.settings.symbols:
             if coin in busy:
