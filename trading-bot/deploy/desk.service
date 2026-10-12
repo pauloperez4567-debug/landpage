@@ -1,0 +1,36 @@
+# Unidad systemd para correr la mesa 24/7 y reiniciarla si se cae o se reinicia la máquina.
+#
+# Instalación (como root), suponiendo el código en /opt/trading-bot y un venv en /opt/trading-bot/venv:
+#   useradd --system --home /opt/trading-bot desk && chown -R desk:desk /opt/trading-bot
+#   cp deploy/desk.service /etc/systemd/system/desk.service
+#   systemctl daemon-reload && systemctl enable --now desk
+#   journalctl -u desk -f                          # ver la salida en vivo
+#   sudo -u desk /opt/trading-bot/venv/bin/python -m desk send "estado"   (desde /opt/trading-bot)
+[Unit]
+Description=Mesa de trading automatizada (desk) 24/7
+Wants=network-online.target
+After=network-online.target
+# Sin límite de reintentos: si la red cae, systemd sigue intentándolo.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=desk
+Group=desk
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/opt/trading-bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trading-bot/venv/bin/python -m desk run --no-input
+# SIGTERM -> termina el ciclo en curso, guarda el estado y sale (los SL/TP quedan en el exchange).
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=always
+RestartSec=10
+# Endurecimiento básico
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/trading-bot/state
+
+[Install]
+WantedBy=multi-user.target
