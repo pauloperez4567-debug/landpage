@@ -106,6 +106,7 @@ class TradingDesk:
         self._last_strategy_ts = -math.inf
         self._last_status_ts = -math.inf
         self._last_equity_ts = -math.inf
+        self._last_broker_save_ts = -math.inf
         self._bar_seen: dict[tuple[str, str], float] = {}
         self._coin_errors: dict[str, str] = {}
         self.pending: Optional[tuple[Command, float]] = None   # comando IA pendiente de confirmar
@@ -858,14 +859,20 @@ class TradingDesk:
     def _save_desk_state(self) -> None:
         self._save_if_changed(STATE_NAME, self._desk_state())
 
-    def save_state(self) -> None:
-        """Guarda mesa, riesgo, motor y broker (sólo lo que cambió)."""
+    def save_state(self, force: bool = False) -> None:
+        """Guarda mesa, riesgo, motor y broker (sólo lo que cambió).
+
+        El broker paper ya guarda solo en cada cambio (``autosave``); aquí sólo se le pide al detener la mesa
+        (``force``) o, si no tiene autosave, como mucho una vez por minuto."""
         self._save_desk_state()
         risk = self.risk.to_dict()
         # last_equity cambia en cada ciclo; sólo provoca escritura junto a otro cambio.
         self._save_if_changed(RISK_STATE_NAME, risk, {k: v for k, v in risk.items() if k != "last_equity"})
         self.engine.save_state()
-        self.broker.save_state()
+        now = self.clock.now()
+        if force or (not getattr(self.broker, "autosave", False) and now - self._last_broker_save_ts >= 60.0):
+            self._last_broker_save_ts = now
+            self.broker.save_state()
 
     # ================================================================== bucle 24/7
     def request_stop(self) -> None:
@@ -943,7 +950,7 @@ class TradingDesk:
 
     def shutdown(self) -> None:
         with self._lock:
-            for what, fn in (("estado", self.save_state), ("snapshot", self.write_status_snapshot)):
+            for what, fn in (("estado", lambda: self.save_state(force=True)), ("snapshot", self.write_status_snapshot)):
                 try:
                     fn()
                 except Exception as e:  # noqa: BLE001
