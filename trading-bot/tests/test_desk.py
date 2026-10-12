@@ -613,6 +613,11 @@ def test_cli_fast_sim_run_send_and_status(tmp_path, capsys, restore_logging):
     with pytest.raises(SystemExit, match="otra configuración"):
         main(["run", "--data", "sim", "--state-dir", str(state), "--env-file", env, "--no-input", "--cycles", "1"])
 
+    assert main(["run", "--data", "sim", "--fast", "--fresh", "--cycles", "1", "--state-dir", str(state),
+                 "--env-file", env, "--no-input", "--no-auto"]) == 0
+    assert not (state / "trades.csv").exists() and not (state / "inbox.txt").exists()
+    assert json.loads((state / "profile.json").read_text(encoding="utf-8"))["clock_ts"] == 1_767_225_600
+
 
 def test_cli_rejects_fast_with_live_data(tmp_path, restore_logging, capsys):
     from desk.__main__ import main
