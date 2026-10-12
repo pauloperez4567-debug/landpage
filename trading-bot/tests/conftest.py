@@ -98,7 +98,10 @@ class FakeMarketData(MarketData):
 
     def candles(self, coin: str, interval: str, limit: int) -> pd.DataFrame:
         self._maybe_fail()
-        df = self._candles.get((coin, interval)) or self._candles.get((coin, "*"))
+        # ``df1 or df2`` no vale con DataFrames (su valor de verdad es ambiguo).
+        df = self._candles.get((coin, interval))
+        if df is None:
+            df = self._candles.get((coin, "*"))
         if df is None:
             df = make_candles(mid=self.mid(coin), n=max(limit, 50), interval=interval,
                               end_ts=self.clock.now())
