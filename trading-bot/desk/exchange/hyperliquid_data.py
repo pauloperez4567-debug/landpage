@@ -47,10 +47,16 @@ class HttpStatusError(MarketDataError):
         self.status = status
 
 
+def utc_index(values: Any, unit: str) -> pd.DatetimeIndex:
+    """Índice UTC desde marcas epoch. Siempre en nanosegundos: pandas >= 3 conserva la unidad de
+    entrada (s / ms) y mezclar unidades entre fuentes de velas rompe comparaciones y ``asi8``."""
+    return pd.DatetimeIndex(pd.to_datetime(values, unit=unit, utc=True)).as_unit("ns")
+
+
 def empty_candles() -> pd.DataFrame:
     """DataFrame de velas vacío con el formato del contrato."""
     return pd.DataFrame({c: pd.Series(dtype=float) for c in CANDLE_COLUMNS},
-                        index=pd.DatetimeIndex([], tz="UTC"))
+                        index=pd.DatetimeIndex([], tz="UTC").as_unit("ns"))
 
 
 class HyperliquidMarketData(MarketData):
@@ -248,7 +254,7 @@ class HyperliquidMarketData(MarketData):
                     for name, k in (("open", "o"), ("high", "h"), ("low", "l"), ("close", "c"), ("volume", "v"))}
         except (KeyError, TypeError, ValueError) as e:
             raise MarketDataError(f"candleSnapshot {coin}: vela malformada ({e})") from e
-        df = pd.DataFrame(cols, index=pd.to_datetime(ts, unit="ms", utc=True))[CANDLE_COLUMNS]
+        df = pd.DataFrame(cols, index=utc_index(ts, "ms"))[CANDLE_COLUMNS]
         df = df[~df.index.duplicated(keep="last")].sort_index()
         self._last_ts[coin] = now
         return df.tail(limit)
