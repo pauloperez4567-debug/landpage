@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.26
+requests>=2.31
+python-dotenv>=1.0
+# Opcional: modo live en Hyperliquid
+hyperliquid-python-sdk>=0.9
+eth-account>=0.10
+# Opcional: interpretar comandos en lenguaje libre con Claude
+anthropic>=1.0
+# Tests
+pytest>=8.0
