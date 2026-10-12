@@ -620,3 +620,17 @@ def test_cli_rejects_fast_with_live_data(tmp_path, restore_logging, capsys):
                  "--env-file", str(tmp_path / "no.env")]) == 2
     assert main(["run", "--fresh", "--data", "sim", "--state-dir", str(tmp_path),
                  "--env-file", str(tmp_path / "no.env")]) == 2
+
+
+def test_env_example_documents_every_setting_with_defaults():
+    from pathlib import Path
+
+    from dotenv import dotenv_values
+
+    from desk.config import _ENV_MAP, Settings
+    path = Path(__file__).resolve().parents[1] / ".env.example"
+    env = {k: v for k, v in dotenv_values(path).items() if v is not None}
+    assert [k for k in _ENV_MAP if k not in env] == []
+    loaded = load_settings(env=env, dotenv_path=None)
+    defaults = Settings()
+    assert {k: getattr(loaded, k) for k in vars(defaults)} == vars(defaults)
