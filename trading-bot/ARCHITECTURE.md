@@ -87,14 +87,20 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 ### `desk/liquidity.py`
 - Funciones puras + un envoltorio:
   - `book_levels(book) -> list[(px, usd)]`
-  - `liq_levels(levels) -> list[(px, usd)]`
+  - `liq_levels(levels, side=None) -> list[(px, usd)]` (con `side`, sólo liquidaciones de posiciones de
+    ese lado: longs → zonas LONG, shorts → zonas SHORT; los niveles sin lado se conservan)
   - `find_zone(coin, side, mid, book_pts, liq_pts, settings) -> Zone|None`: agrupa en tramos de
     `zone_width_pct` del precio; sólo del lado correcto (LONG: por debajo del mid; SHORT: por encima);
     descarta lo que esté a menos de `zone_min_distance_pct` o más de `zone_max_distance_pct`;
     puntuación = `zone_book_weight`·usd_libro + `zone_liq_weight`·usd_liq; devuelve el tramo de mayor
     puntuación con `source` "book"/"liq"/"mixed" y `distance_pct`.
-  - `LiquidityScanner(market, settings).zone(coin, side) -> Zone|None` (usa `l2_book(coin, n_sig_figs=3)`
-    + `liquidation_levels(coin)`; captura `MarketDataError` → None).
+    Tramos anclados en el mid: el tramo j cubre distancias [j·ancho, (j+1)·ancho) del lado que toca (ninguna
+    zona contiene el precio). El filtro de distancia se aplica a cada punto y al centro del tramo (la entrada).
+    Empate de puntuación → gana el tramo más cercano. Fuente con peso ≤ 0 → ignorada.
+  - `LiquidityScanner(market, settings, n_sig_figs=3).zone(coin, side) -> Zone|None` y
+    `.zones(coin) -> dict[Side, Zone|None]` (ambos lados con una sola lectura; es lo que piden las
+    estrategias). Usa `l2_book(coin, n_sig_figs=3)` + `liquidation_levels(coin)`; `MarketDataError` en
+    precio/libro → None; si sólo fallan las liquidaciones, sigue con el libro.
 
 ### `desk/strategy.py`
 - `Strategy` (ABC): `name`, `interval`, `lookback`, `evaluate(coin, candles, mid, zones: dict[Side, Zone|None]) -> Signal|None`.
@@ -104,8 +110,15 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 - `SqueezeBreakoutStrategy` (1h): fin de squeeze (BB dentro de Keltner) en la vela anterior y no en la
   actual, ADX(14) > 25, cierre fuera de Bollinger → entrada MARKET en dirección de la ruptura, SL a
   1.5·ATR, TP a `default_tp_r` R.
-- `build_strategies(settings) -> list[Strategy]` según `settings.strategies`.
-- Sólo señales sobre velas cerradas (ignorar la vela en curso).
+- `build_strategies(settings, clock=None) -> list[Strategy]` según `settings.strategies` (sin duplicados;
+  nombre desconocido → `ValueError`). Registro en `STRATEGIES`. Constructor: `Strategy(settings, clock=None)`.
+- Sólo señales sobre velas cerradas: la mesa pasa las velas tal cual las da `MarketData.candles` y
+  `evaluate(..., now=None)` decide con `closed_candles(candles, interval, now)`: con hora conocida (`now` o el
+  `clock` del constructor) descarta la última si `apertura + duración > now`; sin hora asume que la última
+  está en curso (Hyperliquid siempre la incluye) y la descarta. **Recomendado: `build_strategies(settings,
+  clock)`.** Con hora conocida, si la última cerrada tiene más de una vela + 120 s de retraso → sin señal.
+- Como mucho una señal por moneda y vela cerrada (la mesa evalúa cada `strategy_seconds`).
+- `lookback` = velas a pedir (incluida la posible vela en curso); `min_bars` = velas cerradas mínimas.
 
 ### `desk/commands.py`
 - `parse(text, settings, llm=None) -> Command | None` y `CommandParser` con fallback IA.
