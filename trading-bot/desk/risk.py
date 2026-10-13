@@ -18,7 +18,12 @@ Estados que bloquean entradas nuevas:
 
 ``update()`` devuelve eventos (cadenas, ver ``EVENT_*``). Mientras un halt pida cierre, cada ``update()``
 repite "flatten" si queda exposición (posiciones u órdenes de entrada): si un cierre falla, el siguiente
-ciclo lo reintenta; una entrada que se ejecute tarde también se cierra.
+ciclo lo reintenta; una entrada que se ejecute tarde también se cierra. ``evaluate()`` comprueba además los
+límites de pérdida diaria y drawdown con la cuenta que recibe (puede ir por delante del último ``update()``).
+``apply_cash_flow()`` descuenta depósitos / retiradas del máximo y de la referencia diaria (la mesa los detecta).
+
+Collar de precio: un límite que cruza el libro más de ``LIMIT_MAX_CROSS_PCT`` o reposa a más de
+``LIMIT_MAX_DISTANCE_PCT`` del mid se rechaza (casi siempre es un precio mal escrito).
 
 Dimensionamiento en ``evaluate()`` (ver ARCHITECTURE.md):
 ``notional = units · unit_margin_usd · leverage`` con ``leverage = min(settings.leverage, meta.max_leverage)``,
@@ -62,6 +67,12 @@ EVENT_COOLDOWN_END = "cooldown_end"
 # deslizamiento del stop a mercado).
 LIQ_BUFFER = 1.10
 
+# Collar de precio de las entradas límite: un límite que cruza el libro más de esto, o que reposa más
+# lejos del mid que esto, casi siempre es un precio mal escrito ("83.825" por 83,825): se rechaza en vez
+# de convertirlo en una entrada a mercado o dejarlo en el libro.
+LIMIT_MAX_CROSS_PCT = 1.0
+LIMIT_MAX_DISTANCE_PCT = 20.0
+
 
 def is_auto(origin: str) -> bool:
     """True si la intención viene de una estrategia autónoma (origen "auto" o "auto:<nombre>")."""
@@ -89,6 +100,12 @@ def estimated_liq_px(entry: float, leverage: int, is_long: bool, mmr: float) -> 
     if is_long:
         return max(entry * (1.0 - 1.0 / leverage) / (1.0 - mmr), 0.0)
     return entry * (1.0 + 1.0 / leverage) / (1.0 + mmr)
+
+
+def maintenance_rate(settings: Settings, max_leverage: int) -> float:
+    """Margen de mantenimiento estimado (fracción del notional) como en Hyperliquid: la mitad del margen
+    inicial al apalancamiento máximo de la moneda, nunca menos que el del modelo paper."""
+    return max(settings.paper_maintenance_margin_pct / 100.0, 1.0 / (2.0 * max(int(max_leverage), 1)))
 
 
 class RiskManager:
@@ -231,6 +248,19 @@ class RiskManager:
         elif pnl > 0:
             self.consecutive_losses = 0
         return events
+
+    def apply_cash_flow(self, amount: float) -> None:
+        """Depósito (+) o retirada / transferencia (−) ajena a la operativa: se traslada al máximo de equity y
+        a la referencia del día para que no cuente como ganancia ni como pérdida (ni dispare un halt)."""
+        if not _finite(amount) or float(amount) == 0.0:
+            return
+        amount = float(amount)
+        if self.high_water is not None:
+            self.high_water = max(self.high_water + amount, 0.0)
+        if self.day_start_equity is not None:
+            self.day_start_equity = max(self.day_start_equity + amount, 0.0)
+        log.warning("riesgo: movimiento de saldo ajeno a la operativa %+.2f USD; máximo y referencia diaria ajustados",
+                    amount)
 
     def halt(self, reason: str, detail: str = "", *, flatten: bool = False) -> list[str]:
         """Halt manual (p. ej. "kill"). Sólo se levanta con ``reset_halt()``. Devuelve eventos."""
@@ -380,6 +410,19 @@ class RiskManager:
         blocked = self.block_reason(intent.origin)
         if blocked:
             return self._reject(intent, blocked, warnings)
+        # La cuenta que llega puede ir por delante del último update() (comandos entre ciclos, o antes de la
+        # etapa de riesgo): los límites de pérdida se comprueban también con ella.
+        if _finite(account.equity):
+            eq = float(account.equity)
+            dd = self.drawdown_pct(eq)
+            if s.max_drawdown_pct > 0 and dd >= s.max_drawdown_pct:
+                return self._reject(intent, f"drawdown {dd:.2f}% desde el máximo {self.high_water:.2f} (límite "
+                                            f"{s.max_drawdown_pct:g}%): la mesa se detendrá en este ciclo", warnings)
+            loss = self.day_loss_pct(eq)
+            if (s.daily_loss_limit_pct > 0 and self.day == self.clock.utc_day()
+                    and loss >= s.daily_loss_limit_pct):
+                return self._reject(intent, f"pérdida del día {loss:.2f}% (límite {s.daily_loss_limit_pct:g}%): sin "
+                                            "entradas nuevas hasta el próximo día UTC", warnings)
         if meta.coin != coin:
             return self._reject(intent, f"metadatos de {meta.coin} para una orden de {coin}", warnings)
         units = float(intent.units) if _finite(intent.units) else 0.0
@@ -436,11 +479,23 @@ class RiskManager:
             else:
                 return self._reject(intent, "entrada LIMIT sin precio límite válido", warnings)
             if is_long and entry >= ask:
+                cross = (entry - ask) / ask * 100.0
+                if cross > LIMIT_MAX_CROSS_PCT:
+                    return self._reject(intent, f"el límite {entry:g} está un {cross:.1f}% por encima del ask {ask:g} "
+                                                "(¿precio mal escrito?); para entrar ya usa 'a mercado'", warnings)
                 warnings.append(f"el límite {entry:g} cruza el ask {ask:g}: se ejecutará al instante (taker) a {ask:g}")
                 entry = ask
             elif not is_long and entry <= bid:
+                cross = (bid - entry) / bid * 100.0
+                if cross > LIMIT_MAX_CROSS_PCT:
+                    return self._reject(intent, f"el límite {entry:g} está un {cross:.1f}% por debajo del bid {bid:g} "
+                                                "(¿precio mal escrito?); para entrar ya usa 'a mercado'", warnings)
                 warnings.append(f"el límite {entry:g} cruza el bid {bid:g}: se ejecutará al instante (taker) a {bid:g}")
                 entry = bid
+            elif abs(entry - mid) / mid * 100.0 > LIMIT_MAX_DISTANCE_PCT:
+                dist = abs(entry - mid) / mid * 100.0
+                return self._reject(intent, f"el límite {entry:g} está a un {dist:.1f}% del precio actual ({mid:g}; "
+                                            f"máximo {LIMIT_MAX_DISTANCE_PCT:g}%): ¿precio mal escrito?", warnings)
         entry = round_price(entry, szd)
 
         # --- stop-loss ----------------------------------------------------------------
@@ -508,9 +563,7 @@ class RiskManager:
         if lev < s.leverage:
             warnings.append(f"apalancamiento recortado de {s.leverage}x a {lev}x (máximo de {coin})")
         if sl is not None:
-            # Margen de mantenimiento estimado como en Hyperliquid: la mitad del margen inicial al
-            # apalancamiento máximo (nunca menos que el del modelo paper).
-            mmr = max(s.paper_maintenance_margin_pct / 100.0, 1.0 / (2.0 * max_lev))
+            mmr = maintenance_rate(s, max_lev)
             sl_dist = abs(entry - sl)
             safe = lev
             while safe >= 1 and abs(entry - estimated_liq_px(entry, safe, is_long, mmr)) < sl_dist * LIQ_BUFFER:

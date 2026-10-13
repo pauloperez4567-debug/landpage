@@ -247,7 +247,8 @@ def test_l2_book_n_sig_figs_and_short_cache(clock):
     clock.advance(1.5)
     md.l2_book("BTC", n_sig_figs=3)
     assert len(s.info_calls("l2Book")) == 3
-    assert md.last_update_ts("BTC") == T0 + 1.5
+    # El libro falso lleva siempre time = T0 + 0.123: la edad del dato es la del exchange, no la de la petición.
+    assert md.last_update_ts("BTC") == pytest.approx(T0 + 0.123)
     assert md.last_update_ts("ETH") is None
 
 

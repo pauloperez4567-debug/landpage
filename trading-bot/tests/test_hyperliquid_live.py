@@ -253,8 +253,10 @@ def test_market_order_is_aggressive_ioc_around_mid(broker, fx):
     assert o.status is OrderStatus.FILLED and o.id == "77"
     assert (o.filled_size, o.avg_fill_px, o.price, o.tif) == (2.0, 150.03, 150.15, "Ioc")
 
+    # Un cierre (reduce-only sin precio) no usa los 10 bps de las entradas sino CLOSE_SLIPPAGE (5 %): con
+    # spread > 20 bps un IOC a mid - 10 bps no casaría nunca.
     broker.place_order("SOL", False, 2, MARKET, reduce_only=True, tag="close")
-    assert fx.calls[-1] == ("order", "SOL", False, 2.0, 149.85, {"limit": {"tif": "Ioc"}}, True)
+    assert fx.calls[-1] == ("order", "SOL", False, 2.0, 142.5, {"limit": {"tif": "Ioc"}}, True)
 
 
 def test_market_order_with_worst_price(broker, fx):

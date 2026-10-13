@@ -82,10 +82,13 @@ _OPEN_FILLERS = _ARTICLES | _POSITION_WORDS | frozenset({
     "with", "y", "and", "para", "for", "of", "orden", "order", "entrada", "entry"})
 _CLOSE_VERBS = frozenset({"cierra", "cierre", "cerrar", "cierro", "cierrame", "close", "exit", "sal",
                           "salir", "salte", "liquida", "liquidar", "flat", "flatten"})
-_CLOSE_FILLERS = _ARTICLES | _POSITION_WORDS | _SIDE_WORDS | _URGENT_WORDS | frozenset({
+# Relleno habitual en "cierra todas las posiciones abiertas ahora mismo" / "close all open trades".
+_OPEN_STATE_WORDS = frozenset({"abierta", "abiertas", "abierto", "abiertos", "open", "operaciones", "trades",
+                               "mismo", "right", "inmediato"})
+_CLOSE_FILLERS = _ARTICLES | _POSITION_WORDS | _SIDE_WORDS | _URGENT_WORDS | _OPEN_STATE_WORDS | frozenset({
     "de", "del", "en", "on", "of", "from", "out"})
 _CANCEL_VERBS = frozenset({"cancela", "cancelar", "cancel", "cancelo", "cancelalas", "anula", "anular"})
-_CANCEL_FILLERS = _ARTICLES | _SIDE_WORDS | _URGENT_WORDS | frozenset({
+_CANCEL_FILLERS = _ARTICLES | _SIDE_WORDS | _URGENT_WORDS | _OPEN_STATE_WORDS | frozenset({
     "de", "del", "en", "on", "for", "of", "limite", "limit"})
 _SET_VERBS = frozenset({"mueve", "mover", "muevo", "move", "pon", "poner", "ponle", "set", "cambia",
                         "cambiar", "change", "ajusta", "ajustar", "adjust", "sube", "subir", "raise",
@@ -146,8 +149,9 @@ _PHRASES: list[tuple[CommandAction, re.Pattern[str]]] = [(a, re.compile(p)) for 
      r"|rechazo|rechaza|rechazado|reject|rejected|descartar|descarta|descartalo|discard|olvidalo"
      r"|forget it"),
     (CommandAction.KILL,
-     r"kill(?: (?:all|everything|switch|it|todo))?|killswitch|panico|panic|boton (?:de )?panico"
-     r"|panic button|emergencia|emergency|apaga(?:lo)? todo|apagar todo|shutdown|shut (?:it )?down"),
+     r"(?:kill(?: (?:all|everything|switch|it|todo))?|killswitch|panico|panic|boton (?:de )?panico"
+     r"|panic button|emergencia|emergency|apaga(?:lo)? todo|apagar todo|shutdown|shut (?:it )?down)"
+     r"(?: (?:ya|ya mismo|now|right now|ahora|ahora mismo|inmediatamente|immediately))?"),
     (CommandAction.RESET_HALT,
      r"(?:reset|resetea|resetear|reinicia|reiniciar|levanta|levantar|quita|quitar|clear|lift|unlock"
      r"|desbloquea|desbloquear|libera|liberar) (?:el |la |the )?(?:halt|bloqueo|freno)|unhalt"),
@@ -435,15 +439,18 @@ def _parse_close(toks: list[str], raw: str) -> Optional[Command]:
                 return None
             coin = c
     if coin is not None:
-        return Command(CommandAction.CLOSE, raw=raw, coin=coin)
+        # "cierra todo X": ¿todo o sólo X? (o una palabra desconocida tomada por moneda): mejor no adivinar.
+        return None if every else Command(CommandAction.CLOSE, raw=raw, coin=coin)
     return Command(CommandAction.CLOSE_ALL, raw=raw) if every else None
 
 
 def _parse_cancel(toks: list[str], raw: str) -> Optional[Command]:
     coin: Optional[str] = None
-    target = False                                    # "todo"/"órdenes": todas las monedas
+    target = every = False                            # "órdenes" / "todo": todas las monedas
     for t in toks[1:]:
-        if t in _ALL_WORDS or t in _ORDER_WORDS:
+        if t in _ALL_WORDS:
+            target = every = True
+        elif t in _ORDER_WORDS:
             target = True
         elif t in _CANCEL_FILLERS:
             continue
@@ -452,6 +459,8 @@ def _parse_cancel(toks: list[str], raw: str) -> Optional[Command]:
             if c is None or (coin is not None and coin != c):
                 return None
             coin = c
+    if coin is not None and every:
+        return None                                   # "cancela todo X": ambiguo
     if coin is not None or target:
         return Command(CommandAction.CANCEL, raw=raw, coin=coin)
     return None

@@ -401,10 +401,11 @@ def test_llm_command_rejected_or_expired(settings, market, clock):
     settings.llm_enabled = True
     llm = FakeLLM(Command(CommandAction.KILL))
     desk = make_desk(settings, market, clock, parser=CommandParser(settings, llm=llm))
-    desk.submit("apágalo todo ya mismo por favor")
+    # ("apágalo todo ya mismo" ya lo entienden las reglas como KILL: aquí hace falta texto que sólo entienda la IA)
+    desk.submit("esto se hunde, sácame de todo")
     assert desk.submit("no").startswith("Descartado")
     assert not desk.risk.halted
-    desk.submit("apágalo todo ya mismo por favor")
+    desk.submit("esto se hunde, sácame de todo")
     clock.advance(301)
     assert desk.submit("si").startswith("No hay ningún comando pendiente")
     assert not desk.risk.halted

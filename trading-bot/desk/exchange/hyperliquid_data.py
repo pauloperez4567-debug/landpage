@@ -5,6 +5,8 @@ Sólo lectura, sin claves de Hyperliquid. Pensado para correr 24/7:
 - Una ``requests.Session`` reutilizada (inyectable para tests), timeout de 10 s.
 - Reintentos con backoff exponencial en 429 / 5xx / errores de conexión; el resto de
   códigos y las respuestas malformadas se convierten en ``MarketDataError`` al momento.
+- ``last_update_ts`` (edad de los datos para riesgo) es la hora del libro *según el exchange* (``time`` del
+  l2Book): un nodo atrasado que sirve un libro congelado no pasa por dato fresco.
 - ``meta`` se cachea (cambia muy poco); el libro tiene un cache muy corto (por defecto 1 s)
   para que varias consultas del mismo ciclo no gasten límite de peticiones.
 - ``liquidation_levels`` usa ``/api/positions/all.json`` de Moon Dev si hay ``MOONDEV_API_KEY``.
@@ -86,6 +88,7 @@ class HyperliquidMarketData(MarketData):
         self._metas: dict[str, tuple[float, dict[str, AssetMeta]]] = {}   # dex -> (ts, {coin: meta})
         self._books: dict[tuple[str, Optional[int]], Book] = {}
         self._last_ts: dict[str, float] = {}
+        self._book_ts: dict[str, float] = {}       # hora (del exchange) del último libro de cada moneda
         self._liq_data: Optional[dict] = None
         self._liq_ts: float = -math.inf
         self._liq_retry_at: float = -math.inf
@@ -221,6 +224,9 @@ class HyperliquidMarketData(MarketData):
             book["exchange_ts"] = data["time"] / 1000.0
         self._books[key] = book
         self._last_ts[coin] = now
+        # Edad del precio = la del dato según el exchange (un nodo atrasado puede servir un libro congelado),
+        # nunca posterior a la petición (si el reloj del exchange va por delante del local).
+        self._book_ts[coin] = min(now, book.get("exchange_ts", now))
         return book
 
     def bid_ask(self, coin: str) -> tuple[float, float]:
@@ -307,7 +313,10 @@ class HyperliquidMarketData(MarketData):
         return out
 
     def last_update_ts(self, coin: str) -> Optional[float]:
-        return self._last_ts.get(coin)
+        """Hora del último precio: la del libro según el exchange (campo ``time`` del l2Book); sin libro, la de
+        la última petición de datos de la moneda."""
+        ts = self._book_ts.get(coin)
+        return ts if ts is not None else self._last_ts.get(coin)
 
 
 def _parse_retry_after(resp: Any) -> Optional[float]:

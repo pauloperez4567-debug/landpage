@@ -11,15 +11,26 @@ Ciclo (cada ``loop_seconds``), cada etapa en su propio try/except::
   la espera entre ciclos crece exponencialmente (``loop_seconds · 2^n``, máximo 300 s): la mesa nunca muere
   por un fallo de red o de datos y tampoco martillea una API caída.
 - Comandos: ``submit(text)`` los ejecuta al momento y devuelve la respuesta legible (consola);
-  ``enqueue(text)`` y ``state/inbox.txt`` se procesan al principio del ciclo. El inbox se lee con un offset
-  persistido que se guarda *antes* de ejecutar (como mucho una vez: tras un reinicio nunca se repite un
-  "long HYPE"). Una línea ``[id] texto`` usa ese id; si no, la mesa asigna uno (``c-000001``). Las respuestas
-  van a ``outbox.log`` con el id del comando.
+  ``enqueue(text)`` y ``state/inbox.txt`` se procesan al principio del ciclo (una línea nueva en el inbox
+  corta la espera entre ciclos, también con backoff). El inbox se lee con un offset persistido que se guarda
+  *antes* de ejecutar (como mucho una vez: tras un reinicio nunca se repite un "long HYPE"), junto a una huella
+  de los últimos bytes leídos y los últimos ids ``[id]`` ejecutados. Si el fichero encoge o se reescribe (la
+  huella no cuadra) no se relee desde el principio: sólo se ejecutan líneas con un ``[id]`` no visto. Sin
+  ``desk.json`` válido (borrado o ilegible) el historial del inbox se ignora (salvo en un estado nuevo, sin
+  ``outbox.log``). Una línea ``[id] texto`` usa ese id; si no, la mesa asigna uno (``c-000001``). Las
+  respuestas van a ``outbox.log`` con el id del comando.
 - Comandos interpretados por IA (``source="llm"``) que cambian algo quedan pendientes de ``si``/``no`` si
   ``llm_confirm_trades`` (5 min para confirmar).
 - La operativa automática sólo abre en símbolos de ``settings.symbols`` sin posición, sin entrada pendiente
   y sin operación gestionada: nunca toca posiciones abiertas por comando (ni las cierra: cada operación sale
-  por su propio SL/TP o por orden del usuario).
+  por su propio SL/TP o por orden del usuario). La vela evaluada por (moneda, estrategia) se guarda en
+  ``desk.json``: un reinicio dentro de la misma vela no repite la señal.
+- Riesgo: el estado (halt, pausa, cooldown) se guarda en ``risk.json`` en cuanto cambia (un ``kill`` sobrevive
+  a un crash inmediato). Los movimientos de saldo que no explican las ejecuciones ni el PnL no realizado
+  (depósitos, retiradas, transferencias perp↔spot) se descuentan del máximo de equity y de la referencia
+  diaria: no disparan un halt por drawdown.
+- Salud: cada ciclo escribe ``heartbeat`` (hora) y ``health.json`` (racha de fallos, etapas que fallan y la
+  última vez que se leyó bien la cuenta); ``python -m desk health`` falla si la mesa no ve el exchange.
 - SIGINT/SIGTERM → termina el ciclo en curso, guarda el estado y sale; las órdenes SL/TP quedan en el exchange
   (en paper, en el estado guardado del broker). Un segundo Ctrl+C fuerza la salida.
 
@@ -28,6 +39,8 @@ Todas las horas salen del ``Clock`` inyectado.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import re
@@ -48,7 +61,7 @@ from .liquidity import LiquidityScanner
 from .models import (AccountState, Command, CommandAction, EntryMode, OrderStatus, RiskDecision, Side, Signal,
                      TradeIntent)
 from .risk import (EVENT_COOLDOWN_END, EVENT_COOLDOWN_START, EVENT_FLATTEN, EVENT_HALT_DAILY, EVENT_HALT_DRAWDOWN,
-                   EVENT_HALT_LIFTED, EVENT_NEW_DAY, RiskManager)
+                   EVENT_HALT_LIFTED, EVENT_NEW_DAY, LIMIT_MAX_DISTANCE_PCT, RiskManager)
 from .strategy import Strategy, build_strategies
 
 log = logging.getLogger(__name__)
@@ -59,12 +72,21 @@ STATE_NAME = "desk"
 RISK_STATE_NAME = "risk"
 STATUS_NAME = "status"
 HEARTBEAT_FILE = "heartbeat"
+HEALTH_FILE = "health.json"
 STATE_VERSION = 1
 
 MAX_BACKOFF_S = 300.0
 CONFIRM_TTL_S = 300.0
 EQUITY_EVERY_S = 60.0
 INBOX_ID_RE = re.compile(r"^\[([A-Za-z0-9_.:\-]{1,64})\]\s*(.*)$")
+INBOX_MARK_RE = re.compile(r"\[[A-Za-z0-9_.:\-]{1,64}\]")
+INBOX_FP_BYTES = 64          # huella del inbox: hash de los últimos bytes antes del offset
+INBOX_IDS_KEPT = 500         # ids [id] ya ejecutados que se recuerdan (dedupe)
+HEALTH_STAGES = ("cuenta", "fills")   # sin ellas la mesa no ve el exchange
+# Movimiento de saldo no explicado por ejecuciones ni PnL no realizado: por debajo de esto cuenta como PnL
+# (funding, redondeos); por encima, y con las posiciones cuadradas, es un depósito / retirada / transferencia.
+FLOW_MIN_PCT = 0.5
+FLOW_MIN_USD = 1.0
 
 # Acciones de la IA que se ejecutan sin confirmar (no abren ni cierran nada, o sólo frenan).
 _LLM_SAFE = frozenset({CommandAction.STATUS, CommandAction.HELP, CommandAction.PAUSE, CommandAction.AUTO_OFF})
@@ -112,11 +134,38 @@ class TradingDesk:
         self.pending: Optional[tuple[Command, float]] = None   # comando IA pendiente de confirmar
         self._saved: dict[str, Any] = {}
         self.session = {"trades": 0, "wins": 0, "pnl": 0.0, "fees": 0.0}
+        self.started_ts = clock.now()
+        self.stage_ok_ts: dict[str, float] = {}    # última vez que cada etapa terminó bien (salud)
+        self._close_failures_seen: dict[str, str] = {}
+        # Detección de depósitos / retiradas: cuenta de referencia y lo que las ejecuciones explican desde ella.
+        self._flow_base: Optional[tuple[float, float, dict[str, float], float]] = None
+        self._flow_pnl = 0.0
+        self._flow_sizes: dict[str, float] = {}
 
-        state = self.journal.load_json(STATE_NAME, {}) or {}
+        state = self.journal.load_json(STATE_NAME, None)
+        self.notices: list[str] = []              # avisos de arranque (se muestran con el banner)
         if not isinstance(state, dict):
             state = {}
+            # Sin estado válido de la mesa (desk.json borrado o ilegible) el historial del inbox ya se ejecutó en
+            # su día: se empieza al final. Sólo un estado nuevo (sin outbox.log) lee el inbox desde el principio.
+            end = self._inbox_end() if self.journal.outbox_path.exists() else 0
+            if end:
+                self.notices.append(f"Sin estado de la mesa (desk.json ausente o ilegible): se ignoran los {end} bytes "
+                                    "ya existentes de inbox.txt (no se re-ejecuta su historial).")
+                log.warning("%s", self.notices[-1])
+            state = {"inbox_offset": end}
         self.inbox_offset = int(state.get("inbox_offset") or 0)
+        self.inbox_fp: Optional[str] = state.get("inbox_fp") if isinstance(state.get("inbox_fp"), str) else None
+        if self.inbox_offset and self.inbox_fp is None and "inbox_fp" not in state:
+            self.inbox_fp = self._inbox_fingerprint(self.inbox_offset)
+        # Claves de líneas ya ejecutadas: "id:<id>" o, sin id, "txt:<hash del texto>" (dedupe del inbox).
+        self.inbox_seen: deque[str] = deque((str(x) for x in state.get("inbox_seen") or []), maxlen=INBOX_IDS_KEPT)
+        for key, bar in (state.get("bar_seen") or {}).items():
+            coin, _, strat = str(key).partition("|")
+            try:
+                self._bar_seen[(coin, strat)] = float(bar)
+            except (TypeError, ValueError):
+                continue
         self.cmd_seq = int(state.get("cmd_seq") or 0)
         # DESK_AUTO=false / --no-auto siempre arrancan en OFF; si no, se respeta el último "auto on/off".
         self.auto_enabled = bool(settings.auto_enabled) and bool(state.get("auto_enabled", True))
@@ -198,6 +247,7 @@ class TradingDesk:
             self._save_desk_state()
         except OSError as e:
             log.error("no se pudo guardar el estado de la mesa: %s", e)
+        self._save_risk_quiet()                  # pausa / reanuda / reset halt / kill: a disco ya
         return reply
 
     def _parse(self, text: str) -> Optional[Command]:
@@ -276,6 +326,11 @@ class TradingDesk:
         except KeyError:
             return f"No conozco la moneda {coin} en este mercado."
         mode = cmd.entry_mode or EntryMode(self.settings.default_entry_mode)
+        for what, px in (("el precio límite", cmd.price if mode is EntryMode.LIMIT else None),
+                         ("el SL", cmd.sl_price), ("el TP", cmd.tp_price)):
+            hint = self._thousands_hint(coin, px)
+            if hint:
+                return f"{coin} {side.value.upper()}: no se envió nada: {what} {hint}"
         units = float(cmd.units) if cmd.units else 1.0
         notes: list[str] = []
         zone = None
@@ -312,12 +367,25 @@ class TradingDesk:
                            tp=decision.tp_price, leverage=decision.leverage)
         if not decision.approved:
             return False, f"{coin} {intent.side.value.upper()} rechazada por riesgo: {decision.reason}"
-        order = self.engine.open(intent, decision, cmd_id=cmd_id)
+        extra: list[str] = []
+        try:
+            order = self.engine.open(intent, decision, cmd_id=cmd_id)
+        except BrokerError as e:
+            if not self.engine.is_unconfirmed(coin):
+                raise
+            # La orden pudo llegar al exchange (timeout tras enviarla): el bracket queda registrado con el SL/TP
+            # aprobados y reconcile la encuentra o la descarta. Repetir el comando duplicaría la exposición.
+            self._account_dirty = True
+            self._sync_fills_quiet(extra)
+            lines = [self._describe_entry(intent, decision, None, account.equity),
+                     f"ESTADO INCIERTO: el envío falló ({e}) pero la orden pudo llegar al exchange. NO la repitas: la "
+                     "mesa la reconcilia en los próximos ciclos (si se ejecutó, la protege con el SL/TP de arriba; si "
+                     "no aparece, la descarta y avisa)."]
+            return True, "\n".join(lines + extra)
         if order.status is OrderStatus.REJECTED:
             self._flush_engine()
             return False, f"{coin} {intent.side.value.upper()}: el broker rechazó la entrada: {order.reason}"
-        extra: list[str] = []
-        self._sync_fills(extra)                  # entrada a mercado: SL/TP colocados ya, no en el próximo ciclo
+        self._sync_fills_quiet(extra)            # entrada a mercado: SL/TP colocados ya, no en el próximo ciclo
         lines = [self._describe_entry(intent, decision, order, account.equity)]
         if order.status is OrderStatus.FILLED:
             lines.append(f"Ejecutada a mercado @ {fmt_px(order.avg_fill_px)}.")
@@ -359,26 +427,39 @@ class TradingDesk:
         coin = cmd.coin
         if not coin:
             return "¿Qué moneda cierro? Ejemplo: 'cierra HYPE' o 'cierra todo'."
+        try:
+            self.market.meta(coin)
+        except KeyError:
+            if coin not in self.engine.brackets:
+                return f"No conozco la moneda {coin} en este mercado. Para cerrar todo: 'cierra todo'."
+        except MarketDataError as e:            # sin metadatos se intenta cerrar igual
+            log.warning("cierre de %s sin metadatos (%s)", coin, e)
         msgs: list[str] = []
         order = self.engine.close(coin, "close")
         self._flush_engine(msgs)
         if order is None:
             return "\n".join(msgs) if msgs else f"No hay posición ni entrada pendiente en {coin}."
-        self._sync_fills(msgs)
+        self._sync_fills_quiet(msgs)
         return "\n".join(msgs)
 
     def _cmd_close_all(self, cmd: Command) -> str:
         msgs: list[str] = []
         pending = [c for c, b in self.engine.brackets.items() if b.status == PENDING]
         orders = self.engine.close_all("close_all")
+        failed = dict(self.engine.close_failures)
         self._flush_engine(msgs)
-        self._sync_fills(msgs)
-        if not orders and not pending:
+        self._sync_fills_quiet(msgs)
+        canceled = [c for c in pending if c not in self.engine.brackets]
+        if not orders and not pending and not failed:
             return "No había posiciones abiertas ni entradas pendientes."
         head = f"Cerrando todo: {len(orders)} posición(es) a mercado"
-        if pending:
-            head += f", entradas pendientes canceladas ({', '.join(sorted(pending))})"
-        return "\n".join([head + "."] + msgs)
+        if canceled:
+            head += f", entradas pendientes canceladas ({', '.join(sorted(canceled))})"
+        lines = [head + "."]
+        if failed:
+            lines.append("SIN CERRAR: " + "; ".join(f"{c} ({why})" for c, why in sorted(failed.items()))
+                         + ". Se reintenta en la reconciliación; repite 'cierra todo' si hace falta.")
+        return "\n".join(lines + msgs)
 
     def _cmd_cancel(self, cmd: Command) -> str:
         n = self.engine.cancel(cmd.coin)
@@ -386,7 +467,8 @@ class TradingDesk:
         msgs: list[str] = []
         self._flush_engine(msgs)
         if n == 0:
-            return f"No había órdenes de entrada abiertas {what}. Los SL/TP de las posiciones no se tocan."
+            return "\n".join([f"No había órdenes de entrada abiertas {what}. Los SL/TP de las posiciones no se "
+                              "tocan."] + msgs)
         return "\n".join([f"{n} orden(es) de entrada canceladas {what}. Los SL/TP de las posiciones abiertas se "
                           "mantienen (para salir usa 'cierra <moneda>')."] + msgs)
 
@@ -396,6 +478,9 @@ class TradingDesk:
         label = "SL" if is_sl else "TP"
         pct = cmd.sl_pct if is_sl else cmd.tp_pct
         px = cmd.price
+        hint = self._thousands_hint(coin, px)
+        if hint:
+            return f"No se movió el {label} de {coin}: el precio {hint}"
         if px is None:
             if pct is None:
                 return f"Indica el precio o el % del {label}. Ejemplo: '{'stop' if is_sl else 'tp'} {coin} 84.5'."
@@ -447,15 +532,31 @@ class TradingDesk:
 
     def _cmd_kill(self, cmd: Command) -> str:
         self.risk.halt("kill", "pánico manual", flatten=True)
+        self._save_risk_quiet()                  # antes de tocar el exchange: el halt sobrevive a un crash
         msgs: list[str] = []
-        canceled = self.engine.cancel(None)
-        orders = self.engine.close_all("kill")
+        problems: list[str] = []
+        canceled = 0
+        try:
+            canceled = self.engine.cancel(None)
+        except (MarketDataError, BrokerError) as e:
+            problems.append(f"no se pudieron cancelar las entradas ({e})")
+        orders = []
+        try:
+            orders = self.engine.close_all("kill")
+        except (MarketDataError, BrokerError) as e:
+            problems.append(f"no se pudo leer la cuenta para cerrar ({e})")
+        failed = dict(self.engine.close_failures)
         self._flush_engine(msgs)
-        self._sync_fills(msgs)
+        self._sync_fills_quiet(msgs)
         self._save_desk_state()
-        head = (f"PÁNICO: {len(orders)} posición(es) cerrándose a mercado, {canceled} entrada(s) canceladas. "
-                "Mesa DETENIDA: no se abre nada (ni comandos ni automático) hasta 'reset halt'.")
-        return "\n".join([head] + msgs)
+        lines = [f"PÁNICO: {len(orders)} posición(es) cerrándose a mercado, {canceled} entrada(s) canceladas. "
+                 "Mesa DETENIDA: no se abre nada (ni comandos ni automático) hasta 'reset halt'."]
+        if failed:
+            problems.append("sin cerrar todavía: " + "; ".join(f"{c} ({why})" for c, why in sorted(failed.items())))
+        if problems:
+            lines.append("ATENCIÓN: " + "; ".join(problems) + ". El halt queda activo y el cierre se reintenta en "
+                         "cada ciclo mientras quede exposición.")
+        return "\n".join(lines + msgs)
 
     def _cmd_reset_halt(self, cmd: Command) -> str:
         # Equity fresco antes de reiniciar las referencias (máximo y día) del riesgo.
@@ -518,13 +619,54 @@ class TradingDesk:
 
     # ------------------------------------------------------------------ etapas
     def _stage_commands(self) -> None:
+        # El inbox se lee antes de vaciar la cola: si falla (disco, permisos) los comandos de la cola no se pierden.
+        inbox_error: Optional[Exception] = None
+        try:
+            inbox = self._read_inbox()
+        except Exception as e:  # noqa: BLE001 - se re-lanza tras procesar la cola
+            inbox, inbox_error = [], e
         items: list[tuple[str, str, str]] = []
         while self._queue:
             items.append(self._queue.popleft())
-        items.extend(self._read_inbox())
+        items.extend(inbox)
         for cid, text, source in items:
             reply = self._process(cid, text, source)
             self._emit(f"» [{cid}] {text}\n{reply}")
+        if items:
+            self._account_dirty = True
+        if inbox_error is not None:
+            raise inbox_error
+
+    # ------------------------------------------------------------------ inbox
+    def _inbox_stat(self) -> Optional[tuple[int, int]]:
+        try:
+            st = self.journal.inbox_path.stat()
+        except OSError:
+            return None
+        return st.st_size, st.st_mtime_ns
+
+    def _inbox_end(self) -> int:
+        """Posición tras la última línea completa de inbox.txt (0 si no existe)."""
+        try:
+            data = self.journal.inbox_path.read_bytes()
+        except OSError:
+            return 0
+        return data.rfind(b"\n") + 1
+
+    def _inbox_fingerprint(self, offset: int) -> Optional[str]:
+        """Huella de los ``INBOX_FP_BYTES`` bytes anteriores a ``offset`` (detecta un fichero reescrito)."""
+        if offset <= 0:
+            return None
+        try:
+            with open(self.journal.inbox_path, "rb") as f:
+                start = max(offset - INBOX_FP_BYTES, 0)
+                f.seek(start)
+                data = f.read(offset - start)
+        except OSError:
+            return None
+        if len(data) != offset - start:
+            return None
+        return hashlib.sha1(data).hexdigest()[:16]
 
     def _read_inbox(self) -> list[tuple[str, str, str]]:
         path = self.journal.inbox_path
@@ -532,35 +674,69 @@ class TradingDesk:
             size = path.stat().st_size
         except FileNotFoundError:
             return []
-        if size < self.inbox_offset:
-            log.warning("inbox.txt es más corto que el offset guardado (%d < %d): se relee desde el principio",
-                        size, self.inbox_offset)
-            self.inbox_offset = 0
-        if size == self.inbox_offset:
+        rewritten = size < self.inbox_offset
+        if not rewritten and self.inbox_offset and self.inbox_fp is not None:
+            rewritten = self._inbox_fingerprint(self.inbox_offset) != self.inbox_fp
+        if not rewritten and size == self.inbox_offset:
             return []
+        start = 0 if rewritten else self.inbox_offset
         with open(path, "rb") as f:
-            f.seek(self.inbox_offset)
-            data = f.read(size - self.inbox_offset)
+            f.seek(start)
+            data = f.read(size - start)
         end = data.rfind(b"\n")
-        if end < 0:
+        if end < 0 and not rewritten:
             return []                            # línea a medio escribir: se espera al salto de línea
         chunk = data[:end + 1]
-        previous = self.inbox_offset
-        self.inbox_offset += len(chunk)
-        # Offset guardado ANTES de ejecutar: un comando del inbox se ejecuta como mucho una vez.
+        previous = (self.inbox_offset, self.inbox_fp, list(self.inbox_seen))
+        self.inbox_offset = start + len(chunk)
+        self.inbox_fp = self._inbox_fingerprint(self.inbox_offset)
         out: list[tuple[str, str, str]] = []
+        skipped = 0
+        seen = set(self.inbox_seen)
         for raw in chunk.decode("utf-8", "replace").splitlines():
-            line = raw.strip().lstrip("﻿")
-            if not line or line.startswith("#"):
-                continue
-            m = INBOX_ID_RE.match(line)
-            cid, text = (m.group(1), m.group(2).strip()) if m else (self._next_id(), line)
-            out.append((cid, text, "inbox"))
+            for cid, text in self._split_inbox_line(raw):
+                key = f"id:{cid}" if cid is not None else "txt:" + hashlib.sha1(text.encode()).hexdigest()[:16]
+                # Un [id] ya ejecutado nunca se repite. Sin id, sólo en un fichero reescrito se descarta un texto ya
+                # ejecutado (en uso normal repetir "estado" es legítimo).
+                if key in seen and (cid is not None or rewritten):
+                    skipped += 1
+                    continue
+                seen.add(key)
+                self.inbox_seen.append(key)
+                out.append((cid if cid is not None else self._next_id(), text, "inbox"))
+        if rewritten:
+            msg = (f"inbox.txt cambió por debajo de la mesa (encogió o se reescribió): no se relee su historial; "
+                   f"se ejecutan {len(out)} comando(s) nuevos y se ignoran {skipped} línea(s) ya ejecutadas. No borres "
+                   "ni edites líneas del inbox: para anular algo envía otro comando (p. ej. 'cancela HYPE').")
+            log.warning("%s", msg)
+            self.notify(msg, logging.WARNING)
+        elif skipped:
+            log.warning("inbox: %d línea(s) con un [id] ya ejecutado se ignoran", skipped)
+        # Offset (y huella / ids) guardados ANTES de ejecutar: un comando del inbox se ejecuta como mucho una vez.
         try:
             self._save_desk_state()
         except OSError:
-            self.inbox_offset = previous          # sin offset guardado no se ejecuta: se reintenta luego
+            self.inbox_offset, self.inbox_fp, keys = previous   # sin offset guardado no se ejecuta: se reintenta
+            self.inbox_seen = deque(keys, maxlen=INBOX_IDS_KEPT)
             raise
+        return out
+
+    def _split_inbox_line(self, raw: str) -> list[tuple[Optional[str], str]]:
+        """Línea del inbox → [(id o None, texto)]. Ignora vacías y comentarios. Si un ``[id]`` aparece a mitad
+        de línea (``send`` escribió detrás de una línea sin salto final) se separan los dos comandos."""
+        line = raw.strip().lstrip("﻿")
+        if not line or line.startswith("#"):
+            return []
+        marks = [m.start() for m in INBOX_MARK_RE.finditer(line) if m.start() > 0 and INBOX_ID_RE.match(line[m.start():])]
+        parts = [line]
+        if marks:
+            cuts = [0] + marks + [len(line)]
+            parts = [line[a:b].strip() for a, b in zip(cuts, cuts[1:]) if line[a:b].strip()]
+            log.warning("inbox: línea con %d comandos pegados (falta un salto de línea): %r", len(parts), line[:200])
+        out: list[tuple[Optional[str], str]] = []
+        for part in parts:
+            m = INBOX_ID_RE.match(part)
+            out.append((m.group(1), m.group(2).strip()) if m else (None, part))
         return out
 
     def _sync_fills(self, target: Optional[list[str]] = None) -> list[ClosedTrade]:
@@ -568,10 +744,88 @@ class TradingDesk:
         if not fills:
             self._flush_engine(target)
             return []
+        for f in fills:                          # lo que explican las ejecuciones (detección de depósitos/retiradas)
+            self._flow_pnl += f.realized_pnl - f.fee
+            self._flow_sizes[f.coin] = self._flow_sizes.get(f.coin, 0.0) + (f.size if f.is_buy else -f.size)
         closed = self.engine.on_fills(fills)
         self._flush_engine(target)
         self._record_closed(closed, target)
+        if getattr(self.broker, "fills_cursor_ts", None) is not None:
+            # Live: el cursor de fills a disco junto al motor (un crash no re-entrega lo ya aplicado).
+            try:
+                self._save_desk_state()
+            except OSError as e:
+                log.error("no se pudo guardar el cursor de fills: %s", e)
         return closed
+
+    def _sync_fills_quiet(self, target: list[str]) -> None:
+        """Fills tras una orden ya aceptada: un fallo al leerlos no convierte la respuesta en 'inténtalo de nuevo'
+        (la orden ya está en el exchange); se avisa y el próximo ciclo lo completa."""
+        try:
+            self._sync_fills(target)
+        except (MarketDataError, BrokerError) as e:
+            log.warning("fills tras la orden no disponibles: %s", e)
+            target.append(f"Orden aceptada, pero sus ejecuciones aún no se pudieron leer ({e}): el SL/TP y el "
+                          "estado se completan en el próximo ciclo. No repitas el comando.")
+
+    def _thousands_hint(self, coin: Optional[str], px: Optional[float]) -> Optional[str]:
+        """Texto de aviso si ``px`` parece un precio con punto de miles ("83.825" con BTC a ~83,800): leído como
+        decimal está a >99 % del mercado y ×1000 cae cerca del precio. None si no hay ambigüedad."""
+        if not coin or px is None or not isinstance(px, (int, float)) or not math.isfinite(px) or px <= 0:
+            return None
+        try:
+            mid = self.market.mid(coin)
+        except (MarketDataError, KeyError):
+            return None
+        if not mid or mid <= 0 or px * 100.0 >= mid:
+            return None
+        k = px * 1000.0
+        if abs(k / mid - 1.0) * 100.0 > LIMIT_MAX_DISTANCE_PCT:
+            return None
+        return (f"{fmt_px(px)} parece un precio con punto de miles ({coin} cotiza a {fmt_px(mid)}): ¿querías decir "
+                f"{k:.10g}? Escríbelo sin separador de miles (p. ej. {k:.10g}) o con decimales explícitos.")
+
+    def _detect_cash_flow(self, account: AccountState) -> None:
+        """Depósitos / retiradas / transferencias: la parte del cambio de equity que no explican las ejecuciones
+        (realizado − comisiones) ni el PnL no realizado, con las posiciones cuadradas, se descuenta del máximo de
+        equity y de la referencia diaria del riesgo (no es una pérdida ni una ganancia de la operativa).
+
+        Conservador: si las posiciones no cuadran con los fills recibidos (un fill aún no ha llegado) no se
+        clasifica nada; por debajo de ``FLOW_MIN_PCT`` cuenta como PnL (funding, redondeos); en live se descuenta
+        además el funding cobrado/pagado si el broker lo sabe (``funding_since``)."""
+        eq = float(account.equity) if account.equity is not None else math.nan
+        live = {c: p for c, p in account.positions.items() if p.size != 0}
+        upnl = sum(float(p.unrealized_pnl or 0.0) for p in live.values())
+        sizes = {c: float(p.size) for c, p in live.items()}
+        base, self._flow_base = self._flow_base, (eq, upnl, sizes, self.clock.now())
+        pnl, moved = self._flow_pnl, self._flow_sizes
+        self._flow_pnl, self._flow_sizes = 0.0, {}
+        if base is None or not math.isfinite(eq) or not math.isfinite(base[0]):
+            return
+        b_eq, b_upnl, b_sizes, b_ts = base
+        for c in set(b_sizes) | set(sizes) | set(moved):
+            expected = b_sizes.get(c, 0.0) + moved.get(c, 0.0)
+            if abs(expected - sizes.get(c, 0.0)) > 1e-6 * max(1.0, abs(expected)):
+                return                           # hay ejecuciones que aún no han llegado: no se clasifica
+        unexplained = (eq - b_eq) - (upnl - b_upnl) - pnl
+        threshold = max(FLOW_MIN_USD, abs(b_eq) * FLOW_MIN_PCT / 100.0)
+        if abs(unexplained) < threshold:
+            return
+        funding_since = getattr(self.broker, "funding_since", None)
+        if callable(funding_since):
+            try:
+                unexplained -= float(funding_since(b_ts))
+            except (BrokerError, MarketDataError, TypeError, ValueError) as e:
+                log.warning("funding no disponible (%s): el movimiento de saldo cuenta como PnL", e)
+                return
+            if abs(unexplained) < threshold:
+                return
+        self.risk.apply_cash_flow(unexplained)
+        self.journal.event("cash_flow", amount=unexplained, equity=eq, previous_equity=b_eq)
+        what = "depósito / transferencia entrante" if unexplained > 0 else "retirada / transferencia saliente"
+        self.notify(f"Movimiento de saldo ajeno a la operativa: {fmt_usd(unexplained)} ({what}). No cuenta como PnL: "
+                    f"máximo de equity y referencia del día ajustados (máximo {fmt_usd(self.risk.high_water or 0, sign=False)}).",
+                    logging.WARNING)
 
     def _record_closed(self, trades: list[ClosedTrade], target: Optional[list[str]] = None) -> None:
         today = self.clock.utc_day()
@@ -597,7 +851,10 @@ class TradingDesk:
 
     def _stage_risk(self) -> None:
         account = self._account
+        self._detect_cash_flow(account)
         events = self.risk.update(account)
+        if events:
+            self._save_risk_quiet()
         halted_now = False
         for ev in events:
             if ev == EVENT_NEW_DAY:
@@ -626,10 +883,15 @@ class TradingDesk:
             reason = "kill" if self.risk.halt_reason == "kill" else "flatten"
             had_pending = any(b.status == PENDING for b in self.engine.brackets.values())
             orders = self.engine.close_all(reason)
+            failed = dict(self.engine.close_failures)
             if orders or had_pending:
                 acted = True
                 self.notify(f"Riesgo ({self.risk.halt_reason}): cerrando {len(orders)} posición(es) a mercado.",
                             logging.WARNING)
+            if failed and failed != self._close_failures_seen:
+                self.notify("Riesgo: SIN CERRAR todavía: " + "; ".join(f"{c} ({why})" for c, why in sorted(failed.items()))
+                            + ". Se reintenta en cada ciclo.", logging.WARNING)
+            self._close_failures_seen = failed
             self._flush_engine()
             self._sync_fills()
         if acted:
@@ -839,14 +1101,20 @@ class TradingDesk:
         data = {
             "version": STATE_VERSION,
             "inbox_offset": self.inbox_offset,
+            "inbox_fp": self.inbox_fp,
+            "inbox_seen": list(self.inbox_seen),
             "cmd_seq": self.cmd_seq,
             "auto_enabled": self.auto_enabled,
             "param_overrides": dict(self.param_overrides),
             "day_stats": dict(self.day_stats),
+            "bar_seen": {f"{c}|{st}": bar for (c, st), bar in sorted(self._bar_seen.items())},
         }
         cursor = getattr(self.broker, "fills_cursor_ts", None)
         if isinstance(cursor, (int, float)):
             data["fills_cursor_ts"] = cursor
+            seen = getattr(self.broker, "fills_seen_keys", None)
+            if isinstance(seen, list):
+                data["fills_seen"] = seen          # fills ya entregados en el ms del cursor (no se re-entregan)
         return data
 
     def _save_if_changed(self, name: str, data: dict[str, Any], compare: Optional[dict[str, Any]] = None) -> None:
@@ -859,15 +1127,25 @@ class TradingDesk:
     def _save_desk_state(self) -> None:
         self._save_if_changed(STATE_NAME, self._desk_state())
 
+    def _save_risk_state(self) -> None:
+        risk = self.risk.to_dict()
+        # last_equity cambia en cada ciclo; sólo provoca escritura junto a otro cambio.
+        self._save_if_changed(RISK_STATE_NAME, risk, {k: v for k, v in risk.items() if k != "last_equity"})
+
+    def _save_risk_quiet(self) -> None:
+        """Halt / pausa / cooldown a disco al momento (sobreviven a un crash antes del próximo ciclo)."""
+        try:
+            self._save_risk_state()
+        except OSError as e:
+            log.error("no se pudo guardar el estado de riesgo: %s", e)
+
     def save_state(self, force: bool = False) -> None:
         """Guarda mesa, riesgo, motor y broker (sólo lo que cambió).
 
         El broker paper ya guarda solo en cada cambio (``autosave``); aquí sólo se le pide al detener la mesa
         (``force``) o, si no tiene autosave, como mucho una vez por minuto."""
         self._save_desk_state()
-        risk = self.risk.to_dict()
-        # last_equity cambia en cada ciclo; sólo provoca escritura junto a otro cambio.
-        self._save_if_changed(RISK_STATE_NAME, risk, {k: v for k, v in risk.items() if k != "last_equity"})
+        self._save_risk_state()
         self.engine.save_state()
         now = self.clock.now()
         if force or (not getattr(self.broker, "autosave", False) and now - self._last_broker_save_ts >= 60.0):
@@ -889,13 +1167,16 @@ class TradingDesk:
         log.warning("señal %s recibida: la mesa se detiene al terminar el ciclo (otra vez para forzar)", name)
 
     def _sleep(self, seconds: float) -> None:
+        """Espera hasta el próximo ciclo; la corta un comando encolado o una línea nueva en inbox.txt (un
+        ``kill`` enviado con ``python -m desk send`` no espera al backoff, que puede llegar a 300 s)."""
         remaining = seconds
+        inbox = self._inbox_stat()
         while remaining > 0 and not self._stop_requested:
             step = min(remaining, 1.0)
             self.clock.sleep(step)
             remaining -= step
-            if self._queue:
-                break                            # hay comandos encolados: ciclo ya
+            if self._queue or self._inbox_stat() != inbox:
+                break                            # hay comandos: ciclo ya
 
     def banner(self) -> str:
         s = self.settings
@@ -911,6 +1192,7 @@ class TradingDesk:
                  f"máx. {s.max_drawdown_pct:g}%, máx. {s.max_open_positions} posiciones"]
         if self.restored_params:
             lines.append("Parámetros restaurados del estado: " + ", ".join(self.restored_params))
+        lines.extend(self.notices)
         if self.risk.active_halt():
             lines.append(f"ATENCIÓN: {self.risk.block_reason()}")
         return "\n".join(lines)

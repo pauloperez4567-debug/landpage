@@ -12,7 +12,9 @@
 Mapeo de órdenes (precios con ``round_price``, tamaños con ``round_size``):
 
 - LIMIT → ``{"limit": {"tif": "Gtc"|"Alo"|"Ioc"}}`` al precio dado.
-- MARKET → IOC límite agresiva a mid ± ``market_slippage_bps`` (o al ``price`` dado = peor aceptable).
+- MARKET → IOC límite agresiva a mid ± ``market_slippage_bps`` (o al ``price`` dado = peor aceptable). Un
+  MARKET ``reduce_only`` sin precio (cierre) usa ``CLOSE_SLIPPAGE`` (5 %, como ``market_close`` del SDK): con
+  10 bps un cierre no casaría en cuanto el spread pasara de ~20 bps.
 - STOP / TAKE_PROFIT → ``{"trigger": {"triggerPx", "isMarket": True, "tpsl": "sl"|"tp"}}``, siempre
   ``reduce_only=True``; el precio límite que exige el exchange se pone a ``TRIGGER_SLIPPAGE`` del disparo
   (tolerancia de deslizamiento del stop a mercado).
@@ -24,7 +26,9 @@ orden llegue al exchange, la orden puede existir; ``ExecutionEngine.reconcile`` 
 ``open_orders()``.
 
 ``poll_fills()`` lee ``user_fills_by_time`` desde la última marca vista (inclusive) y deduplica por
-``tid``: cada fill se entrega una sola vez aunque aparezca en varias consultas.
+``tid``: cada fill se entrega una sola vez aunque aparezca en varias consultas. Como la marca es inclusiva,
+los ``tid`` ya entregados en ese milisegundo (``fills_seen_keys``) se guardan con el cursor y se pasan al
+reiniciar (``fills_seen``): un reinicio no vuelve a entregar el último fill.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ TESTNET_API_URL = "https://api.hyperliquid-testnet.xyz"
 VALID_TIFS = ("Gtc", "Alo", "Ioc")
 TRIGGER_KINDS = (OrderKind.STOP, OrderKind.TAKE_PROFIT)
 TRIGGER_SLIPPAGE = 0.05      # límite de un SL/TP a mercado: 5 % más allá del disparo (como el SDK)
+CLOSE_SLIPPAGE = 0.05        # cierre a mercado (reduce-only sin precio): 5 % más allá del mid
 FILLS_PAGE_LIMIT = 2000      # Hyperliquid devuelve como mucho 2000 fills por consulta
 MAX_FILL_PAGES = 10
 META_TTL = 3600.0
@@ -113,12 +118,15 @@ def _err_text(e: BaseException) -> str:
 class LiveHyperliquidBroker(Broker):
     def __init__(self, market: Optional[MarketData], settings: Settings, clock: Clock, *,
                  exchange: Any = None, info: Any = None, address: Optional[str] = None,
-                 timeout: float = 10.0, fills_since_ts: Optional[float] = None):
+                 timeout: float = 10.0, fills_since_ts: Optional[float] = None,
+                 fills_seen: Optional[list[str]] = None):
         """``exchange`` / ``info`` inyectables (tests); si faltan se crean con el SDK.
 
         ``market`` (opcional) aporta metadatos y precio medio con su propio cache; sin él se piden
         a ``info.meta`` / ``info.all_mids``. ``fills_since_ts``: desde cuándo entregar fills
         (por defecto, desde ahora: lo anterior ya lo conoce la mesa o lo adopta ``reconcile``).
+        ``fills_seen``: claves (``tid``) ya entregadas en el milisegundo de ``fills_since_ts``
+        (``fills_seen_keys`` guardado por la mesa): no se vuelven a entregar.
         """
         if not settings.is_live:
             raise ValueError("LiveHyperliquidBroker sólo se usa en modo live (DESK_MODE=live)")
@@ -139,6 +147,7 @@ class LiveHyperliquidBroker(Broker):
         self.leverage: dict[str, int] = {}
         start = self.clock.now() if fills_since_ts is None else float(fills_since_ts)
         self._fills_cursor_ms = int(start * 1000)
+        self._seen.update({str(k): self._fills_cursor_ms for k in fills_seen or []})
 
         wallet = None
         if exchange is None or not (address or settings.hl_account_address):
@@ -181,6 +190,12 @@ class LiveHyperliquidBroker(Broker):
     def fills_cursor_ts(self) -> float:
         """Marca (s) desde la que se piden fills; la mesa puede guardarla para el próximo arranque."""
         return self._fills_cursor_ms / 1000.0
+
+    @property
+    def fills_seen_keys(self) -> list[str]:
+        """Fills ya entregados en el milisegundo del cursor (la consulta lo incluye): se guardan con él."""
+        with self._lock:
+            return sorted(k for k, t in self._seen.items() if t >= self._fills_cursor_ms)
 
     # ------------------------------------------------------------------ llamadas al SDK
     @staticmethod
@@ -329,7 +344,8 @@ class LiveHyperliquidBroker(Broker):
                     raise _Reject("MARKET: price (peor precio aceptable) debe ser > 0")
                 px = order.price
             else:
-                slip = max(self.settings.market_slippage_bps, 0.0) / 10_000.0
+                slip = (CLOSE_SLIPPAGE if order.reduce_only
+                        else max(self.settings.market_slippage_bps, 0.0) / 10_000.0)
                 mid = self._mid(order.coin)
                 px = mid * (1.0 + slip) if order.is_buy else mid * (1.0 - slip)
             order.price, order.tif = round_price(px, szd), "Ioc"
