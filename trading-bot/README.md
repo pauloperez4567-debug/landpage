@@ -196,6 +196,17 @@ Con `DESK_AUTO=true` (por defecto) la mesa evalúa sus estrategias sobre `DESK_S
 - **`squeeze_breakout` (1 h)** — fin de una compresión de volatilidad (Bollinger dentro de Keltner) con
   ADX(14) > 25 y cierre fuera de Bollinger → entrada en la dirección de la ruptura, SL a 1,5·ATR.
 
+Disponibles pero no activas por defecto (añádelas a `DESK_STRATEGIES` si las quieres):
+
+- **`ema_trend` (1 h)** — cruce de EMA rápida/lenta (20/50) con ADX > 20; SL a 2·ATR, TP a R.
+- **`rsi_reversion` (15 m)** — RSI extremo (< 30 / > 70) con toque de la Bollinger; objetivo la media, SL a 1,5·ATR.
+- **`donchian_breakout` (4 h)** — primer cierre fuera del canal de 20 velas; SL a 2·ATR, TP a R.
+
+Cada estrategia define su lógica una sola vez (`Strategy.signals`, vectorizada): el backtest y la operativa
+en vivo usan exactamente el mismo código, y la señal en vivo es la última fila de ese cálculo. Que una
+estrategia exista aquí no significa que gane dinero: un backtest no garantiza nada y sólo cuenta el
+resultado fuera de muestra.
+
 Reglas de la operativa automática:
 
 - Cada señal pasa por el **mismo gestor de riesgo** que los comandos, con `DESK_AUTO_UNITS` unidades.
@@ -326,8 +337,9 @@ trading-bot/
 │   ├── desk.py            TradingDesk: bucle 24/7, comandos, operativa automática, estado
 │   ├── engine.py          ExecutionEngine: entradas, brackets SL/TP, OCO, reconciliación
 │   ├── risk.py            RiskManager: tamaño, halts diario/drawdown, cooldown, pausa
-│   ├── strategy.py        Estrategias autónomas (liquidity_sweep, squeeze_breakout)
-│   ├── liquidity.py       Zonas de liquidez (libro + liquidaciones)
+│   ├── strategy.py        Estrategias (liquidity_sweep, squeeze_breakout, ema_trend, rsi_reversion, donchian_breakout)
+│   ├── backtest.py        Backtest por gráfica: ejecución conservadora, métricas
+│   ├── liquidity.py       Zonas de liquidez (libro + liquidaciones; históricas por pivotes para backtest)
 │   ├── commands.py        Comandos ES/EN por reglas + fallback IA
 │   ├── journal.py         Diarios y estado en disco
 │   ├── indicators.py      RSI, ATR, Bollinger, Keltner, ADX...

@@ -7,15 +7,21 @@ condición del patrón que sí dispara.
 
 from __future__ import annotations
 
+import itertools
+import json
+
 import numpy as np
+import pandas as pd
 import pytest
 
 from conftest import make_candles
 from desk.clock import SimClock
-from desk.indicators import atr
+from desk.indicators import adx, atr, bollinger, ema
+from desk.liquidity import historical_zones, row_zones, zones_frame
 from desk.models import EntryMode, Side, Zone
-from desk.strategy import (LiquiditySweepStrategy, SqueezeBreakoutStrategy, Strategy, build_strategies,
-                           closed_candles, interval_seconds)
+from desk.strategy import (SIGNAL_COLUMNS, STRATEGIES, DonchianBreakoutStrategy, EmaTrendStrategy,
+                           LiquiditySweepStrategy, RsiReversionStrategy, SqueezeBreakoutStrategy, Strategy,
+                           build_strategies, closed_candles, create_strategy, interval_seconds)
 
 END = 1_767_225_600.0
 M15, H1 = 900, 3600
@@ -246,3 +252,267 @@ def test_build_strategies_rejects_unknown_names(settings):
     settings.strategies = ["liquidity_sweep", "martingala"]
     with pytest.raises(ValueError, match="martingala"):
         build_strategies(settings)
+
+
+# === Fase 2: una sola lógica (signals) para vivo y backtest ======================
+
+ALL = sorted(STRATEGIES)
+
+
+def random_bars(strat, n=1200, seed=5):
+    """Paseo aleatorio en la temporalidad de la estrategia: con esta semilla todas disparan en ambos lados."""
+    return make_candles(n=n, seed=seed, vol_pct=0.5, interval=strat.interval, end_ts=END)
+
+
+def zones_for(strat, bars, settings):
+    return historical_zones(bars, settings) if strat.uses_zones else None
+
+
+def test_registry_has_the_new_strategies(settings):
+    assert {"liquidity_sweep", "squeeze_breakout", "ema_trend", "rsi_reversion", "donchian_breakout"} <= set(ALL)
+    assert isinstance(create_strategy("EMA-Trend", settings), EmaTrendStrategy)
+    with pytest.raises(ValueError, match="martingala"):
+        create_strategy("martingala", settings)
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_signals_frame_shape(settings, name):
+    strat = create_strategy(name, settings)
+    bars = random_bars(strat)
+    sig = strat.signals(bars, zones_for(strat, bars, settings))
+    assert list(sig.columns) == SIGNAL_COLUMNS and sig.index.equals(bars.index)
+    fired = sig[sig["side"] != ""]
+    assert set(fired["side"]) == {"long", "short"}          # el paseo de prueba ejercita ambos lados
+    assert set(fired["entry_mode"]) == {"market"}
+    assert (sig.loc[sig["side"] == "", "entry_mode"] == "").all() and sig.loc[sig["side"] == "", "sl"].isna().all()
+    longs, shorts = fired[fired["side"] == "long"], fired[fired["side"] == "short"]
+    assert ((longs["sl"] < longs["entry_px"]) & (longs["entry_px"] < longs["tp"])).all()
+    assert ((shorts["tp"] < shorts["entry_px"]) & (shorts["entry_px"] < shorts["sl"])).all()
+    assert (fired["reason"].str.len() > 10).all()
+    assert (sig["side"].iloc[:strat.min_bars - 1] == "").all()      # sin calentar no hay señal
+    # datos inservibles: nunca lanza
+    assert (strat.signals(bars.iloc[:0])["side"] == "").all()
+    assert (strat.signals(bars.drop(columns=["low"]))["side"] == "").all()
+    assert len(strat.signals(None)) == 0
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_live_evaluate_equals_the_backtest_row(settings, name):
+    """Paridad exacta: en cada vela, ``evaluate`` en vivo == la fila de ``signals`` sobre toda la historia."""
+    strat = create_strategy(name, settings)
+    bars = random_bars(strat)
+    zones = zones_for(strat, bars, settings)
+    full = strat.signals(bars, zones)
+    step = interval_seconds(strat.interval)
+    fired = np.flatnonzero(full["side"].to_numpy() != "")
+    quiet = np.flatnonzero(full["side"].to_numpy() == "")
+    rows = list(fired[:12]) + list(quiet[strat.min_bars::97][:8]) + [strat.min_bars - 2]
+    assert len(fired) >= 4
+    for i in rows:
+        live = create_strategy(name, settings)                    # instancia nueva: sin memoria de la vela
+        zd = row_zones(zones, i, "BTC") if zones is not None else {}
+        sig = live.evaluate("BTC", bars.iloc[:i + 1], None, zd, now=bars.index[i].timestamp() + step)
+        row = full.iloc[i]
+        if row["side"] == "":
+            assert sig is None, i
+            continue
+        assert sig is not None, i
+        assert (sig.side.value, sig.entry_mode.value, sig.strategy) == (row["side"], row["entry_mode"], name)
+        assert (sig.entry_px, sig.sl_price, sig.tp_price) == (row["entry_px"], row["sl"], row["tp"])
+        assert sig.reason == row["reason"] and sig.confidence == row["confidence"]
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_live_signal_is_the_last_row_of_signals_with_the_mid(settings, name):
+    """Con mid distinto del cierre, la señal viva es la última fila de ``signals(..., ref_px=mid)``."""
+    strat = create_strategy(name, settings)
+    bars = random_bars(strat)
+    zones = zones_for(strat, bars, settings)
+    full = strat.signals(bars, zones)
+    i = int(np.flatnonzero(full["side"].to_numpy() != "")[-1])
+    window, mid = bars.iloc[:i + 1], float(bars["close"].iloc[i]) * 1.0003
+    zd = row_zones(zones, i, "BTC") if zones is not None else {}
+    zdf = zones_frame(window.index, zd, "BTC") if strat.uses_zones else None
+    expected = strat.signals(window, zdf, ref_px=mid).iloc[-1]
+    sig = create_strategy(name, settings).evaluate("BTC", window, mid, zd,
+                                                   now=window.index[-1].timestamp() + interval_seconds(strat.interval))
+    if expected["side"] == "":
+        assert sig is None
+    else:
+        assert sig.side.value == expected["side"] and sig.entry_px == mid
+        assert (sig.sl_price, sig.tp_price) == (expected["sl"], expected["tp"])
+
+
+def _scramble_future(bars, k, seed):
+    """Copia con las velas posteriores a ``k`` sustituidas por otro paseo (precio y volumen)."""
+    rng = np.random.default_rng(seed)
+    out = bars.copy()
+    m = len(out) - k - 1
+    factor = np.exp(np.cumsum(rng.normal(0.002, 0.01, m)))
+    for col in ("open", "high", "low", "close"):
+        out.iloc[k + 1:, out.columns.get_loc(col)] = out[col].iloc[k + 1:].to_numpy() * factor
+    out.iloc[k + 1:, out.columns.get_loc("volume")] = rng.uniform(10, 10_000, m)
+    return out
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_signals_never_look_ahead(settings, name):
+    """Cambiar (o quitar) velas futuras no cambia ninguna señal pasada; las zonas se recalculan también."""
+    strat = create_strategy(name, settings)
+    bars = random_bars(strat)
+    base = strat.signals(bars, zones_for(strat, bars, settings))
+    for n_cut, k in enumerate((len(bars) // 3, len(bars) // 2, 2 * len(bars) // 3)):
+        altered = _scramble_future(bars, k, seed=n_cut)
+        alt = strat.signals(altered, zones_for(strat, altered, settings))
+        pd.testing.assert_frame_equal(base.iloc[:k + 1], alt.iloc[:k + 1])
+        assert not alt.iloc[k + 1:].equals(base.iloc[k + 1:])      # el cambio sí afecta al futuro
+        cut = bars.iloc[:k + 1]
+        pd.testing.assert_frame_equal(base.iloc[:k + 1], strat.signals(cut, zones_for(strat, cut, settings)))
+    # Cortes en muchas velas: las que disparan, la anterior a cada una (una fuga suele adelantar la señal
+    # una vela) y una muestra regular. La última fila de la historia cortada es la fila de la completa.
+    fired = np.flatnonzero(base["side"].to_numpy() != "")[:25]
+    rows = sorted({*fired.tolist(), *(fired - 1).tolist(), *range(strat.min_bars, len(bars), 41)})
+    for k in rows:
+        cut = bars.iloc[:k + 1]
+        last = strat.signals(cut, zones_for(strat, cut, settings)).iloc[-1]
+        assert last.equals(base.iloc[k]), k
+
+
+# --- parámetros -------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ALL)
+def test_param_grid_is_valid_and_params_roundtrip(settings, name):
+    cls = STRATEGIES[name]
+    assert cls.PARAM_GRID and set(cls.PARAM_GRID) <= set(cls.PARAMS)
+    keys = list(cls.PARAM_GRID)
+    for combo in itertools.product(*(cls.PARAM_GRID[k] for k in keys)):   # todas las combinaciones construyen
+        strat = cls(settings, **dict(zip(keys, combo)))
+        assert strat.lookback > strat.min_bars >= cls.min_bars
+        assert all(strat.params()[k] == v for k, v in zip(keys, combo))
+    strat = cls(settings)
+    params = strat.params()
+    assert list(params) == list(cls.PARAMS) and json.loads(json.dumps(params)) == params
+    assert cls(settings, **params).params() == params
+
+
+@pytest.mark.parametrize("name,kwargs", [
+    ("ema_trend", {"martingala": 2}),             # nombre desconocido
+    ("ema_trend", {"fast": 50, "slow": 20}),      # fast >= slow
+    ("ema_trend", {"fast": 9.5}),                 # periodo no entero
+    ("ema_trend", {"fast": True}),
+    ("rsi_reversion", {"rsi_low": 80.0}),         # rsi_low >= rsi_high
+    ("donchian_breakout", {"channel": 1}),
+    ("squeeze_breakout", {"adx_min": float("nan")}),
+    ("liquidity_sweep", {"tp_r": 0}),
+    ("liquidity_sweep", {"sl_atr_mult": "mucho"}),
+])
+def test_invalid_params_raise(settings, name, kwargs):
+    with pytest.raises(ValueError):
+        create_strategy(name, settings, **kwargs)
+
+
+def test_interval_and_params_from_the_constructor(settings, clock):
+    strat = EmaTrendStrategy(settings, clock, interval="4h", fast=12, slow=200, tp_r=3)
+    assert strat.interval == "4h" and strat.clock is clock
+    assert strat.params()["fast"] == 12 and isinstance(strat.params()["fast"], int)
+    assert strat.params()["tp_r"] == 3.0 and isinstance(strat.params()["tp_r"], float)
+    assert strat.min_bars > 200 and strat.lookback >= strat.min_bars + 4 * 200   # calienta la EMA lenta
+    assert EmaTrendStrategy.interval == "1h"                                      # la clase no cambia
+    with pytest.raises(ValueError):
+        EmaTrendStrategy(settings, interval="7m")
+
+
+def test_default_warmup_of_existing_strategies_is_unchanged(settings):
+    assert (LiquiditySweepStrategy(settings).lookback, LiquiditySweepStrategy(settings).min_bars) == (120, 30)
+    assert (SqueezeBreakoutStrategy(settings).lookback, SqueezeBreakoutStrategy(settings).min_bars) == (150, 50)
+
+
+def test_tp_r_param_overrides_the_live_default(settings):
+    sig = SqueezeBreakoutStrategy(settings, tp_r=1.5).evaluate("BTC", candles(SQ_LONG, "1h"), None, {},
+                                                               now=END + H1)
+    assert_bracket(sig, Side.LONG, 1.5)
+    settings.default_tp_r = 3.0                                   # no le afecta: tiene su propio tp_r
+    sig = SqueezeBreakoutStrategy(settings, tp_r=1.5).evaluate("BTC", candles(SQ_LONG, "1h"), None, {},
+                                                               now=END + H1)
+    assert_bracket(sig, Side.LONG, 1.5)
+
+
+def test_parameters_change_the_signals(settings):
+    bars = make_candles(n=1200, seed=5, vol_pct=0.5, interval="4h", end_ts=END)
+    a = DonchianBreakoutStrategy(settings, channel=10).signals(bars)
+    b = DonchianBreakoutStrategy(settings, channel=55).signals(bars)
+    assert (a["side"] != "").sum() > (b["side"] != "").sum() > 0
+
+
+# --- estrategias nuevas con patrones construidos a mano -----------------------------
+
+EMA_UP = list(np.linspace(110, 100, 120)) + list(np.linspace(100, 112, 60))     # bajada y giro alcista
+EMA_DOWN = list(np.linspace(100, 110, 120)) + list(np.linspace(110, 98, 60))
+
+
+@pytest.mark.parametrize("closes,side", [(EMA_UP, Side.LONG), (EMA_DOWN, Side.SHORT)])
+def test_ema_trend_fires_on_the_cross_bar(settings, closes, side):
+    df = candles(closes, "1h")
+    sig = EmaTrendStrategy(settings).signals(df)
+    rows = np.flatnonzero(sig["side"].to_numpy() != "")
+    fast, slow = ema(df["close"], 20), ema(df["close"], 50)
+    diff = (fast - slow).to_numpy()
+    crosses = np.flatnonzero((np.sign(diff[1:]) != np.sign(diff[:-1])) & np.isfinite(diff[:-1])) + 1
+    assert list(rows) == list(crosses) and len(rows) == 1
+    i = int(rows[0])
+    assert adx(df["high"], df["low"], df["close"], 14).iloc[i] > 20
+    # evaluate en esa vela: misma señal, SL a 2 ATR y TP a default_tp_r R
+    s = EmaTrendStrategy(settings).evaluate("ETH", df.iloc[:i + 1], None, {}, now=df.index[i].timestamp() + H1)
+    assert s is not None and s.side is side and "cruce" in s.reason
+    a = atr(df["high"], df["low"], df["close"], 14).iloc[i]
+    assert abs(s.entry_px - s.sl_price) == pytest.approx(2.0 * a)
+    assert_bracket(s, side, settings.default_tp_r)
+    # con un filtro de ADX imposible no hay señal
+    assert (EmaTrendStrategy(settings, adx_min=99.0).signals(df)["side"] == "").all()
+
+
+WAVE = [100 + 0.3 * np.sin(i / 2) for i in range(60)]
+RSI_DROP = WAVE + [99.5, 98.8, 98.0, 97.2]
+RSI_POP = WAVE + [100.5, 101.2, 102.0, 102.8]
+
+
+@pytest.mark.parametrize("closes,side", [(RSI_DROP, Side.LONG), (RSI_POP, Side.SHORT)])
+def test_rsi_reversion_targets_the_mean(settings, closes, side):
+    df = candles(closes)
+    s = RsiReversionStrategy(settings).evaluate("SOL", df, None, {}, now=END + M15)
+    assert s is not None and s.side is side and s.entry_mode is EntryMode.MARKET and "RSI" in s.reason
+    up, mid, lo = bollinger(df["close"], 20, 2.0)
+    assert s.tp_price == pytest.approx(mid.iloc[-1])                     # objetivo: la media
+    assert abs(s.entry_px - s.sl_price) == pytest.approx(1.5 * atr(df["high"], df["low"], df["close"], 14).iloc[-1])
+    if side is Side.LONG:
+        assert df["low"].iloc[-1] <= lo.iloc[-1] and s.sl_price < s.entry_px < s.tp_price
+    else:
+        assert df["high"].iloc[-1] >= up.iloc[-1] and s.tp_price < s.entry_px < s.sl_price
+
+
+def test_rsi_reversion_needs_room_to_the_mean_and_an_extreme(settings):
+    df = candles(RSI_DROP)
+    assert RsiReversionStrategy(settings, min_rr=10.0).evaluate("SOL", df, None, {}, now=END + M15) is None
+    assert RsiReversionStrategy(settings, rsi_low=5.0).evaluate("SOL", df, None, {}, now=END + M15) is None
+    assert RsiReversionStrategy(settings).evaluate("SOL", candles(WAVE), None, {}, now=END + M15) is None
+
+
+RANGE = [100 + (0.8 if i % 2 else -0.8) for i in range(40)]
+
+
+@pytest.mark.parametrize("closes,side", [(RANGE + [102.0, 102.5], Side.LONG), (RANGE + [98.0, 97.5], Side.SHORT)])
+def test_donchian_breakout_fires_once_on_the_first_close_outside(settings, closes, side):
+    df = candles(closes, "4h")
+    sig = DonchianBreakoutStrategy(settings).signals(df)
+    assert list(np.flatnonzero(sig["side"].to_numpy() != "")) == [40]   # la ruptura, no la vela siguiente
+    row = sig.iloc[40]
+    assert row["side"] == side.value and "Donchian 20" in row["reason"]
+    a = atr(df["high"], df["low"], df["close"], 14).iloc[40]
+    assert abs(row["entry_px"] - row["sl"]) == pytest.approx(2.0 * a)
+    assert abs(row["tp"] - row["entry_px"]) == pytest.approx(settings.default_tp_r * 2.0 * a)
+
+
+def test_liquidity_sweep_without_zones_never_fires(settings):
+    strat = LiquiditySweepStrategy(settings)
+    assert (strat.signals(candles(LONG_SWEEP)).side == "").all()
+    assert strat.evaluate("HYPE", candles(LONG_SWEEP), 98.6, {}, now=END + M15) is None

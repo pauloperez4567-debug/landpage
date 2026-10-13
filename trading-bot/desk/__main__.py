@@ -5,6 +5,8 @@
     python -m desk send "long HYPE"        (escribe en state/inbox.txt y espera la respuesta en outbox.log)
     python -m desk status                  (último estado guardado por la mesa y avisos de salud)
     python -m desk health                  (0 = sana; 1 = parada o sin ver el exchange: para healthchecks)
+    python -m desk dashboard [--once]      (panel en vivo de sólo lectura sobre los ficheros de estado)
+    python -m desk console                 (consola interactiva conectada a la mesa en marcha por inbox/outbox)
 
 ``--fast`` usa un reloj simulado (``SimClock``) con datos ``sim`` o ``replay``: cada ciclo avanza
 ``loop_seconds`` de tiempo simulado sin esperar, así se simulan días en segundos. Su estado va a
@@ -27,13 +29,14 @@ import os
 import shutil
 import sys
 import threading
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .clock import Clock, RealClock, SimClock
 from .config import LIVE_CONFIRM_PHRASE, Settings, load_settings
-from .journal import INBOX_FILE, OUTBOX_FILE, Journal, read_outbox
+from .journal import Journal
+# append_inbox_line se reexporta: la usan los tests y quien escribía en el inbox importándola de aquí.
+from .remote import DEFAULT_TIMEOUT_S, append_inbox_line, no_reply_message, send_command, wait_reply  # noqa: F401
 
 log = logging.getLogger("desk.cli")
 
@@ -334,61 +337,23 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------- send / status
 def cmd_send(args: argparse.Namespace) -> int:
+    """Envía un comando por el inbox y espera la respuesta (la lógica, compartida con la consola, en ``remote``)."""
     state_dir = _base_state_dir(args)
     state_dir.mkdir(parents=True, exist_ok=True)
-    text = " ".join(args.text).strip()
-    if not text or "\n" in text:
-        print("Comando vacío o con saltos de línea.", file=sys.stderr)
-        return 2
-    cmd_id = f"cli-{uuid.uuid4().hex[:8]}"
-    outbox = state_dir / OUTBOX_FILE
     try:
-        offset = outbox.stat().st_size
-    except FileNotFoundError:
-        offset = 0
-    append_inbox_line(state_dir / INBOX_FILE, f"[{cmd_id}] {text}")
+        sent = send_command(state_dir, " ".join(args.text), prefix="cli")
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     if args.no_wait:
-        print(f"Enviado [{cmd_id}] a {state_dir / INBOX_FILE}")
+        print(f"Enviado [{sent.cmd_id}] a {sent.inbox}")
         return 0
-    clock = RealClock()
-    deadline = clock.now() + args.timeout
-    lines: list[str] = []
-    got_at: Optional[float] = None
-    while clock.now() < deadline:
-        new, offset = read_outbox(outbox, cmd_id, offset)
-        if new:
-            lines.extend(new)
-            got_at = got_at or clock.now()
-        elif got_at is not None and clock.now() - got_at > 0.5:
-            break
-        clock.sleep(0.25)
+    lines = wait_reply(sent, args.timeout, RealClock())
     if lines:
         print("\n".join(lines))
         return 0
-    print(f"La mesa no respondió en {args.timeout:g} s (¿está corriendo con este estado: {state_dir}?).\n"
-          f"El comando [{cmd_id}] queda en {INBOX_FILE} y se ejecutará (una sola vez) cuando la mesa lo lea. No "
-          "borres ni edites líneas del inbox: si ya no lo quieres, envía después el comando contrario (p. ej. "
-          "'cancela HYPE' o 'cierra HYPE').", file=sys.stderr)
+    print(no_reply_message(sent, args.timeout, state_dir), file=sys.stderr)
     return 1
-
-
-def append_inbox_line(path: Path, line: str) -> None:
-    """Añade una línea al inbox con su salto final. Si el fichero no acaba en salto de línea (alguien escribió a
-    mano sin él) antepone uno: si no, el comando se pegaría a esa línea. Con bloqueo para escritores concurrentes."""
-    data = (line.rstrip("\n") + "\n").encode("utf-8")
-    with open(path, "a+b") as f:
-        try:
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):     # Windows o sistema de ficheros sin bloqueos
-            pass
-        f.seek(0, os.SEEK_END)
-        if f.tell() > 0:
-            f.seek(-1, os.SEEK_END)
-            if f.read(1) != b"\n":
-                data = b"\n" + data
-        f.write(data)
-        f.flush()
 
 
 def health_check(state_dir: Path, now: float, max_age: float = HEALTH_MAX_AGE_S,
@@ -465,6 +430,34 @@ def cmd_health(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- dashboard / console
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Panel en vivo de sólo lectura (rich) sobre los ficheros de estado."""
+    try:
+        from .tui import run_dashboard
+    except ImportError as e:
+        print(f"El panel necesita 'rich' (pip install rich): {e}", file=sys.stderr)
+        return 2
+    state_dir = _base_state_dir(args)
+    if not state_dir.exists():
+        print(f"No existe {state_dir} (¿la mesa ha corrido alguna vez con este estado?).", file=sys.stderr)
+        return 1
+    return run_dashboard(state_dir, refresh_s=max(0.2, float(args.refresh)), once=args.once)
+
+
+def cmd_console(args: argparse.Namespace) -> int:
+    """Consola interactiva conectada por inbox/outbox a una mesa en marcha."""
+    try:
+        from .console import run_console
+    except ImportError as e:
+        print(f"La consola necesita 'rich' (pip install rich): {e}", file=sys.stderr)
+        return 2
+    state_dir = _base_state_dir(args)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    problems, _ = health_check(state_dir, RealClock().now())
+    return run_console(state_dir, timeout=args.timeout, warnings=[f"la mesa {p}" for p in problems])
+
+
 # --------------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m desk",
@@ -490,7 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("send", help="envía un comando a la mesa en marcha y espera la respuesta")
     s.add_argument("text", nargs="+", help='p. ej. "long HYPE 2u zona"')
-    s.add_argument("--timeout", type=float, default=30.0, help="segundos de espera (30)")
+    s.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help=f"segundos de espera ({DEFAULT_TIMEOUT_S:g})")
     s.add_argument("--no-wait", action="store_true", help="no esperar la respuesta")
     s.add_argument("--state-dir")
     s.add_argument("--fast", action="store_true", help="usar el estado de la simulación --fast")
@@ -512,6 +505,22 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--max-stale", type=float, default=STAGE_MAX_STALE_S,
                    help=f"segundos sin leer la cuenta o los fills para darla por ciega ({STAGE_MAX_STALE_S:g})")
     h.set_defaults(func=cmd_health)
+
+    d = sub.add_parser("dashboard", help="panel en vivo (sólo lectura) del estado de la mesa")
+    d.add_argument("--state-dir")
+    d.add_argument("--fast", action="store_true", help="panel de la simulación --fast")
+    d.add_argument("--env-file", default=".env")
+    d.add_argument("--refresh", type=float, default=1.0, help="segundos entre refrescos (1)")
+    d.add_argument("--once", action="store_true", help="pinta una vez y sale (también sin terminal)")
+    d.set_defaults(func=cmd_dashboard)
+
+    c = sub.add_parser("console", help="consola interactiva conectada a la mesa en marcha (inbox/outbox)")
+    c.add_argument("--state-dir")
+    c.add_argument("--fast", action="store_true", help="hablar con la simulación --fast")
+    c.add_argument("--env-file", default=".env")
+    c.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
+                   help=f"segundos de espera de cada respuesta ({DEFAULT_TIMEOUT_S:g})")
+    c.set_defaults(func=cmd_console)
     return p
 
 

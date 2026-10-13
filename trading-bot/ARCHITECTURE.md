@@ -308,6 +308,24 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
 - Estrategias nuevas registradas en `STRATEGIES`: `ema_trend` (cruce EMA rápida/lenta + filtro ADX),
   `rsi_reversion` (RSI extremo + toque de Bollinger, objetivo media), `donchian_breakout` (ruptura de canal
   N velas + stop ATR). Todas con SL/TP coherentes y `PARAM_GRID`.
+- Implementado (detalles y extensiones compatibles):
+  - `PARAMS: tuple[str, ...]` = parámetros ajustables (`PARAM_GRID` es un subconjunto); valores con el tipo
+    del defecto (entero no entero, NaN, `fast >= slow`... -> `ValueError`). `tp_r=None` (por defecto) = usa
+    `default_tp_r` en caliente; con número, TP fijo a ese R (lo que se optimiza). `min_bars`/`lookback` son de
+    instancia y crecen con los periodos (los de `liquidity_sweep` 30/120 y `squeeze_breakout` 50/150 no cambian).
+  - `signals(bars, zones=None, *, ref_px=None)`: `ref_px` = precio de referencia de la última fila (en vivo el
+    mid; sin él, el cierre). Columna extra `confidence`. `SIGNAL_COLUMNS`, `empty_signals(index)`.
+    Las primeras `min_bars - 1` filas y las de OHLC inválido (vela o anterior) nunca dan señal. `uses_zones`
+    (sólo `liquidity_sweep`): sin zonas no hay señal. `signal_at(signals, pos, coin) -> Signal|None`.
+  - Paridad: `evaluate(bars[:i+1], mid=None|cierre)` == fila `i` de `signals` sobre toda la historia (exacto).
+    En vivo las medias recursivas (EMA/Wilder) arrancan `lookback` velas atrás: diferencia despreciable, no cero.
+  - `create_strategy(name, settings, clock=None, *, interval=None, **params)` (nombre normalizado).
+  - `liquidity`: `ZONE_COLUMNS`, `zones_frame(index, zones_dict, coin)` (zonas vivas en la última fila, con
+    `long_source`/`short_source` opcionales), `row_zones(zones_df, pos, coin) -> dict[Side, Zone|None]`,
+    `historical_zones(..., *, pivot_bars=3, max_age=300)`: pivote con 3 velas a cada lado, usado desde su
+    confirmación, se borra al *cerrar* más allá (una mecha no lo borra) o a las 300 velas; rejilla y filtros de
+    `find_zone` anclados en el cierre; fuente `HIST_SOURCE` ("pivots").
+  - `indicators.wilder` reescrita sobre floats (mismo resultado bit a bit, ~50x más rápida).
 
 ## `desk/backtest.py`
 - `BTTrade(coin, side, entry_ts, entry_px, exit_ts, exit_px, size, pnl, pnl_pct, r_multiple, fees, exit_reason, bars_held)`;
@@ -323,6 +341,28 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   ejecución al open (peor). Dimensionamiento igual que el riesgo en vivo (`auto_units`, `unit_margin_usd`,
   apalancamiento min(settings, meta), recorte por `risk_per_trade_pct` en el SL y `max_notional_per_coin_usd`).
   5000 velas con un juego de parámetros en < 100 ms.
+- Implementado (detalles y extensiones compatibles):
+  - `run_backtest(..., signals=None, trade_from=None, allow_flip=False)`: `signals` = señales ya calculadas
+    (sobre estas velas o una historia más larga con el mismo inicio: son causales); `trade_from` = posición o
+    marca de tiempo de la primera vela operada (las anteriores sólo calientan; equity y métricas empiezan ahí);
+    `allow_flip=False` como en vivo (con posición no se evalúa); True -> señal contraria cierra (`"flip"`) al open.
+    Sin `zones`, las estrategias con `uses_zones` usan `historical_zones`. `ValueError` si faltan columnas o el
+    índice no es `DatetimeIndex`.
+  - Reglas concretas: MARKET se descarta si al open de i+1 el SL/TP ya quedan del lado equivocado (el riesgo lo
+    rechazaría); límite: sólo cuentan velas que terminan antes de la caducidad, ejecución al precio límite y en
+    esa vela sólo cuenta el SL; hueco a través del TP -> al TP (sin regalo); salidas SL/TP/fin = taker + desliz.;
+    lo abierto se cierra al cierre de la última vela (`"end"`). Sin funding, liquidaciones ni spread.
+  - `BTTrade.side` = "long"/"short"; `entry_ts`/`exit_ts` = apertura (s UNIX) de la vela donde ocurre;
+    `pnl` neto; `pnl_pct` = pnl / equity al entrar · 100; `r_multiple` = pnl / (size·|entrada − SL|);
+    `bars_held` cuenta la vela de entrada y la de salida. `to_dict()/from_dict()` en ambas clases.
+  - `BacktestResult.to_dict(max_points=500)`: `equity` = `[[ts, valor], ...]` (incluye primero y último).
+    `equity` (Series) = capital marcado a mercado al cierre de cada vela, índice = apertura de la vela.
+  - `metrics` incluye además `n_signals` y `n_skipped` (señales operables / descartadas por niveles, tamaño o
+    caducidad). Todo finito: `profit_factor` sin pérdidas = `PF_CAP` (999); Sharpe/Sortino anualizados con
+    velas 24/7 y sin tipo libre de riesgo.
+  - `compute_metrics(trades, equity, start_equity, interval, *, n_bars=None, end_ts=None) -> dict` y
+    `position_size(settings, meta, equity, entry, sl) -> (size, leverage)` (mismo cálculo que
+    `RiskManager.evaluate` con la cuenta plana) son públicas para el optimizador.
 
 ## `desk/optimizer.py`
 - `StrategyEvaluation(strategy, params, is_metrics, oos_metrics, oos_trades, folds, score, passed, reasons)`.
@@ -362,6 +402,20 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `key` y `alert_cooldown_seconds`), `mute(minutes|None)`, `unmute()` (los críticos nunca se silencian).
 - Persistencia: reglas en `state/alerts.json`; cada aviso disparado en `state/alerts.jsonl`
   (`{"ts","level","kind","coin","text","rule_id"}`), que leen el panel y la consola.
+- Implementado (extensiones compatibles): `AlertRule` añade `severity` ("warn" por defecto; "critical" no se silencia) y
+  `state` (referencia del cruce `s` y última vela evaluada `bar`, persistidos). Claves opcionales del spec: `interval`
+  (velas, "1h" por defecto), `repeat`, `cooldown_s` (por defecto `alert_cooldown_seconds`), `note`, `severity`,
+  `immediate`; `move_pct` admite `direction` (`pct` negativo = caída). `add(coin, spec, *, ref_px=None)` (mid actual:
+  referencia de los cruces de precio; spec inválido -> `ValueError` con el motivo), `get(id)`, `list_text()`, `stats()`
+  (contadores para `status.json`), `describe_rule(rule)`. `system(..., image=None) -> bool` (False = omitido por
+  anti-spam o silenciado; un crítico con texto distinto pasa el anti-spam). `mute()`/`unmute()` devuelven la respuesta
+  para el usuario; al caducar el silencio se avisa del recuento. Los avisos silenciados van a `alerts.jsonl` con
+  `"muted": true`.
+- Semántica: **cruces, no estados** (`price_above 100` creada con el precio en 105 no dispara hasta que baje a <= 100
+  y vuelva a superarlo; `immediate: True` = dispara también si ya se cumple). Precio = mid cada ciclo; indicadores sobre
+  velas cerradas, una vez por vela y sólo con velas que cierran después de crear la alarma; las velas se piden sólo
+  cuando puede haber cerrado una nueva. `zone`: el precio entra en la zona vista en el ciclo anterior. Una vez
+  (`repeat=False`) = dispara y se elimina.
 
 ## `desk/notify.py`
 - `Notifier(channels)`: `send(text, level="info", kind="", coin=None, image=None)`; envío de red en un hilo con cola
@@ -370,12 +424,25 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `TelegramChannel(token, chat_ids, min_level, session=None)` (`sendMessage`, `sendPhoto` si hay imagen),
   `WebhookChannel(url, min_level, session=None)` (JSON con `content` y `text`: vale para Discord y Slack).
 - Niveles: "info" < "warn" < "critical".
+- Implementado (extensiones compatibles): `Notifier(channels, *, clock=None, threaded=True, queue_size=500)` con
+  `flush(timeout) -> bool`, `close()`, `describe()`, contadores `sent`/`failed`/`dropped` y `last_error` (sin secretos);
+  cola llena -> se descarta el aviso más antiguo. `build_notifier(settings, out=None, *, console=True, clock=None,
+  session=None, file_path=None)` monta los canales según `telegram_*`, `webhook_url` y `alert_min_level_*`.
+  Telegram: texto plano, troceo a 4000 caracteres (`split_message`), "info" sin sonido, `sendPhoto` multipart (si la
+  foto falla el texto llega igual), un reintento ante 429. Webhook troceado a 1900 (límite de Discord). Errores pasan
+  por `redact`: nunca se registran el token ni la ruta del webhook (`safe_url` = sólo el host).
 
 ## `desk/telegram_bot.py`
 - `TelegramBot(token, chat_ids, submit, clock=None, session=None)`: long polling de `getUpdates` (timeout 25 s) en un
   hilo daemon; sólo acepta mensajes de `chat_ids` (el resto se ignora sin responder y se registra);
   `/start` y `/help` -> ayuda; un `/comando` se traduce a texto (`/estado` -> "estado"); cada texto se pasa a
   `submit(text, source="telegram") -> str` y la respuesta vuelve al chat. `start()`, `stop()`. Nunca registra el token.
+- Implementado (extensiones compatibles): kwargs `poll_timeout=25`, `max_age_s=300` (mensajes más antiguos según el
+  `clock` no se ejecutan y se avisa al chat; `None` lo desactiva, p. ej. con un `SimClock`), `api_base`. `poll_once()
+  -> int` (un `getUpdates` + tratamiento, nunca lanza), `reply(chat_id, text, reply_to=None) -> bool`,
+  `translate_command(text)` (`/cierra_todo@Bot` -> "cierra todo"). Offset en memoria **confirmado a Telegram antes de
+  ejecutar** (como mucho una vez: un reinicio no repite un "long"); ediciones y mensajes no de texto no se ejecutan.
+  Backoff 1, 2, 4... 60 s (respeta `retry_after`; 401/404 -> 300 s); `start()` devuelve False sin token.
 
 ## `desk/tui.py` y `desk/console.py`
 - `python -m desk dashboard`: panel `rich.live` de sólo lectura sobre los archivos de estado (`status.json`,

@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+import pandas as pd
 import pytest
 
+from conftest import make_candles
 from desk.exchange.base import MarketDataError
-from desk.liquidity import LiquidityScanner, book_levels, find_zone, liq_levels
-from desk.models import Side
+from desk.liquidity import (HIST_SOURCE, ZONE_COLUMNS, LiquidityScanner, book_levels, find_zone, historical_zones,
+                            liq_levels, row_zones, zones_frame)
+from desk.models import Side, Zone
 
 MID = 100.0
 
@@ -242,3 +246,130 @@ def test_scanner_degrades_to_book_when_liquidation_feed_fails(market, settings, 
     monkeypatch.setattr(market, "liquidation_levels", broken_liqs)
     z = LiquidityScanner(market, settings).zone("HYPE", Side.LONG)
     assert z is not None and z.source == "book" and z.contains(99.5)
+
+
+# --- zonas históricas (backtest) ----------------------------------------------------
+
+def ohlc(rows, start="2026-01-01", freq="15min"):
+    """Velas a mano: filas (open, high, low, close[, volume])."""
+    rows = [tuple(r) + (1_000.0,) * (5 - len(r)) for r in rows]
+    idx = pd.date_range(start, periods=len(rows), freq=freq, tz="UTC")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=idx, dtype=float)
+
+
+def v_bottom(after):
+    """Bajada de 102.5 a 100 (mínimo de pivote 99.9 en la vela 5), subida y luego ``after`` (cierres)."""
+    closes = [102.5, 102.0, 101.5, 101.0, 100.5, 100.0, 100.5, 101.0, 101.5] + list(after)
+    rows, prev = [], closes[0]
+    for c in closes:
+        rows.append((prev, max(prev, c) + 0.1, min(prev, c) - 0.1, c))
+        prev = c
+    return rows
+
+
+def reference_zone(bars, i, side, settings, k=3, max_age=300):
+    """Implementación directa (lenta) de la definición, sobre ``find_zone``: pivotes confirmados en ``i``."""
+    lo, hi, cl, vol = (bars[c].to_numpy() for c in ("low", "high", "close", "volume"))
+    pts = []
+    for p in range(k, i - k + 1):
+        if i - p > max_age:
+            continue
+        if side is Side.LONG:
+            ok = lo[p] < lo[p - k:p].min() and lo[p] <= lo[p + 1:p + k + 1].min()
+            px, broken = lo[p], (cl[p + k:i + 1] < lo[p]).any()
+        else:
+            ok = hi[p] > hi[p - k:p].max() and hi[p] >= hi[p + 1:p + k + 1].max()
+            px, broken = hi[p], (cl[p + k:i + 1] > hi[p]).any()
+        if ok and not broken:
+            pts.append((px, vol[p] * px))
+    return find_zone("X", side, cl[i], [], pts, settings)
+
+
+def test_historical_zones_match_the_direct_definition(settings):
+    bars = make_candles(n=900, seed=11, vol_pct=0.4)
+    bars["volume"] = np.random.default_rng(3).uniform(100, 5_000, len(bars))     # el volumen pesa
+    z = historical_zones(bars, settings)
+    assert list(z.columns) == ZONE_COLUMNS and z.index.equals(bars.index)
+    checked = 0
+    for i in range(10, len(bars), 7):
+        for side in (Side.LONG, Side.SHORT):
+            ref = reference_zone(bars, i, side, settings)
+            p = side.value
+            got = z.iloc[i][[f"{p}_low", f"{p}_high", f"{p}_usd"]].to_numpy(dtype=float)
+            if ref is None:
+                assert np.isnan(got).all(), (i, side)
+            else:
+                checked += 1
+                assert got == pytest.approx([ref.low, ref.high, ref.usd], rel=1e-12), (i, side)
+                assert ref.high <= bars["close"].iloc[i] if side is Side.LONG else ref.low >= bars["close"].iloc[i]
+    assert checked > 150
+
+
+def test_pivot_counts_only_once_confirmed(settings):
+    bars = ohlc(v_bottom([102.0, 102.0]))
+    z = historical_zones(bars, settings)
+    assert z["long_low"].iloc[:8].isna().all()                  # el mínimo de la vela 5 aún no está confirmado
+    assert z["long_low"].iloc[8] <= 99.9 <= z["long_high"].iloc[8]
+    assert z["long_usd"].iloc[8] == pytest.approx(1_000.0 * 99.9)
+
+
+def test_wick_through_keeps_the_pivot_close_through_removes_it(settings):
+    rows = v_bottom([101.0])
+    rows.append((101.0, 101.1, 99.5, 100.6))                  # 10: mecha bajo 99.9 pero cierra encima
+    rows.append((100.6, 101.2, 100.5, 101.0))                 # 11
+    rows.append((101.0, 101.0, 99.0, 99.6))                   # 12: cierra bajo 99.9 -> nivel roto
+    rows.append((99.6, 100.4, 99.5, 100.3))                   # 13
+    z = historical_zones(ohlc(rows), settings)
+    has = lambda i: z["long_low"].iloc[i] <= 99.9 <= z["long_high"].iloc[i]    # noqa: E731
+    assert has(10) and has(11)
+    assert not has(12) and not has(13)
+
+
+def test_old_pivots_expire(settings):
+    bars = ohlc(v_bottom([102.0] * 10))
+    assert historical_zones(bars, settings)["long_low"].iloc[8:].notna().all()
+    z = historical_zones(bars, settings, max_age=6)
+    assert z["long_low"].iloc[8:12].notna().all() and z["long_low"].iloc[12:].isna().all()   # 5 + 6 = 11
+
+
+def test_historical_zones_short_side_mirror(settings):
+    rows = [(2 * 101.0 - o, 2 * 101.0 - lo, 2 * 101.0 - hi, 2 * 101.0 - c) for o, hi, lo, c in v_bottom([100.0])]
+    z = historical_zones(ohlc(rows), settings)
+    assert z["short_low"].iloc[:8].isna().all()
+    assert z["short_low"].iloc[8] <= 102.1 <= z["short_high"].iloc[8]
+    assert z["short_low"].iloc[8] > ohlc(rows)["close"].iloc[8]
+
+
+def test_historical_zones_never_look_ahead(settings):
+    bars = make_candles(n=1500, seed=4, vol_pct=0.5)
+    full = historical_zones(bars, settings)
+    for k in (300, 777, 1200):
+        changed = bars.copy()
+        changed.iloc[k + 1:, :4] = changed.iloc[k + 1:, :4].to_numpy() * 0.93
+        pd.testing.assert_frame_equal(full.iloc[:k + 1], historical_zones(changed, settings).iloc[:k + 1])
+        pd.testing.assert_frame_equal(full.iloc[:k + 1], historical_zones(bars.iloc[:k + 1], settings))
+
+
+def test_historical_zones_degenerate_inputs(settings):
+    assert historical_zones(make_candles(n=5), settings).isna().all().all()
+    assert len(historical_zones(make_candles(n=200).iloc[:0], settings)) == 0
+    settings.zone_width_pct = 0.0
+    assert historical_zones(make_candles(n=200), settings).isna().all().all()
+
+
+def test_zones_frame_puts_live_zones_on_the_last_row_only():
+    idx = pd.date_range("2026-01-01", periods=4, freq="15min", tz="UTC")
+    long_z = Zone("HYPE", Side.LONG, 97.0, 97.1, 5e5, "liq")
+    short_z = Zone("HYPE", Side.SHORT, 103.0, 103.1, 2e5, "book")
+    zf = zones_frame(idx, {Side.LONG: long_z, Side.SHORT: short_z}, "HYPE")
+    assert zf[ZONE_COLUMNS].iloc[:3].isna().all().all()
+    assert zf.iloc[-1][["long_low", "long_high", "long_usd"]].tolist() == [97.0, 97.1, 5e5]
+    assert zf.iloc[-1]["short_source"] == "book"
+    back = row_zones(zf, -1, "HYPE")
+    assert back[Side.LONG] == long_z and back[Side.SHORT] == short_z
+    assert row_zones(zf, 0, "HYPE") == {Side.LONG: None, Side.SHORT: None}
+    # otra moneda o lado equivocado del diccionario: se ignoran
+    other = zones_frame(idx, {Side.LONG: Zone("BTC", Side.LONG, 1, 2, 3, "liq"), Side.SHORT: long_z}, "HYPE")
+    assert other[ZONE_COLUMNS].isna().all().all()
+    # sin columna de fuente (zonas históricas) la fuente es HIST_SOURCE
+    assert row_zones(zf[ZONE_COLUMNS], -1, "HYPE")[Side.LONG].source == HIST_SOURCE

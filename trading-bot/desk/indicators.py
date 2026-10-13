@@ -21,24 +21,29 @@ def ema(series: pd.Series, n: int) -> pd.Series:
 
 
 def wilder(series: pd.Series, n: int) -> pd.Series:
-    """Suavizado de Wilder (RMA) con semilla = media simple de los primeros n valores válidos."""
+    """Suavizado de Wilder (RMA) con semilla = media simple de los primeros n valores válidos.
+
+    La recursión va sobre floats de Python (no ``Series.iloc``): mismas operaciones IEEE, mismo
+    resultado bit a bit, ~100 veces más rápido (el backtest la llama sobre miles de velas).
+    """
     s = series.astype(float)
-    out = pd.Series(np.nan, index=s.index, dtype=float)
-    valid = s.dropna()
-    if len(valid) < n:
-        return out
-    start = s.index.get_loc(valid.index[n - 1])
-    values = s.to_numpy()
-    prev = float(valid.iloc[:n].mean())
-    out.iloc[start] = prev
-    for i in range(start + 1, len(values)):
-        v = values[i]
-        if np.isnan(v):
-            out.iloc[i] = prev
+    values = s.to_numpy(dtype=float)
+    out = np.full(len(values), np.nan)
+    valid_pos = np.flatnonzero(~np.isnan(values))
+    if len(valid_pos) < n:
+        return pd.Series(out, index=s.index, dtype=float)
+    start = int(valid_pos[n - 1])
+    prev = float(s.iloc[valid_pos[:n]].mean())
+    out[start] = prev
+    vals = values.tolist()
+    for i in range(start + 1, len(vals)):
+        v = vals[i]
+        if v != v:  # NaN: se arrastra el último valor
+            out[i] = prev
             continue
         prev = prev + (v - prev) / n
-        out.iloc[i] = prev
-    return out
+        out[i] = prev
+    return pd.Series(out, index=s.index, dtype=float)
 
 
 def rsi(close: pd.Series, n: int = 14) -> pd.Series:
