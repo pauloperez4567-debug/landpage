@@ -443,7 +443,7 @@ def test_auto_opens_on_signal_and_leaves_command_positions_alone(settings, marke
     desk.run_cycle()
     acct = desk.broker.account()
     assert acct.positions["SOL"].size > 0
-    assert desk.engine.brackets["SOL"].origin == "auto:stub"
+    assert desk.engine.brackets["SOL"].origin == "auto:stub@15m"     # auto:<estrategia>@<temporalidad>
     assert acct.positions["HYPE"].size > 0 and desk.engine.brackets["HYPE"].origin == "command"
     assert "HYPE" not in stub.calls                        # ni siquiera se evalúa
     assert "AUTO [stub] SOL LONG" in out.text and "Motivo: señal de prueba" in out.text

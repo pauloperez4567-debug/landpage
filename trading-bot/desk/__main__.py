@@ -7,6 +7,8 @@
     python -m desk health                  (0 = sana; 1 = parada o sin ver el exchange: para healthchecks)
     python -m desk dashboard [--once]      (panel en vivo de sólo lectura sobre los ficheros de estado)
     python -m desk console                 (consola interactiva conectada a la mesa en marcha por inbox/outbox)
+    python -m desk backtest --coin SOL --interval 1h --days 120 [--strategy X] [--data sim | --csv velas.csv]
+                                           (backtest walk-forward suelto: resumen + informe JSON/HTML/PNG)
 
 ``--fast`` usa un reloj simulado (``SimClock``) con datos ``sim`` o ``replay``: cada ciclo avanza
 ``loop_seconds`` de tiempo simulado sin esperar, así se simulan días en segundos. Su estado va a
@@ -430,6 +432,141 @@ def cmd_health(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- backtest offline
+def _backtest_market(settings: Settings, state_dir: Path) -> tuple[Any, Clock]:
+    """Mercado y reloj para un backtest suelto. ``sim``: la historia termina en la hora simulada de ``state_dir`` (la
+    de una mesa ``--fast`` que use ese estado) o en el ancla de la simulación. ``replay``: el CSV tal cual (reloj al
+    final de su última vela). ``hyperliquid``: datos reales, hora real."""
+    kind = _data_kind(settings.data_source)
+    if kind == "sim":
+        from .exchange.sim import DEFAULT_ANCHOR_TS, SimMarketData
+        clock = SimClock(resume_clock_ts(state_dir) or DEFAULT_ANCHOR_TS)
+        return SimMarketData(clock), clock
+    if kind == "replay":
+        path = settings.data_source.split(":", 1)[1] if ":" in settings.data_source else ""
+        if not path:
+            raise SystemExit("Falta la ruta del CSV: --csv datos/btc_1h.csv (o --data replay:<ruta>)")
+        from .exchange.base import MarketDataError
+        from .exchange.sim import ReplayMarketData
+        clock = SimClock(0.0)
+        try:
+            market = ReplayMarketData(path, clock, offset=0.0)
+        except MarketDataError as e:
+            raise SystemExit(str(e)) from None
+        clock.set(max(float(s.ts[-1]) + s.interval_s for s in market.series.values()))
+        return market, clock
+    if kind == "hyperliquid":
+        from .exchange.hyperliquid_data import HyperliquidMarketData
+        clock = RealClock()
+        return HyperliquidMarketData.from_settings(settings, clock), clock
+    raise SystemExit(f"Datos desconocidos: {settings.data_source!r} (usa hyperliquid, sim o --csv <fichero>)")
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Backtest walk-forward de una gráfica sin arrancar la mesa: imprime el resumen y guarda JSON/HTML/PNG en
+    ``<estado>/reports`` (donde ``activa COIN tf`` lo encuentra si la mesa usa el mismo estado)."""
+    from .commands import normalize_coin, strategy_key
+    from .exchange.base import MarketDataError
+    from .exchange.intervals import interval_seconds
+    from .jobs import BacktestJob, fetch_bars, run_job
+    from .optimizer import MIN_SEGMENT_BARS, ReportStore
+    from .strategy import STRATEGIES
+
+    overrides: dict[str, Any] = {"auto_enabled": False}
+    if args.data:
+        overrides["data_source"] = args.data
+    if args.csv:
+        overrides["data_source"] = f"replay:{args.csv}"
+    _load_env(args.env_file)
+    try:
+        settings = load_settings(dotenv_path=args.env_file, **overrides)
+    except ValueError as e:
+        print(f"Configuración inválida: {e}", file=sys.stderr)
+        return 2
+    coin = normalize_coin(args.coin or "")
+    if not coin:
+        print(f"Moneda inválida: {args.coin!r}", file=sys.stderr)
+        return 2
+    try:
+        interval_seconds(args.interval)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    strategy = None
+    if args.strategy:
+        strategy = strategy_key(args.strategy)          # "donchian" o "EMA-trend" también valen
+        if strategy not in STRATEGIES:
+            print(f"Estrategia desconocida: {args.strategy}. Disponibles: {', '.join(sorted(STRATEGIES))}",
+                  file=sys.stderr)
+            return 2
+    days = float(args.days) if args.days else float(settings.bt_default_days)
+    if days <= 0:
+        print("--days debe ser > 0", file=sys.stderr)
+        return 2
+    kind = _data_kind(settings.data_source)
+    if args.state_dir:
+        state_dir = Path(args.state_dir)
+    else:
+        # Informes de datos simulados junto a la mesa simulada (state/fast), nunca junto a la mesa real.
+        base = settings.state_path
+        state_dir = base / "fast" if kind in ("sim", "replay") or args.fast else base
+    state_dir.mkdir(parents=True, exist_ok=True)
+    market, clock = _backtest_market(settings, state_dir)
+    try:
+        meta = market.meta(coin)
+    except KeyError:
+        print(f"No conozco la moneda {coin} en los datos {settings.data_source}.", file=sys.stderr)
+        return 1
+    try:
+        bars, notes = fetch_bars(market, coin, args.interval, days, clock)
+    except (MarketDataError, KeyError, ValueError) as e:
+        print(f"No se pudieron obtener las velas de {coin} {args.interval}: {e}", file=sys.stderr)
+        return 1
+    need = 2 * MIN_SEGMENT_BARS
+    if bars is None or len(bars) < need:
+        print(f"{coin} {args.interval}: sólo hay {0 if bars is None else len(bars)} velas cerradas; el walk-forward "
+              f"necesita al menos {need}.", file=sys.stderr)
+        return 1
+    what = strategy or f"{len(STRATEGIES)} estrategias"
+    print(f"Backtest {coin} {args.interval}: {len(bars)} velas cerradas (~{days:g} días), {what}, datos "
+          f"{settings.data_source}. Calculando...", flush=True)
+    for note in notes:
+        print(f"  Nota: {note}")
+    tty = sys.stderr.isatty()
+    last = [-1]
+
+    def progress(done: int, total: int, text: str) -> None:
+        pct = int(done * 100 / total) if total else 100
+        if tty and pct != last[0]:
+            last[0] = pct
+            sys.stderr.write(f"\r  {pct:3d} % {text[:60]:<60}")
+            sys.stderr.flush()
+
+    job = BacktestJob(id="cli", coin=coin, interval=args.interval, days=days, strategy=strategy, bars=bars, meta=meta,
+                      requested_ts=clock.now(), notes=notes, source="cli")
+    try:
+        out = run_job(job, settings, ReportStore(state_dir), clock, progress=progress, render=not args.no_render)
+    except (ValueError, OSError) as e:
+        print(f"\nEl backtest falló: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if tty:
+            sys.stderr.write("\r" + " " * 70 + "\r")
+    print()
+    print(out.report.summary_text())
+    print()
+    for what, path in (("Informe HTML", out.html_path), ("Gráfico PNG", out.png_path), ("Datos JSON", out.report_path)):
+        if path:
+            print(f"{what}: {path}")
+    if not args.no_render and out.png_path is None:
+        print("(Sin PNG: instala matplotlib para generarlo.)")
+    if out.report.winner:
+        print(f"\nPara operarla en automático con una mesa que use este estado ({state_dir}): 'activa {coin} "
+              f"{args.interval}'. Empieza en paper y obsérvala antes de pasar a testnet.")
+    print(f"({out.elapsed_s:.1f} s)")
+    return 0
+
+
 # --------------------------------------------------------------------------- dashboard / console
 def cmd_dashboard(args: argparse.Namespace) -> int:
     """Panel en vivo de sólo lectura (rich) sobre los ficheros de estado."""
@@ -505,6 +642,19 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--max-stale", type=float, default=STAGE_MAX_STALE_S,
                    help=f"segundos sin leer la cuenta o los fills para darla por ciega ({STAGE_MAX_STALE_S:g})")
     h.set_defaults(func=cmd_health)
+
+    b = sub.add_parser("backtest", help="backtest walk-forward de una gráfica (sin arrancar la mesa)")
+    b.add_argument("--coin", required=True, help="moneda, p. ej. SOL")
+    b.add_argument("--interval", default="1h", help="temporalidad (1m 5m 15m 1h 4h 1d...; 1h por defecto)")
+    b.add_argument("--days", type=float, help="días de historia (DESK_BT_DEFAULT_DAYS; máx. 5000 velas)")
+    b.add_argument("--strategy", help="una sola estrategia (por defecto, todas)")
+    b.add_argument("--data", help="hyperliquid | sim | replay:<ruta.csv>")
+    b.add_argument("--csv", help="velas de un CSV (timestamp,open,high,low,close,volume) en vez de --data")
+    b.add_argument("--state-dir", help="dónde guardar reports/ (por defecto state/, o state/fast con sim/replay)")
+    b.add_argument("--fast", action="store_true", help="guardar en el estado de la simulación --fast")
+    b.add_argument("--no-render", action="store_true", help="sólo JSON (sin HTML ni PNG)")
+    b.add_argument("--env-file", default=".env")
+    b.set_defaults(func=cmd_backtest)
 
     d = sub.add_parser("dashboard", help="panel en vivo (sólo lectura) del estado de la mesa")
     d.add_argument("--state-dir")

@@ -1146,7 +1146,14 @@ def build_alerts(snap: Snapshot) -> RenderableType:
     t.add_column(no_wrap=True)
     t.add_column(ratio=1, overflow="fold")
     for r in reversed(recs):                       # el más reciente arriba
-        text = Text(r["text"] or r["kind"] or "-", style="dim" if r["muted"] else "")
+        # Un aviso de varias líneas (p. ej. el resumen de un backtest) se resume en su primera línea: entero está en
+        # alerts.jsonl / outbox.log y el informe tiene su propio panel.
+        first, _, rest = (r["text"] or r["kind"] or "-").partition("\n")
+        if len(first) > NOTICE_CHARS:
+            first = first[:NOTICE_CHARS - 1] + "…"
+        elif rest.strip():
+            first += " …"
+        text = Text(first, style="dim" if r["muted"] else "")
         if r["muted"]:
             text.append(" (silenciada)", style="dim italic")
         t.add_row(Text(_when(r["ts"], r["time"]), style="dim"), level_badge(r["level"]), text)

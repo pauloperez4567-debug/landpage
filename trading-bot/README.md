@@ -17,6 +17,12 @@ comandos o no.
   apagado limpio con SIGTERM, listo para systemd o Docker.
 - **Modos**: `paper` (dinero simulado con precios reales, por defecto), `sim`/`replay` (todo offline, días
   simulados en segundos) y `live` (dinero real; testnet por defecto).
+- **Backtest por gráfica**: `backtest HYPE 1h` prueba 5 estrategias con walk-forward (parámetros elegidos sólo
+  con el pasado, medidos fuera de muestra) sin parar la mesa, y deja un informe HTML/PNG. `activa HYPE 1h` pone
+  la ganadora en automático (sólo si aprobó fuera de muestra).
+- **Alarmas y avisos**: `alerta BTC > 100000`, `alerta HYPE rsi < 30 1h`... y avisos de la mesa (ejecuciones,
+  cierres con PnL, halts, consumo de límites) por consola, Telegram (que además acepta comandos) y
+  Discord/Slack. Panel en vivo (`dashboard`) y consola interactiva (`console`).
 
 ---
 
@@ -43,7 +49,8 @@ cp .env.example .env                # opcional: todos los valores por defecto so
 ```
 
 `hyperliquid-python-sdk`, `eth-account` y `anthropic` sólo hacen falta para el modo live y para la IA;
-el resto de la mesa funciona sin ellos.
+el resto de la mesa funciona sin ellos. `rich` es para el panel y la consola en color; `matplotlib`, para el PNG
+de los informes de backtest (sin él sólo se genera el HTML).
 
 ---
 
@@ -122,6 +129,19 @@ python -m desk console              # consola conectada a la mesa en marcha (por
 
 (Ambos aceptan `--fast` y `--state-dir` como `send`.)
 
+### 5. Backtest de una gráfica sin arrancar la mesa
+
+```bash
+python -m desk backtest --data sim --coin SOL --interval 1h --days 120      # offline, datos simulados
+python -m desk backtest --coin HYPE --interval 15m --days 60               # velas reales de Hyperliquid
+python -m desk backtest --csv datos/btc_1h.csv --coin BTC --interval 1h --strategy donchian
+```
+
+Imprime el resumen (dentro vs **fuera de muestra**) y guarda `reports/<MONEDA>_<tf>_<id>.json|html|png` en el
+estado (`state/`, o `state/fast/` con datos `sim`/replay, para no mezclar informes de datos simulados con la mesa
+real). Una mesa que use ese estado lo encuentra con `activa <MONEDA> <tf>`. Ver
+[Backtest por gráfica, playbook y alarmas](#backtest-por-gráfica-playbook-y-alarmas).
+
 ---
 
 ## Comandos
@@ -178,6 +198,19 @@ y cuando el precio llega: `HYPE LONG: entrada ejecutada: 11.72 @ 85.288` → `HY
 | `si` · `confirmar` · `yes` — `no` · `cancelar` · `reject` | Confirma / descarta el comando pendiente interpretado por IA (5 min) |
 | `ayuda` · `help` · `?` | Chuleta de comandos |
 
+### Gráficas, informes y alarmas (resumen)
+
+| Comando | Qué hace |
+|---|---|
+| `backtest HYPE 1h` · `backtest BTC 15m 90d` · `optimiza ETH 1h 3 meses` · `prueba SOL 1h ema_trend` | Backtest walk-forward de la gráfica (en segundo plano) |
+| `informes` · `ultimos backtests` | Informes guardados (métricas fuera de muestra) |
+| `activa HYPE 1h` · `activa HYPE 1h ema_trend` · `... forzar` | Opera esa gráfica en automático con la ganadora (o esa estrategia) |
+| `desactiva HYPE 1h` · `desactiva HYPE` · `playbook` | Quita una gráfica / todas las de una moneda · lista las activas |
+| `alerta HYPE > 90` · `alerta BTC rsi < 30 1h` · `alerta SOL zona long` | Alarmas de precio, indicadores y zonas |
+| `alertas` · `borra alerta 3` · `borra alertas` · `silencio 30m` · `sonido` | Ver / borrar alarmas, silenciar avisos no críticos |
+
+Detalles en [Backtest por gráfica, playbook y alarmas](#backtest-por-gráfica-playbook-y-alarmas).
+
 ### Parámetros en caliente
 
 Se aplican a las siguientes operaciones y **se recuerdan tras reiniciar** (aparecen en `estado`).
@@ -203,10 +236,146 @@ reposa a más de un 20 % del precio se rechaza por "¿precio mal escrito?" en ve
 
 ---
 
+## Backtest por gráfica, playbook y alarmas
+
+### Flujo recomendado
+
+1. **Backtest** de la gráfica que te interesa: `backtest HYPE 1h` (o `python -m desk backtest ...`).
+2. **Revisa el informe** (`reports/HYPE_1h_<id>.html` en el navegador): sólo las métricas **fuera de muestra**,
+   cuántas operaciones son, el drawdown y si los tramos van todos en la misma dirección.
+3. **Actívala en paper**: `activa HYPE 1h`. Sólo se activa lo aprobado fuera de muestra.
+4. **Obsérvala** unos días o semanas (`playbook`, `estado`, panel): ¿se parece lo que hace a lo del informe?
+5. **Testnet** (ver [Pasar a live](#pasar-a-live-dinero-real-checklist)) y sólo después, con poco, mainnet.
+
+Un backtest no garantiza resultados futuros: describe cómo le habría ido a unas reglas en un pasado concreto,
+con supuestos de ejecución. Lo de dentro de muestra está inflado por construcción; lo de fuera de muestra es
+mejor indicio, pero el mercado cambia. Que una gráfica no tenga ganadora es un resultado normal y útil.
+
+### Backtest por gráfica
+
+`backtest COIN [tf] [días] [estrategia]` (temporalidad por defecto `1h`; días, `DESK_BT_DEFAULT_DAYS` = 120):
+
+- La mesa descarga las velas **cerradas** al momento (si la moneda no existe o no hay datos, lo dice ya) y lanza
+  el cálculo en un hilo propio, uno a la vez y en cola: **el bucle sigue vigilando posiciones, alarmas y
+  comandos** mientras tanto. Responde `Backtest HYPE 1h (120 días, 2880 velas, 5 estrategias) en marcha...` y, al
+  terminar, avisa con el resumen, la ruta del informe HTML/PNG y, si hay ganadora aprobada, `activa HYPE 1h`.
+  Por Telegram llega además el PNG. Con `--fast` (reloj simulado) se ejecuta dentro del ciclo: determinista.
+- Historia: días × velas por día, con tope de 5000 velas (lo que da Hyperliquid); si se recorta, se avisa.
+- Al apagar la mesa, los backtests en marcha o en cola se cancelan (no se guarda un informe a medias).
+
+Cómo leer el resumen:
+
+```
+                        DENTRO |      FUERA de muestra (lo que cuenta)
+Estrategia         Ret %    PF |  Ret %    PF  DD %  Ops     t  Sharpe
+rsi_reversion      +16.4  2.41 |   +8.4  1.63   3.1   41   1.6    2.91 ✘
+donchian_breakout   +8.2  1.35 |   -3.7  0.87  11.2   71  -0.4   -0.82 ✘
+...
+Rechazadas:
+  · rsi_reversion: ventaja no significativa: t = 1.64 < 2.42 (con 41 operaciones puede ser suerte)
+```
+
+- **DENTRO de muestra**: los parámetros se eligieron con esos mismos datos. Siempre sale mejor; no lo uses para
+  decidir.
+- **FUERA de muestra**: walk-forward anclado de `DESK_BT_FOLDS` tramos. En cada tramo se eligen los parámetros
+  con el pasado y se miden en el bloque siguiente, que no vieron; la curva fuera de muestra encadena esos
+  bloques. Comisiones y deslizamiento incluidos; funding y liquidaciones no.
+- **✔ aprobada** sólo si fuera de muestra: PF ≥ `DESK_BT_MIN_PROFIT_FACTOR` (1,15), retorno > 0, ≥
+  `DESK_BT_MIN_TRADES` (20) operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` (25 %) y ventaja
+  estadísticamente significativa (`t`: R medio por operación, corregido por el número de estrategias comparadas).
+  El ejemplo de arriba (datos simulados, un paseo aleatorio) no tiene ganadora aunque `rsi_reversion` ganara un
+  8 %: con 41 operaciones eso puede ser suerte. Es exactamente lo que debe pasar sobre ruido.
+- `informes` lista los últimos (con su id y la mejor estrategia fuera de muestra).
+
+### Activar gráficas (playbook)
+
+- `activa HYPE 1h` toma el **último informe** de esa gráfica y pone la ganadora en `state/playbook.json` con sus
+  parámetros. `activa HYPE 1h ema_trend` elige otra estrategia del informe (si aprobó).
+- Si no aprobó fuera de muestra, **no se activa**. `activa HYPE 1h [estrategia] forzar` la activa igualmente con
+  una advertencia explícita (NO recomendado: lo más probable es que no tenga ventaja real).
+- Cada entrada del playbook opera **su** gráfica (temporalidad y parámetros), con `DESK_AUTO_UNITS` unidades,
+  pasando por el mismo gestor de riesgo que todo lo demás. Las señales llevan el origen
+  `auto:<estrategia>@<temporalidad>` (en `estado`, el panel y `trades.csv`).
+- Además del playbook, si `DESK_AUTO_DEFAULT_STRATEGIES=true` (por defecto) siguen las estrategias de
+  `DESK_STRATEGIES` sobre `DESK_SYMBOLS`; pon `false` para operar sólo lo activado.
+- `desactiva HYPE 1h` (o `desactiva HYPE`) la quita; las posiciones abiertas siguen con su SL/TP. `playbook`
+  lista lo activo. Si un backtest nuevo de una gráfica activa ya no la aprueba, la mesa avisa
+  (`PLAYBOOK DEGRADADO`) pero no la desactiva sola: decides tú.
+
+### Alarmas
+
+| Ejemplo | Dispara cuando |
+|---|---|
+| `alerta HYPE > 90` · `alerta BTC < 80000` | El precio **cruza** el nivel (si ya está al otro lado al crearla, espera a que vuelva y cruce) |
+| `alerta SOL cruza 150` | Cruza el nivel en cualquier sentido |
+| `alerta HYPE rsi < 30 1h` · `alerta BTC rsi > 70 15m` | El RSI de velas **cerradas** de esa temporalidad cruza el nivel |
+| `alerta BTC cruce ema 20 50 1h alcista` · `alerta BTC golden cross 1d` | Cruce de medias |
+| `alerta SOL zona long` | El precio entra en la zona de liquidez |
+| `alerta BTC volumen 3x 15m` | Volumen de la vela ≥ 3 veces la media |
+| `alerta HYPE mueve 3% 1h` · `alerta HYPE sube 5% 4h` | Movimiento de una vela |
+| `... siempre` · `... cada vez` | Repite (con pausa de `DESK_ALERT_COOLDOWN_SECONDS`); sin esto avisa una vez y se borra |
+
+`alertas` las lista; `borra alerta 3` / `borra alertas`; `silencio 30m` (o `silencio` hasta `sonido`) calla los
+avisos no críticos (quedan registrados en `state/alerts.jsonl`; los críticos siempre llegan). Las alarmas se
+guardan en `state/alerts.json` y sobreviven a reinicios.
+
+### Avisos de la mesa
+
+Además de las alarmas, la mesa avisa sola (pantalla, `alerts.jsonl`, `outbox.log` y Telegram/webhook según el
+nivel mínimo de cada canal):
+
+| Nivel | Avisos |
+|---|---|
+| info | Mesa arrancada/detenida, ejecuciones y SL/TP colocados, cierres con su PnL, señales automáticas abiertas, backtest terminado |
+| warn (aviso) | Consumo de la pérdida diaria ≥ `DESK_DAILY_LOSS_WARN_FRAC` (80 %) del límite, drawdown al 80 % del máximo, fallos repetidos (3, 10, 50... ciclos seguidos), datos viejos de una moneda con posición, cooldown por racha de pérdidas, backtest fallido, playbook degradado |
+| critical | Halts (pérdida diaria, drawdown máximo) y cierres por riesgo; nunca se silencian |
+
+Un aviso repetido no se reenvía antes de `DESK_ALERT_COOLDOWN_SECONDS`. Las ejecuciones que provoca un comando
+van en la respuesta a ese comando. La línea de estado periódica sólo sale por pantalla y `outbox.log`.
+
+### Telegram paso a paso
+
+1. En Telegram, habla con **@BotFather**: `/newbot`, elige nombre y usuario. Te da un token tipo
+   `123456789:AAF...`. Ponlo en `.env`: `TELEGRAM_BOT_TOKEN=123456789:AAF...`
+2. Escribe cualquier cosa a tu bot (búscalo por su usuario y pulsa *Iniciar*).
+3. Obtén tu **chat id**: abre en el navegador `https://api.telegram.org/bot<TOKEN>/getUpdates` y busca
+   `"chat":{"id":123456789`. (Otra forma: arranca la mesa sólo con el token; ignora los mensajes de chats no
+   autorizados y escribe en `state/desk.log` "mensaje de un chat no autorizado ignorado (chat 123456789, ...)").
+   Para un grupo, añade el bot al grupo; su id es negativo (`-100...`).
+4. `TELEGRAM_CHAT_ID=123456789` en `.env` (varios separados por comas) y reinicia la mesa. El banner dice
+   `canales: consola (>= info), telegram (>= info) | Telegram escuchando`.
+5. Escríbele igual que en la consola: `estado`, `long HYPE 2u zona`, `backtest HYPE 1h`, `alerta BTC > 100000`,
+   `/estado`, `/cierra_todo` (el `_` es un espacio). `/help` da la ayuda.
+
+Seguridad: **sólo** los chats de `TELEGRAM_CHAT_ID` pueden dar órdenes (el resto se ignora sin responder y queda
+en el log); el token nunca se escribe en logs. Cada mensaje se ejecuta como mucho una vez (aunque la mesa se
+reinicie a mitad) y uno de hace más de 5 minutos no se ejecuta (se avisa para reenviarlo). Las órdenes
+interpretadas por IA piden `si`/`no`. `DESK_ALERT_MIN_LEVEL_TELEGRAM=warn` deja en el móvil sólo avisos y
+críticos (los resultados de backtest son "info").
+
+### Webhook de Discord o Slack
+
+- **Discord**: Ajustes del canal → Integraciones → Webhooks → Nuevo webhook → Copiar URL.
+- **Slack**: crea una app con *Incoming Webhooks* y copia la URL del canal.
+
+`DESK_WEBHOOK_URL=https://discord.com/api/webhooks/...` en `.env`. Recibe los avisos de nivel
+`DESK_ALERT_MIN_LEVEL_WEBHOOK` (`warn` por defecto) o más; el webhook sólo avisa, no acepta comandos. La URL lleva
+el secreto: no se escribe en logs (sólo su dominio).
+
+### Panel y consola
+
+`python -m desk dashboard` y `python -m desk console` (ver [Arranque rápido](#4-panel-en-vivo-y-consola-interactiva))
+leen lo que escribe la mesa: `status.json` (se refresca cada 30 s y tras cada comando, señal o cierre, con
+posiciones, órdenes, consumo de límites, playbook, alarmas y últimas señales), `alerts.jsonl`, `playbook.json` y
+`reports/`.
+
+---
+
 ## Cómo opera sola 24/7
 
-Con `DESK_AUTO=true` (por defecto) la mesa evalúa sus estrategias sobre `DESK_SYMBOLS` cada
-`DESK_STRATEGY_SECONDS`, **una vez por vela cerrada** (nunca con la vela en curso):
+Con `DESK_AUTO=true` (por defecto) la mesa evalúa las gráficas del **playbook** (ver arriba) y sus estrategias
+por defecto sobre `DESK_SYMBOLS` cada `DESK_STRATEGY_SECONDS`, **una vez por vela cerrada** (nunca con la vela
+en curso):
 
 - **`liquidity_sweep` (15 m)** — reversión tras un barrido de liquidez: la vela anterior perfora la zona de
   liquidez (bids/liquidaciones de longs bajo el precio) y la última cierra de vuelta por encima, con RSI(14)
@@ -226,7 +395,7 @@ en vivo usan exactamente el mismo código, y la señal en vivo es la última fil
 estrategia exista aquí no significa que gane dinero: un backtest no garantiza nada y sólo cuenta el
 resultado fuera de muestra.
 
-### Backtest walk-forward por gráfica y playbook
+### Detalles del walk-forward (para desarrolladores)
 
 `desk/optimizer.py` prueba las estrategias sobre una gráfica (moneda + temporalidad) sin hacerse trampas:
 
@@ -254,7 +423,8 @@ ReportStore(settings.state_dir).save(report)
 
 Reglas de la operativa automática:
 
-- Cada señal pasa por el **mismo gestor de riesgo** que los comandos, con `DESK_AUTO_UNITS` unidades.
+- Cada señal pasa por el **mismo gestor de riesgo** que los comandos, con `DESK_AUTO_UNITS` unidades (o las de
+  su entrada del playbook). Con varias gráficas en la misma moneda, el playbook va primero.
 - Sólo abre en monedas **sin** posición, sin entrada pendiente y sin operación gestionada: nunca toca ni
   cierra posiciones abiertas por comando. Cada operación automática sale por su propio SL/TP.
 - Se para con `pausa`, `auto off`, cualquier halt de riesgo o el cooldown tras `DESK_MAX_CONSECUTIVE_LOSSES`
@@ -378,8 +548,9 @@ Dockerfile; úsalo en cron/alertas con systemd). `python -m desk status` muestra
 ```
 trading-bot/
 ├── desk/
-│   ├── __main__.py        CLI: run / send / status / health
-│   ├── desk.py            TradingDesk: bucle 24/7, comandos, operativa automática, estado
+│   ├── __main__.py        CLI: run / send / status / health / dashboard / console / backtest
+│   ├── desk.py            TradingDesk: bucle 24/7, comandos, operativa automática (playbook), avisos, estado
+│   ├── jobs.py            Backtests en segundo plano (un hilo, cola, cancelables al apagar)
 │   ├── engine.py          ExecutionEngine: entradas, brackets SL/TP, OCO, reconciliación
 │   ├── risk.py            RiskManager: tamaño, halts diario/drawdown, cooldown, pausa
 │   ├── strategy.py        Estrategias (liquidity_sweep, squeeze_breakout, ema_trend, rsi_reversion, donchian_breakout)
@@ -387,6 +558,10 @@ trading-bot/
 │   ├── optimizer.py       Walk-forward: parámetros sin mirar el futuro, aprobación fuera de muestra, informes
 │   ├── playbook.py        Gráficas adoptadas en automático (estrategia + parámetros por moneda y temporalidad)
 │   ├── report_render.py   Informes HTML (SVG en línea) y PNG, mini-gráficas de texto
+│   ├── alerts.py          Alarmas del usuario y avisos de la mesa (anti-spam, silencio)
+│   ├── notify.py          Canales de aviso: consola, fichero, Telegram, webhook (Discord/Slack)
+│   ├── telegram_bot.py    Bot de Telegram: comandos desde el móvil
+│   ├── tui.py console.py remote.py   Panel en vivo, consola interactiva y cliente inbox/outbox
 │   ├── liquidity.py       Zonas de liquidez (libro + liquidaciones; históricas por pivotes para backtest)
 │   ├── commands.py        Comandos ES/EN por reglas + fallback IA
 │   ├── journal.py         Diarios y estado en disco
@@ -410,11 +585,14 @@ En `state/` (o `DESK_STATE_DIR`; `state/fast/` con `--fast`):
 | `equity.csv` | Curva de equity (cada minuto) |
 | `events.jsonl` | Todo lo que pasa: comandos, decisiones de riesgo, órdenes, halts, señales |
 | `desk.log` | Log técnico (rota a los 5 MB) |
-| `status.json` | Último estado (lo muestra `python -m desk status`); sin cuenta, una línea "SIN DATOS DE LA CUENTA" |
+| `status.json` | Último estado (lo muestra `python -m desk status`) y sus campos para el panel (posiciones, órdenes, consumo de límites, playbook, alarmas, señales); sin cuenta, una línea "SIN DATOS DE LA CUENTA" |
 | `health.json` | Salud de cada ciclo: racha de fallos, etapas que fallan, última lectura buena de cuenta y fills |
 | `heartbeat` | Hora del último ciclo que leyó la cuenta y los fills (healthcheck) |
 | `paper_broker.json`, `engine.json`, `risk.json`, `desk.json`, `profile.json` | Estado para sobrevivir a reinicios |
 | `reports/<COIN>_<tf>_<id>.json` | Informes de backtest walk-forward (dentro vs fuera de muestra) y su curva fuera de muestra |
+| `reports/<COIN>_<tf>_<id>.html` / `.png` | El mismo informe para abrir en el navegador / enviar por Telegram |
+| `alerts.json` | Alarmas activas y estado del silencio |
+| `alerts.jsonl` | Cada alarma o aviso enviado (o silenciado), con nivel y moneda (lo leen el panel y la consola) |
 | `playbook.json` | Gráficas adoptadas en automático: estrategia, parámetros, unidades y métricas fuera de muestra |
 
 Para empezar de cero en paper: detén la mesa y borra `state/`.
@@ -432,4 +610,7 @@ orden en zona → ejecución → SL/TP → TP con OCO → PnL; stop-loss; cierra
 drawdown con cierre; reinicio con estado persistido; inbox con offset; confirmación de comandos de IA;
 operativa automática con pausa/auto off; fallos de datos que no tumban el bucle; y regresiones de casos
 límite (SL más allá de la liquidación, cierres que no casan, timeouts con la orden ya en el exchange,
-fills re-entregados, inbox reescrito, retiradas, salud, perfil testnet/mainnet).
+fills re-entregados, inbox reescrito, retiradas, salud, perfil testnet/mainnet). La fase 2 se prueba de punta a
+punta en `tests/test_desk_phase2.py`: backtest por comando → informe → `activa` → operación automática de la
+estrategia adoptada; alarmas de precio y RSI; aviso al 80 % de la pérdida diaria; halts críticos; Telegram con
+una sesión HTTP falsa; `status.json` ampliado; y el bucle sigue vivo aunque un backtest falle o tarde.

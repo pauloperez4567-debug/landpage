@@ -287,7 +287,7 @@ class TradeIntent:
     side: Side
     units: float
     entry_mode: EntryMode
-    origin: str                          # "command" | "auto:<estrategia>"
+    origin: str                          # "command" | "auto:<estrategia>@<temporalidad>"
     reason: str = ""
     limit_px: Optional[float] = None
     sl_price: Optional[float] = None

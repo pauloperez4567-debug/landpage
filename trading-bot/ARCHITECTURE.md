@@ -283,6 +283,7 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 - `python -m desk health [--fast|--state-dir] [--max-age 600] [--max-stale 600]`: 0 si la mesa completa ciclos
   (`health.json` reciente) y lee la cuenta y los fills; 1 si no (HEALTHCHECK del Dockerfile).
   `build_broker` pasa al broker live `fills_cursor_ts` y `fills_seen` guardados en `desk.json`.
+- `python -m desk backtest|dashboard|console ...`: ver Fase 2 (integración en la mesa y `tui`/`console`).
 
 ---
 
@@ -576,3 +577,69 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
     tardías de comandos que se dejaron de esperar). Ctrl+C mientras espera deja de esperar (el comando sigue en el
     inbox). `salir`/`exit`/`quit`/Ctrl+D cierran sólo la consola. CLI `console [--timeout S]` (avisa con
     `health_check` si la mesa parece parada).
+
+## `desk/desk.py`, `desk/jobs.py` y `desk/__main__.py` (integración de la fase 2)
+- `TradingDesk(..., out=None, *, notifier=None, alerts=None, playbook=None, reports=None, backtests=None,
+  telegram=None, http_session=None)`: sin inyectar, construye `build_notifier(settings, out=pantalla)` (la pantalla es
+  un `ConsoleChannel` más), `AlertManager(settings, clock, state_dir, notifier)`, `Playbook(state_dir, clock)`,
+  `ReportStore(state_dir)`, `BacktestWorker(settings, reports, clock, threaded=not SimClock)` y, si hay
+  `telegram_bot_token`, un `TelegramBot(token, chat_ids, self.submit, clock, session, max_age_s=None con SimClock)` que
+  se arranca en `run_forever` y se para en `shutdown` (fuera del lock). Sin chats autorizados el bot arranca igual:
+  ignora todo y registra el id del chat (sirve para descubrirlo). `http_session` se comparte con el canal de Telegram
+  y el webhook (tests sin red).
+- Ciclo: `comandos → broker → fills → cuenta → riesgo → reconciliación → estrategias → alarmas → backtests → guardar →
+  estado`. "alarmas" = `alerts.evaluate(market, scanner)` + frescura de los datos de las monedas con posición (cada
+  60 s). "backtests" = `backtests.poll()` → aviso por cada trabajo terminado (con reloj simulado ahí se ejecutan).
+- `notify(text, level=INFO, *, kind="desk", key=None, coin=None, image=None, push=True)`: log + `outbox.log` (id
+  `desk`) y, con `push`, `alerts.system(kind, text, nivel, key, coin, image)` → `alerts.jsonl` + canales (pantalla,
+  Telegram, webhook). Nivel: `logging.WARNING` → "warn", `>= ERROR` → "critical". Con `key` un aviso repetido dentro de
+  `alert_cooldown_seconds` se omite del todo (también del outbox); silenciado (`mute`) se omite en los canales pero no
+  en el outbox. `push=False` (línea de estado periódica, "SIN DATOS DE LA CUENTA"): sólo log, outbox y pantalla.
+  Avisos: arranque/parada (`start`/`stop`, info), mensajes del motor en el ciclo (`exec`/`trade`: ejecuciones, SL/TP,
+  cierres con PnL), señales automáticas abiertas (`signal`), halts y cierres por riesgo (`halt`, critical), consumo de
+  la pérdida diaria >= `daily_loss_warn_frac` y del drawdown >= 80 % (`risk`, warn, una vez por cruce con histéresis de
+  10 puntos), racha de fallos 3/10/50/100... (`errors`, warn) y recuperación, datos viejos (`data`, warn, clave por
+  moneda), backtest terminado (`backtest`, info, con el PNG) o fallido (warn), playbook degradado (`playbook`, warn).
+  Lo que ejecuta un comando va en su respuesta, no se empuja a los canales.
+- Comandos: `BACKTEST` (moneda conocida; temporalidad por defecto la de la estrategia pedida o `1h`; días por defecto
+  `bt_default_days`; velas con `jobs.fetch_bars` al momento; < `2·MIN_SEGMENT_BARS` velas → no se lanza; trabajo con
+  copia de `Settings`) → "Backtest HYPE 1h (120 días, 2880 velas, 5 estrategias) en marcha..." y al terminar aviso con
+  `summary_text`, rutas HTML/PNG/JSON y, si hay ganadora, "activa COIN tf". `ADOPT` = `ReportStore.latest(coin, tf)` →
+  `entry_from_report(report, strategy, allow_rejected=force)` → `Playbook.adopt`; sin ganadora y con `forzar` se toma
+  `report.best()`; lo forzado empieza por "ATENCIÓN — FORZADO". `DEACTIVATE` = `Playbook.remove`. `PLAYBOOK`,
+  `REPORTS` (incluye el trabajo en marcha), `ALERT_ADD` (`alerts.add(coin, spec, ref_px=mid)`; el aviso de "punto de
+  miles" también vale para el nivel), `ALERT_LIST`, `ALERT_DEL` (`target_id` None = todas), `MUTE`, `UNMUTE`. Sin
+  confirmación por IA (además de estado/ayuda/pausa/auto off): `BACKTEST`, `PLAYBOOK`, `REPORTS`, `ALERT_LIST`, `MUTE`.
+- Operativa automática: `auto_slots()` = entradas activas del playbook (su temporalidad, parámetros y `units` o
+  `auto_units`) y, si `auto_default_strategies`, las estrategias por defecto sobre `symbols` (salvo la misma
+  estrategia@temporalidad que el playbook ya cubre en esa moneda). Por moneda, el playbook primero. Origen de las
+  señales `auto:<estrategia>@<tf>` (antes `auto:<estrategia>`; `risk.is_auto` sólo mira el prefijo). "Una evaluación
+  por vela" con clave `(moneda, estrategia@tf)` en `bar_seen`. Una estrategia que lanza no frena a las demás: se
+  reintenta en la vela siguiente y la etapa queda marcada como fallida en ese ciclo.
+- `status.json` = `{ts, time, line, report}` + `account_ok, mode, data, network, equity, available, day_pnl,
+  day_pnl_pct, drawdown_pct, auto, paused, cooldown, halt, symbols, risk{daily_loss_pct, daily_loss_limit_pct,
+  daily_loss_used_pct, drawdown_pct, max_drawdown_pct, drawdown_used_pct, daily_loss_warn_frac}, positions[{coin, side,
+  size, entry_px, mark_px, unrealized_pnl, pnl_pct, leverage, liq_px, sl, tp, origin}], orders[{coin, is_buy, kind, size,
+  trigger_px, price, reduce_only, tag}], pending[{coin, side, planned_size, entry_px, sl, tp, expires_ts, origin}],
+  strategies, playbook (como playbook.json), alerts (stats), signals (últimas 20: ts, time, coin, side, strategy
+  "nombre@tf", source "playbook"|"defecto", reason, opened, result), backtests (`BacktestWorker.describe()`),
+  notifier {channels, sent, failed, dropped, last_error}, telegram {running, handled, ignored, errors, last_error}`.
+  `origin` usa las etiquetas del informe de texto ("comando", "adoptada", "sin gestionar" o el `auto:...`). Se reescribe
+  tras un comando, una señal, un cierre o un backtest, y como mucho cada `SNAPSHOT_EVERY_S` (30 s de reloj) si no.
+- `shutdown()`: para Telegram, cancela los backtests (aviso si había), guarda, avisa "Mesa detenida" y cierra el
+  notifier (entrega lo pendiente).
+- `desk/jobs.py`: `bars_for(days, tf) -> (n, recortado)` (tope `MAX_BARS - 1` = 4999 cerradas), `fetch_bars(market,
+  coin, tf, days, clock) -> (velas cerradas, notas)`, `BacktestJob(id, coin, interval, days, strategy, bars, meta,
+  requested_ts, cmd_id, notes, source, settings)`, `BacktestOutcome(job, report, report_path, html_path, png_path, png,
+  error, canceled, elapsed_s)`, `run_job(job, settings, store, clock, *, should_stop, progress, render=True)`
+  (`optimize` → `ReportStore.save` → `.html`/`.png` junto al JSON; un fallo al pintar no pierde el informe; se podan
+  los HTML/PNG huérfanos) y `BacktestWorker(settings, store, clock, *, threaded=True, max_queue=4, runner=run_job)`:
+  `submit(job) -> por delante` (`ValueError` si la cola está llena o se está apagando), `poll() -> [BacktestOutcome]`
+  (sin hilo ejecuta aquí lo pendiente), `busy_with(coin, tf, strategy)`, `busy_chart(coin, tf)`, `pending()`,
+  `has_results()`, `describe()`, `stop(timeout)` (cancela la cola y pide parar al que corre; `optimize` lo consulta
+  entre combinaciones). Una excepción del trabajo → `BacktestOutcome.error`; el hilo nunca muere.
+- CLI `python -m desk backtest --coin SOL [--interval 1h] [--days N] [--strategy X] [--data sim|hyperliquid|replay:x]
+  [--csv x.csv] [--state-dir D] [--fast] [--no-render]`: sin arrancar la mesa; `sim` termina la historia en la hora
+  simulada del estado (`resume_clock_ts`) o en el ancla; `--csv` = `ReplayMarketData(offset=0)` con el reloj al final
+  del CSV. Informes en `<state>/reports` (con datos sim/replay, `state/fast` por defecto: nunca junto a la mesa real).
+  Código de salida 0 aunque no haya ganadora; 2 por argumentos inválidos; 1 si no hay datos.

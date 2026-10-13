@@ -111,7 +111,7 @@ def fmt_size(x: float) -> str:
 class Bracket:
     coin: str
     side: Side
-    origin: str                          # "command" | "auto:<estrategia>" | "adopted"
+    origin: str                          # "command" | "auto:<estrategia>@<temporalidad>" | "adopted"
     status: str = PENDING
     entry_mode: str = ""
     entry_order_id: str = ""

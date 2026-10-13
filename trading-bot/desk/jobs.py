@@ -89,6 +89,8 @@ class BacktestJob:
     requested_ts: float = 0.0
     cmd_id: str = ""
     notes: list[str] = field(default_factory=list)
+    source: str = ""                       # quién lo pidió ("consola", "telegram", "inbox"...)
+    settings: Optional[Settings] = None    # copia de la configuración al pedirlo (None = la del trabajador)
 
     @property
     def chart(self) -> tuple[str, str]:
@@ -124,6 +126,7 @@ def run_job(job: BacktestJob, settings: Settings, store: ReportStore, clock: Clo
     """Optimiza la gráfica, guarda el informe y pinta HTML/PNG. Lanza si ``optimize`` o el guardado fallan
     (``BacktestWorker`` lo convierte en ``BacktestOutcome.error``)."""
     t0 = time.monotonic()
+    settings = job.settings if job.settings is not None else settings
     report = optimize(job.coin, job.interval, job.bars, settings,
                       strategies=[job.strategy] if job.strategy else None, meta=job.meta,
                       progress=progress, should_stop=should_stop, clock=clock)
@@ -207,6 +210,13 @@ class BacktestWorker:
         with self._cond:
             jobs = list(self._queue) + ([self._running] if self._running else [])
             return any((j.coin.upper(), j.interval, j.strategy) == key for j in jobs)
+
+    def busy_chart(self, coin: str, interval: str) -> bool:
+        """True si hay algún trabajo (en curso o en cola) de esa gráfica, sea cual sea la estrategia."""
+        key = (str(coin).upper(), interval)
+        with self._cond:
+            jobs = list(self._queue) + ([self._running] if self._running else [])
+            return any((j.coin.upper(), j.interval) == key for j in jobs)
 
     def pending(self) -> int:
         with self._cond:
@@ -294,7 +304,8 @@ class BacktestWorker:
 
     def _run(self, job: BacktestJob) -> None:
         t0 = time.monotonic()
-        self._progress = (0, 0)
+        with self._cond:
+            self._progress = (0, 0)
         try:
             out = self.runner(job, self.settings, self.store, self.clock, should_stop=self._stop.is_set,
                               progress=self._on_progress)

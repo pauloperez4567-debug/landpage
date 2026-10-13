@@ -2,6 +2,10 @@ pandas>=2.0
 numpy>=1.26
 requests>=2.31
 python-dotenv>=1.0
+# Panel en vivo y consola interactiva (python -m desk dashboard / console)
+rich>=13.0
+# Gráfico PNG de los informes de backtest (sin él sólo se genera el HTML)
+matplotlib>=3.8
 # Opcional: modo live en Hyperliquid
 hyperliquid-python-sdk>=0.9
 eth-account>=0.10
