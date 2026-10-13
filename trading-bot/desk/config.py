@@ -113,6 +113,26 @@ class Settings:
     hl_account_address: str = ""
     moondev_api_key: str = field(default="", repr=False)
 
+    # --- backtest por gráfica y optimización walk-forward ----------------------
+    bt_default_days: float = 120.0           # historia por defecto (Hyperliquid da como máximo 5000 velas)
+    bt_objective: str = "sharpe"             # "sharpe" | "calmar" | "profit_factor" | "return"
+    bt_folds: int = 4                        # tramos walk-forward (entrenar -> validar fuera de muestra)
+    bt_max_combos: int = 60                  # combinaciones de parámetros por estrategia (muestreo determinista)
+    bt_min_trades: int = 20                  # operaciones fuera de muestra mínimas para aprobar
+    bt_min_profit_factor: float = 1.15       # profit factor fuera de muestra mínimo para aprobar
+    bt_max_drawdown_pct: float = 25.0        # drawdown fuera de muestra máximo para aprobar
+    auto_default_strategies: bool = True     # además del playbook, estrategias por defecto sobre ``symbols``
+
+    # --- alarmas y canales -----------------------------------------------------
+    alert_cooldown_seconds: float = 300.0    # anti-spam por clave de aviso
+    alert_bell: bool = True                  # pitido en consola para avisos y críticos
+    daily_loss_warn_frac: float = 0.8        # aviso al consumir este % del límite de pérdida diaria
+    alert_min_level_telegram: str = "info"   # "info" | "warn" | "critical"
+    alert_min_level_webhook: str = "warn"
+    telegram_bot_token: str = field(default="", repr=False)
+    telegram_chat_ids: list[str] = field(default_factory=list)
+    webhook_url: str = field(default="", repr=False)
+
     # ------------------------------------------------------------------------
     @property
     def state_path(self) -> Path:
@@ -160,7 +180,7 @@ class Settings:
         """Configuración sin secretos (para logs / estado)."""
         out = {}
         for f in fields(self):
-            if f.name in {"hl_private_key", "moondev_api_key", "live_confirm"}:
+            if f.name in {"hl_private_key", "moondev_api_key", "live_confirm", "telegram_bot_token", "webhook_url"}:
                 continue
             out[f.name] = getattr(self, f.name)
         return out
@@ -216,6 +236,22 @@ _ENV_MAP: dict[str, str] = {
     "HL_PRIVATE_KEY": "hl_private_key",
     "HL_ACCOUNT_ADDRESS": "hl_account_address",
     "MOONDEV_API_KEY": "moondev_api_key",
+    "DESK_BT_DEFAULT_DAYS": "bt_default_days",
+    "DESK_BT_OBJECTIVE": "bt_objective",
+    "DESK_BT_FOLDS": "bt_folds",
+    "DESK_BT_MAX_COMBOS": "bt_max_combos",
+    "DESK_BT_MIN_TRADES": "bt_min_trades",
+    "DESK_BT_MIN_PROFIT_FACTOR": "bt_min_profit_factor",
+    "DESK_BT_MAX_DRAWDOWN_PCT": "bt_max_drawdown_pct",
+    "DESK_AUTO_DEFAULT_STRATEGIES": "auto_default_strategies",
+    "DESK_ALERT_COOLDOWN_SECONDS": "alert_cooldown_seconds",
+    "DESK_ALERT_BELL": "alert_bell",
+    "DESK_DAILY_LOSS_WARN_FRAC": "daily_loss_warn_frac",
+    "DESK_ALERT_MIN_LEVEL_TELEGRAM": "alert_min_level_telegram",
+    "DESK_ALERT_MIN_LEVEL_WEBHOOK": "alert_min_level_webhook",
+    "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+    "TELEGRAM_CHAT_ID": "telegram_chat_ids",
+    "DESK_WEBHOOK_URL": "webhook_url",
 }
 
 

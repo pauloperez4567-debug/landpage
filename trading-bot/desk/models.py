@@ -211,6 +211,17 @@ class CommandAction(str, Enum):
     CONFIRM = "confirm"      # confirmar un comando pendiente (interpretado por IA)
     REJECT = "reject"        # descartar un comando pendiente
     HELP = "help"
+    # --- fase 2: backtest por gráfica, playbook y alarmas ---
+    BACKTEST = "backtest"          # backtest + optimización walk-forward de una gráfica (coin, interval, days, strategy?)
+    ADOPT = "adopt"                # activar en automático la ganadora (o ``strategy``) del último backtest de la gráfica
+    DEACTIVATE = "deactivate"      # quitar una gráfica del playbook (coin, interval?)
+    PLAYBOOK = "playbook"          # listar las gráficas activas en automático
+    REPORTS = "reports"            # listar los últimos informes de backtest
+    ALERT_ADD = "alert_add"        # crear alarma (alert = especificación)
+    ALERT_LIST = "alert_list"      # listar alarmas
+    ALERT_DEL = "alert_del"        # borrar alarma (target_id) o todas (target_id None)
+    MUTE = "mute"                  # silenciar avisos no críticos ``value`` minutos (None = hasta UNMUTE)
+    UNMUTE = "unmute"
 
 
 @dataclass
@@ -229,6 +240,11 @@ class Command:
     tp_pct: Optional[float] = None       # distancia del TP en % desde la entrada
     param: Optional[str] = None          # SET_PARAM: nombre canónico del parámetro
     value: Optional[float] = None        # SET_PARAM: valor
+    interval: Optional[str] = None       # BACKTEST/ADOPT/DEACTIVATE: temporalidad ("15m", "1h", ...)
+    strategy: Optional[str] = None       # BACKTEST/ADOPT: estrategia concreta (None = todas / la ganadora)
+    days: Optional[float] = None         # BACKTEST: días de historia (None = por defecto)
+    alert: Optional[dict[str, Any]] = None  # ALERT_ADD: especificación de la alarma (ver ARCHITECTURE.md)
+    target_id: Optional[int] = None      # ALERT_DEL: id de la alarma
     id: str = ""                         # asignado por la mesa al recibirlo
 
     def to_dict(self) -> dict[str, Any]:

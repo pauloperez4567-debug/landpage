@@ -283,3 +283,107 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 - `python -m desk health [--fast|--state-dir] [--max-age 600] [--max-stale 600]`: 0 si la mesa completa ciclos
   (`health.json` reciente) y lee la cuenta y los fills; 1 si no (HEALTHCHECK del Dockerfile).
   `build_broker` pasa al broker live `fills_cursor_ts` y `fills_seen` guardados en `desk.json`.
+
+---
+
+# Fase 2: backtest por gráfica, playbook, alarmas e interactividad
+
+Campos nuevos ya añadidos en `desk/models.py` (`CommandAction.BACKTEST/ADOPT/DEACTIVATE/PLAYBOOK/REPORTS/
+ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/alert/target_id`) y en
+`desk/config.py` (`bt_*`, `auto_default_strategies`, `alert_*`, `daily_loss_warn_frac`, `telegram_*`, `webhook_url`).
+
+## `desk/strategy.py` (refactor: una sola lógica para vivo y backtest)
+- Cada estrategia declara `PARAM_GRID: dict[str, list]` (valores a probar) y sus parámetros como atributos.
+  `Strategy(settings, clock=None, *, interval=None, **params)` permite fijar temporalidad y parámetros
+  (nombre desconocido -> `ValueError`). `params() -> dict` devuelve los valores actuales.
+- `signals(bars, zones=None) -> pd.DataFrame` **vectorizado**, mismo índice que `bars`, columnas
+  `side` ("long"/"short"/""), `entry_mode` ("market"/"zone"/"limit"), `entry_px`, `sl`, `tp`, `reason`.
+  La fila i sólo usa datos de filas <= i (sin look-ahead). `zones` es un DataFrame por vela con
+  `long_low, long_high, long_usd, short_low, short_high, short_usd` (NaN = sin zona).
+- En vivo, `_evaluate_closed` = última fila de `signals(bars, zones_df)` donde la última fila de zonas
+  viene del `LiquidityScanner` (paridad exacta vivo/backtest).
+- `liquidity.historical_zones(bars, settings) -> DataFrame`: zonas aproximadas para el pasado (no hay libro
+  ni liquidaciones históricas): clusters de máximos/mínimos de pivote confirmados (sin look-ahead) con
+  volumen como peso. Documentar la limitación.
+- Estrategias nuevas registradas en `STRATEGIES`: `ema_trend` (cruce EMA rápida/lenta + filtro ADX),
+  `rsi_reversion` (RSI extremo + toque de Bollinger, objetivo media), `donchian_breakout` (ruptura de canal
+  N velas + stop ATR). Todas con SL/TP coherentes y `PARAM_GRID`.
+
+## `desk/backtest.py`
+- `BTTrade(coin, side, entry_ts, entry_px, exit_ts, exit_px, size, pnl, pnl_pct, r_multiple, fees, exit_reason, bars_held)`;
+  `exit_reason` in {"sl","tp","end","flip"}.
+- `BacktestResult(coin, interval, strategy, params, start_ts, end_ts, bars, trades, equity: pd.Series, metrics: dict)`
+  con `to_dict()` (equity muestreada a <= 500 puntos).
+- `metrics`: `total_return_pct, cagr_pct, sharpe, sortino, max_drawdown_pct, calmar, win_rate_pct, profit_factor,
+  expectancy_r, n_trades, avg_trade_pct, avg_bars_held, exposure_pct, best_trade_pct, worst_trade_pct, fees_usd`.
+- `run_backtest(strategy, bars, settings, *, coin, meta=None, start_equity=None, zones=None) -> BacktestResult`:
+  señal al cierre de la vela i -> MARKET al open de i+1 ± `paper_slippage_bps` (comisión taker);
+  ZONE/LIMIT: límite en `entry_px` válido `entry_ttl_minutes`, se ejecuta si la vela lo toca (comisión maker);
+  una posición a la vez; SL/TP intravela, si una vela toca ambos -> **SL primero**; hueco a través del SL ->
+  ejecución al open (peor). Dimensionamiento igual que el riesgo en vivo (`auto_units`, `unit_margin_usd`,
+  apalancamiento min(settings, meta), recorte por `risk_per_trade_pct` en el SL y `max_notional_per_coin_usd`).
+  5000 velas con un juego de parámetros en < 100 ms.
+
+## `desk/optimizer.py`
+- `StrategyEvaluation(strategy, params, is_metrics, oos_metrics, oos_trades, folds, score, passed, reasons)`.
+- `OptimizationReport(id, coin, interval, days, bars, created_ts, evaluations, winner, notes)` con
+  `to_dict()/from_dict()` y `summary_text()` (tabla en español: dentro vs fuera de muestra).
+- `optimize(coin, interval, bars, settings, *, strategies=None, meta=None, seed=7, progress=None, should_stop=None)`:
+  walk-forward anclado de `bt_folds` tramos; en cada tramo se elige la mejor combinación (<= `bt_max_combos`,
+  muestreo determinista) en el tramo de entrenamiento y se mide en el siguiente (fuera de muestra). Los
+  parámetros propuestos para adoptar = mejores del último entrenamiento. Aprobada sólo si fuera de muestra:
+  PF >= `bt_min_profit_factor`, retorno > 0, operaciones >= `bt_min_trades`, DD <= `bt_max_drawdown_pct`;
+  `reasons` explica cada rechazo. Ranking por `bt_objective` fuera de muestra. `winner` = mejor aprobada o None.
+- `ReportStore(state_dir)`: `save(report, result=None) -> path` en `state/reports/<COIN>_<interval>_<id>.json`,
+  `latest(coin, interval)`, `list(limit)`, `get(id)`.
+
+## `desk/playbook.py`
+- `PlaybookEntry(coin, interval, strategy, params, units, adopted_ts, report_id, oos_metrics, enabled=True)`.
+- `Playbook(state_dir)` (`state/playbook.json`, escritura atómica): `adopt(entry)` (una entrada por moneda+temporalidad),
+  `remove(coin, interval=None) -> int`, `entries()`, `strategies(settings, clock) -> list[(PlaybookEntry, Strategy)]`.
+- La operativa automática usa las entradas del playbook (más las estrategias por defecto sobre `symbols` si
+  `auto_default_strategies`). Cada entrada opera con su temporalidad y sus parámetros.
+
+## `desk/report_render.py`
+- `render_html(report, result, bars) -> str`: HTML autocontenido (SVG en línea, sin dependencias): precio con
+  entradas/salidas, curva de capital, drawdown y tabla de estrategias (dentro vs fuera de muestra). Claro y oscuro.
+- `render_png(report, result, bars) -> bytes | None` (matplotlib si está instalado, backend Agg).
+- `sparkline(values, width=40) -> str` (bloques unicode) para consola y Telegram.
+
+## `desk/alerts.py`
+- `AlertRule(id, coin, kind, params, interval, repeat, cooldown_s, created_ts, last_fired_ts, fired_count, note)`.
+- Tipos (`Command.alert["kind"]`): `price_above`, `price_below`, `price_cross` (`level`); `rsi_below`, `rsi_above`
+  (`level`, `period`=14); `ma_cross` (`fast`, `slow`, `ma`="sma"|"ema", `direction`="up"|"down"|"any");
+  `zone` (`side`="long"|"short"|None: el precio entra en la zona de liquidez); `volume_spike` (`mult`, `lookback`=20);
+  `move_pct` (`pct`, ventana = `interval`). `Command.alert` = `{"kind":..., <params>, "interval":..., "repeat": bool}`.
+- `AlertManager(settings, clock, state_dir, notifier)`: `add(coin, spec) -> AlertRule`, `remove(id) -> bool`, `clear() -> int`,
+  `rules()`, `evaluate(market, scanner=None) -> list[str]` (cada ciclo; nunca lanza; indicadores sobre velas cerradas
+  con caché por ciclo), `system(kind, text, level="info", key=None, coin=None)` (avisos de la mesa con anti-spam por
+  `key` y `alert_cooldown_seconds`), `mute(minutes|None)`, `unmute()` (los críticos nunca se silencian).
+- Persistencia: reglas en `state/alerts.json`; cada aviso disparado en `state/alerts.jsonl`
+  (`{"ts","level","kind","coin","text","rule_id"}`), que leen el panel y la consola.
+
+## `desk/notify.py`
+- `Notifier(channels)`: `send(text, level="info", kind="", coin=None, image=None)`; envío de red en un hilo con cola
+  (la mesa nunca se bloquea por HTTP); errores de red se registran y se tragan.
+- Canales: `ConsoleChannel(out, bell)` (colores con rich si está disponible), `FileChannel(path)` (jsonl),
+  `TelegramChannel(token, chat_ids, min_level, session=None)` (`sendMessage`, `sendPhoto` si hay imagen),
+  `WebhookChannel(url, min_level, session=None)` (JSON con `content` y `text`: vale para Discord y Slack).
+- Niveles: "info" < "warn" < "critical".
+
+## `desk/telegram_bot.py`
+- `TelegramBot(token, chat_ids, submit, clock=None, session=None)`: long polling de `getUpdates` (timeout 25 s) en un
+  hilo daemon; sólo acepta mensajes de `chat_ids` (el resto se ignora sin responder y se registra);
+  `/start` y `/help` -> ayuda; un `/comando` se traduce a texto (`/estado` -> "estado"); cada texto se pasa a
+  `submit(text, source="telegram") -> str` y la respuesta vuelve al chat. `start()`, `stop()`. Nunca registra el token.
+
+## `desk/tui.py` y `desk/console.py`
+- `python -m desk dashboard`: panel `rich.live` de sólo lectura sobre los archivos de estado (`status.json`,
+  `alerts.jsonl`, `playbook.json`, índice de informes, `events.jsonl`): cabecera (modo, equity, PnL del día, barras
+  de consumo de pérdida diaria y drawdown, auto/halt), posiciones con PnL en color, órdenes, playbook, últimas
+  alarmas y señales, último backtest. Refresco 1 s; tolera archivos ausentes o a medio escribir.
+- `python -m desk console`: consola interactiva conectada a una mesa en marcha (inbox/outbox): historial readline,
+  autocompletado de verbos/monedas/temporalidades, respuestas en color y alarmas en tiempo real (hilo que sigue
+  `alerts.jsonl` y los avisos `desk` de `outbox.log`).
+- `status.json` (lo escribe la mesa) se amplía con: posiciones, órdenes, playbook, contadores de alarmas, últimas
+  señales y consumo de límites de riesgo en %.
