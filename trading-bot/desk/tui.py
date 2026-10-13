@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Union
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -69,6 +70,8 @@ MAX_EVALS = 5
 NOTICE_CHARS = 160                    # un aviso largo de la mesa se corta (el completo está en outbox.log)
 SPARK_POINTS = 32
 TWO_COLUMNS_MIN_WIDTH = 120
+LEFT_WANTED = 101                     # columna izquierda con la que cabe la tabla completa de posiciones
+RIGHT_MIN_WIDTH = 56                  # la derecha (alarmas, señales, operaciones) no baja de aquí por dar sitio
 HALT_DAILY = "daily_loss"             # halt diario: caduca solo al cambiar el día UTC (ver risk.active_halt)
 
 LEVEL_STYLES = {"info": "cyan", "warn": "bold yellow", "critical": "bold white on red"}
@@ -211,7 +214,8 @@ def usage_bar(used_pct: Optional[float], width: int = 20) -> Text:
     frac = min(max(used_pct, 0.0), 100.0) / 100.0
     full = int(round(frac * width))
     style = usage_style(used_pct)
-    t = Text("█" * full, style=style)
+    t = Text()
+    t.append("█" * full, style=style)
     t.append("░" * (width - full), style="dim")
     t.append(f" {used_pct:3.0f}%", style=style)
     return t
@@ -608,6 +612,11 @@ class Snapshot:
     problems: list[str] = field(default_factory=list)
 
 
+def _desk_now(snap: Snapshot) -> float:
+    """Hora de la mesa (simulada en ``--fast``): la del último ciclo, la de ``status.json`` o la del panel."""
+    return float(_pick(_num(snap.health.get("ts")), snap.status.get("ts"), snap.now))
+
+
 class SnapshotReader:
     """Lee ``state_dir`` y devuelve un ``Snapshot``. Recuerda la última lectura buena de cada JSON (un fichero a
     medio escribir no deja el panel en blanco) y no vuelve a leer lo que no ha cambiado (informes, diarios)."""
@@ -690,7 +699,7 @@ class SnapshotReader:
         if not risk:
             return
         st = snap.status
-        desk_now = _pick(_num(snap.health.get("ts")), st.get("ts"), snap.now)
+        desk_now = _desk_now(snap)
         halt = _str(risk.get("halt_reason")) or "halt" if _bool(risk.get("halted")) else ""
         if halt == HALT_DAILY and risk.get("day"):
             try:
@@ -720,17 +729,16 @@ class SnapshotReader:
                         "kind": _str(r.get("kind")), "coin": _str(r.get("coin")), "text": _str(r.get("text")),
                         "muted": bool(r.get("muted"))} for r in recs]
         stats = snap.status.get("alerts")
-        if isinstance(stats, dict):
-            snap.alert_stats = dict(stats)
-            return
+        snap.alert_stats = dict(stats) if isinstance(stats, dict) else {}
+        # alerts.json se guarda en cuanto cambia (status.json puede tener minutos): manda en reglas y silencio.
         state = _dict(self._json(ALERTS_STATE, snap.problems))
         if state:
             rules = state.get("rules") if isinstance(state.get("rules"), list) else []
             mute = state.get("mute")
             until = _num(mute.get("until")) if isinstance(mute, dict) else None
-            muted = isinstance(mute, dict) and (mute.get("until") is None or (until or 0) > snap.now)
-            snap.alert_stats = {"rules": len(rules), "muted": muted, "muted_until": until,
-                                "silenced": _num(mute.get("silenced")) if isinstance(mute, dict) else None}
+            muted = isinstance(mute, dict) and (mute.get("until") is None or (until or 0) > _desk_now(snap))
+            snap.alert_stats.update({"rules": len(rules), "muted": muted, "muted_until": until,
+                                     "silenced": _num(mute.get("silenced")) if isinstance(mute, dict) else None})
 
     def _read_playbook(self, snap: Snapshot) -> None:
         raw = self._json(PLAYBOOK_FILE, snap.problems)
@@ -784,7 +792,8 @@ class SnapshotReader:
         snap.trades = trades[-MAX_TRADES:]
 
     def _read_notices(self, snap: Snapshot) -> None:
-        snap.notices = desk_notices(self._tail(OUTBOX_FILE))[-MAX_NOTICES:]
+        """Avisos de la mesa sin la línea de estado periódica (repetiría la cabecera y taparía los avisos)."""
+        snap.notices = [n for n in desk_notices(self._tail(OUTBOX_FILE)) if not is_status_line(n["text"])][-MAX_NOTICES:]
 
     def _read_equity(self, snap: Snapshot) -> None:
         col = EQUITY_COLUMNS.index("equity")
@@ -794,6 +803,15 @@ class SnapshotReader:
             if len(parts) > col and (x := _num(parts[col])) is not None:
                 vals.append(x)
         snap.equity_curve = vals
+
+
+# Línea de estado periódica de la mesa (``TradingDesk.status_line``): también llega a outbox.log con id ``desk``.
+_RX_STATUS_LINE = re.compile(r"^equity -?\$[\d,]+(?:\.\d+)? \| PnL día .* \| auto (?:ON|OFF)\b.* \| halt \S+$")
+
+
+def is_status_line(text: str) -> bool:
+    """¿Es la línea de estado periódica (``equity ... | auto ON | halt no``)? La cabecera del panel ya la muestra."""
+    return bool(_RX_STATUS_LINE.match(text.strip()))
 
 
 def desk_notices(lines: Iterable[str]) -> list[dict[str, Any]]:
@@ -820,14 +838,17 @@ def load_snapshot(state_dir: Union[str, Path], clock: Optional[Clock] = None) ->
 
 
 # --------------------------------------------------------------------------- paneles
-def _table(*columns: tuple[str, str], flex: Optional[str] = None) -> Table:
-    """Tabla compacta: columnas de una línea con su ancho natural; ``flex`` (la de texto largo) se queda con el
-    sitio que sobra y se corta con "…" si no cabe."""
+def _table(*columns: tuple[str, str], flex: Optional[str] = None, wrap: bool = True) -> Table:
+    """Tabla compacta: columnas de una línea con su ancho natural (precios e importes nunca se parten); ``flex``
+    (la de texto largo: notas, veredicto) se queda con el sitio que sobra y, si no cabe, sigue en la línea
+    siguiente (un veredicto cortado con "…" ya no dice por qué); con ``wrap=False`` se corta con "…"."""
     t = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False, pad_edge=False, collapse_padding=True,
               header_style="bold")
     for name, justify in columns:
-        t.add_column(name, justify=justify, no_wrap=True, overflow="ellipsis", ratio=1 if name == flex else None,
-                     min_width=4 if name == flex else None)
+        wide = name == flex
+        t.add_column(name, justify=justify, no_wrap=not (wide and wrap),
+                     overflow="fold" if wide and wrap else "ellipsis", ratio=1 if wide else None,
+                     min_width=8 if wide else None)
     return t
 
 
@@ -940,28 +961,16 @@ def build_header(snap: Snapshot) -> RenderableType:
                  subtitle_align="right", border_style=border)
 
 
-class _ByWidth:
-    """Elige qué pintar según el ancho disponible (no se sabe hasta pintar). Un fallo se pinta como error."""
-
-    def __init__(self, build: Callable[[int], RenderableType]):
-        self.build = build
-
-    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        try:
-            yield self.build(options.max_width)
-        except Exception as e:  # noqa: BLE001 - el panel nunca se cae por un dato raro
-            log.debug("panel: fallo pintando", exc_info=True)
-            yield Text(f"No se pudo pintar ({type(e).__name__}: {e})", style="red")
+ORIGIN_MIN_WIDTH = 10                 # separación + ancho mínimo de la columna Origen (lo que no quepa, con "…")
+COMPACT_HIDDEN = frozenset({"%", "Lev", "Origen"})
+MEASURE_WIDTH = 10_000
 
 
-POSITIONS_COMPACT_WIDTH = 90          # por debajo, sin Lev / % / Origen: nunca se recortan precios ni importes
-
-
-def _positions_table(pos: list[dict[str, Any]], compact: bool) -> Table:
+def _positions_table(pos: list[dict[str, Any]], hidden: Iterable[str] = ()) -> Table:
     cols = [("Moneda", "left"), ("Lado", "left"), ("Tamaño", "right"), ("Entrada", "right"), ("Marca", "right"),
             ("PnL", "right"), ("%", "right"), ("Lev", "right"), ("SL", "right"), ("TP", "right"), ("Origen", "left")]
-    hidden = {"%", "Lev", "Origen"} if compact else set()
-    t = _table(*[c for c in cols if c[0] not in hidden], flex=None if compact else "Origen")
+    hidden = set(hidden)
+    t = _table(*[c for c in cols if c[0] not in hidden], flex=None if "Origen" in hidden else "Origen", wrap=False)
     for p in pos[:MAX_ROWS]:
         pct, lev = p.get("pnl_pct"), p.get("leverage")
         cells = {"Moneda": Text(p["coin"], style="bold"), "Lado": side_text(p.get("side")),
@@ -975,6 +984,29 @@ def _positions_table(pos: list[dict[str, Any]], compact: bool) -> Table:
     return t
 
 
+class _PositionsBody:
+    """Tabla de posiciones con las columnas que quepan sin recortar precios ni importes: todas; sin Origen; o sin %,
+    Lev ni Origen (terminal estrecho). Se mide al pintar: el ancho disponible no se sabe antes."""
+
+    def __init__(self, pos: list[dict[str, Any]]):
+        self.pos = pos
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        try:
+            core = _positions_table(self.pos, {"Origen"})
+            # Ancho natural medido sin tope (con el ancho real, rich lo recorta a lo disponible).
+            need = Measurement.get(console, options.update_width(MEASURE_WIDTH), core).minimum
+            if need + ORIGIN_MIN_WIDTH <= options.max_width:
+                yield _positions_table(self.pos)
+            elif need <= options.max_width:
+                yield core
+            else:
+                yield _positions_table(self.pos, COMPACT_HIDDEN)
+        except Exception as e:  # noqa: BLE001 - el panel nunca se cae por un dato raro
+            log.debug("panel: fallo pintando posiciones", exc_info=True)
+            yield Text(f"No se pudo pintar ({type(e).__name__}: {e})", style="red")
+
+
 def build_positions(snap: Snapshot) -> RenderableType:
     pos = snap.status.get("positions") or []
     if not pos:
@@ -984,7 +1016,7 @@ def build_positions(snap: Snapshot) -> RenderableType:
     sub = Text("PnL no realizado ") + pnl_text(total, bold=True)
     if more > 0:
         sub.append(f" · y {more} más", style="dim")
-    body = _ByWidth(lambda w: _positions_table(pos, compact=w < POSITIONS_COMPACT_WIDTH))
+    body = _PositionsBody(pos)
     return Panel(body, title=f"Posiciones ({len(pos)})", border_style="blue", subtitle=sub, subtitle_align="right")
 
 
@@ -1122,14 +1154,19 @@ def build_alerts(snap: Snapshot) -> RenderableType:
 
 
 def build_signals(snap: Snapshot) -> RenderableType:
+    """Lista (no tabla): en la columna estrecha el motivo es lo que más ocupa y debe leerse entero."""
     sigs = snap.signals
     if not sigs:
         return Panel(_empty("Sin señales recientes de las estrategias."), title="Últimas señales", border_style="cyan")
-    t = _table(("Hora", "left"), ("Moneda", "left"), ("Lado", "left"), ("Estrategia", "left"), ("Motivo", "left"),
-               flex="Motivo")
-    for s in reversed(sigs):
-        t.add_row(Text(_when(s.get("ts"), s.get("time")), style="dim"), Text(s["coin"], style="bold"),
-                  side_text(s.get("side")), Text(s.get("strategy") or "-"), Text(s.get("reason") or "", style="dim"))
+    t = Table.grid(padding=(0, 1), expand=True)
+    t.add_column(no_wrap=True)
+    t.add_column(ratio=1, overflow="fold")
+    for s in reversed(sigs):                       # la más reciente arriba
+        body = Text.assemble((s["coin"], "bold"), " ", side_text(s.get("side")),
+                             (f" {s['strategy']}" if s.get("strategy") else "", ""))
+        if s.get("reason"):
+            body.append(f": {s['reason']}", style="dim")
+        t.add_row(Text(_when(s.get("ts"), s.get("time")), style="dim"), body)
     return Panel(t, title="Últimas señales", border_style="cyan")
 
 
@@ -1195,21 +1232,31 @@ def _safe(title: str, builder: Callable[[Snapshot], RenderableType], snap: Snaps
         return Panel(Text(f"No se pudo pintar ({type(e).__name__}: {e})", style="red"), title=title, border_style="red")
 
 
+def column_widths(width: int) -> Optional[tuple[int, int]]:
+    """(izquierda, derecha) del panel a dos columnas, o None si no caben (una debajo de otra). La izquierda se lleva
+    3/5 y, si hay sitio, lo necesario para la tabla completa de posiciones (``LEFT_WANTED``)."""
+    if width < TWO_COLUMNS_MIN_WIDTH:
+        return None
+    left = max(width * 3 // 5, min(LEFT_WANTED, width - 1 - RIGHT_MIN_WIDTH))
+    return left, width - 1 - left
+
+
 class _Columns:
     """Dos columnas si caben (terminal ancho); si no, una debajo de otra."""
 
-    def __init__(self, left: list[RenderableType], right: list[RenderableType], min_width: int = TWO_COLUMNS_MIN_WIDTH):
-        self.left, self.right, self.min_width = left, right, min_width
+    def __init__(self, left: list[RenderableType], right: list[RenderableType]):
+        self.left, self.right = left, right
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
-        if options.max_width >= self.min_width:
-            grid = Table.grid(expand=True, padding=(0, 1))
-            grid.add_column(ratio=3)
-            grid.add_column(ratio=2)
-            grid.add_row(Group(*self.left), Group(*self.right))
-            yield grid
-        else:
+        widths = column_widths(options.max_width)
+        if widths is None:
             yield Group(*self.left, *self.right)
+            return
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=widths[0])
+        grid.add_column(width=widths[1])
+        grid.add_row(Group(*self.left), Group(*self.right))
+        yield grid
 
 
 def build_layout(snap: Snapshot) -> RenderableType:
@@ -1218,8 +1265,11 @@ def build_layout(snap: Snapshot) -> RenderableType:
             _safe("Playbook", build_playbook, snap), _safe("Último backtest", build_backtest, snap)]
     right = [_safe("Alarmas", build_alerts, snap), _safe("Últimas señales", build_signals, snap),
              _safe("Operaciones cerradas", build_trades, snap), _safe("Avisos de la mesa", build_notices, snap)]
-    foot = Text(f"Sólo lectura de {snap.state_dir} · se actualiza cada {REFRESH_S:g} s · Ctrl+C para salir",
-                style="dim")
+    try:
+        read_at = datetime.fromtimestamp(snap.now, tz=timezone.utc).strftime("%H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        read_at = "-"
+    foot = Text(f"Sólo lectura de {snap.state_dir} · leído a las {read_at} UTC · Ctrl+C para salir", style="dim")
     return Group(_safe("Mesa de trading", build_header, snap), _Columns(left, right), foot)
 
 

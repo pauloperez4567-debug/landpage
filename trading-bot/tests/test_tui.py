@@ -14,9 +14,10 @@ from rich.panel import Panel
 from desk import tui
 from desk.__main__ import main
 from desk.clock import SimClock
-from desk.tui import (Snapshot, SnapshotReader, build_alerts, build_header, build_layout, build_positions, desk_notices,
-                      load_snapshot, normalize_playbook, normalize_report, normalize_status, notice_level,
-                      run_dashboard, sparkline, tail_lines, usage_bar)
+from desk.tui import (Snapshot, SnapshotReader, build_alerts, build_backtest, build_header, build_layout, build_orders,
+                      build_positions, build_signals, column_widths, desk_notices, load_snapshot, normalize_playbook,
+                      normalize_report, normalize_status, notice_level, run_dashboard, sparkline, tail_lines,
+                      usage_bar)
 
 T0 = 1_767_225_600.0          # 2026-01-01 00:00:00 UTC
 
@@ -139,6 +140,7 @@ def write_full_state(d: Path) -> None:
          "pnl": 22.42, "exit_reason": "tp", "closed_ts": T0 + 1000, "origin": "command"},
     ])
     (d / "outbox.log").write_text(
+        "2026-01-01 00:20:00 [desk] equity $10,100.00 | PnL día +$0.00 (+0.00%) | posiciones 0 | auto ON | halt no\n"
         "2026-01-01 00:30:00 [desk] AUTO [ema_trend] BTC LONG: entrada ejecutada\n"
         "2026-01-01 00:30:00 [desk] Motivo: cruce EMA\n"
         "2026-01-01 00:31:00 [c-000001] respuesta privada a un comando\n"
@@ -222,6 +224,7 @@ def test_full_snapshot_renders_every_panel(tmp_path):
     snap = SnapshotReader(tmp_path, SimClock(T0 + 3600)).read()
     assert snap.problems == []
     text = render(build_layout(snap))
+    assert "leído a las 01:00:00 UTC" in text                                      # hora del reloj inyectado
     # cabecera: modo, equity, PnL del día, consumo de límites, auto/halt, alarmas y salud
     for s in ("Mesa de trading", "PAPER", "datos sim", "$10,127.00", "-$123.00 (-1.20%)", "disponible $9,000.00",
               "Pérdida diaria", " 55%", "1.20% de 3%", "Drawdown", " 82%", "4.10% de 5%", "Automático ON",
@@ -240,11 +243,30 @@ def test_full_snapshot_renders_every_panel(tmp_path):
     assert "77.7" not in text and "77.8" not in text and "4.40" not in text      # nada dentro de muestra
     # alarmas (la línea a medio escribir no sale), señales, operaciones y avisos de la mesa
     for s in ("BTC cruzó 85000 al alza", " AVISO ", " CRÍTICO ", "SOL volumen x3.2 (silenciada)",
-              "cruce EMA 12/26 al alza", "+$22.42", "-$11.07", "take-profit", "stop-loss",
-              "AUTO [ema_trend] BTC LONG: entrada ejecutada", "Motivo: cruce EMA", "HALT por pérdida diaria: -3.1%"):
+              "BTC LONG ema_trend: cruce EMA 12/26", "+$22.42", "-$11.07", "take-profit", "stop-loss",
+              "AUTO [ema_trend] BTC LONG: entrada", "Motivo: cruce EMA", "HALT por pérdida diaria: -3.1%"):
         assert s in text, s
     assert "a medio escr" not in text and "respuesta privada" not in text
+    assert "$10,100.00" not in text                     # la línea de estado periódica no tapa los avisos
     assert text.index("BTC cruzó 85000") > text.index("ETH RSI(14)")             # lo más reciente arriba
+    # Dos columnas: la izquierda deja sitio a la tabla completa de posiciones (con el origen entero).
+    assert "Origen" in text and max(len(ln) for ln in text.splitlines()) <= 160
+
+
+def test_long_texts_wrap_instead_of_being_cut(tmp_path):
+    """Motivos de señal, notas y veredictos largos siguen en la línea siguiente: nunca se pierden con "…"."""
+    write_full_state(tmp_path)
+    raw = full_status()
+    raw["signals"][0]["reason"] = "barrido de la zona LONG 84000-84200 con RSI(14) 31 subiendo y volumen x2"
+    write_json(tmp_path / "status.json", raw)
+    snap = load_snapshot(tmp_path, SimClock(T0 + 3600))
+    assert "…" not in render(build_layout(snap))
+
+    def words(renderable, width):           # texto del panel sin bordes ni saltos de línea
+        return " ".join(w for w in render(renderable, width).split() if w.strip("│╭╮╰╯─"))
+    assert "barrido de la zona LONG 84000-84200 con RSI(14) 31 subiendo y volumen x2" in words(build_signals(snap), 58)
+    assert "rechazada: PF fuera de muestra 0.81 < 1.2" in words(build_backtest(snap), 60)
+    assert "SL 3050 TP 3200 · caduca 01/01 02:00" in words(build_orders(snap), 60)
 
 
 def test_pnl_risk_bars_and_alarm_levels_have_their_colors(tmp_path):
@@ -264,10 +286,16 @@ def test_pnl_risk_bars_and_alarm_levels_have_their_colors(tmp_path):
     assert usage_bar(10).spans[0].style == "green" and usage_bar(None).plain.endswith("s/d")
 
 
+def test_column_widths():
+    assert column_widths(119) is None                                             # una columna
+    assert column_widths(160) == (101, 58)                                        # posiciones completas a la izquierda
+    assert column_widths(120) == (72, 47) and column_widths(250) == (150, 99)    # 3/5 como mínimo
+
+
 def test_narrow_terminal_stacks_panels_and_never_truncates_prices(tmp_path):
     write_full_state(tmp_path)
     text = render(build_layout(load_snapshot(tmp_path, SimClock(T0))), width=80)
-    assert text.index("Último backtest") < text.index("Alarmas")                  # una columna
+    assert text.index("Último backtest") < text.index("BTC cruzó 85000")          # una columna
     assert "84000" in text and "85000" in text and "-$10.80" in text and "Origen" not in text
     assert max(len(ln) for ln in text.splitlines()) <= 80
 
@@ -286,6 +314,18 @@ def test_risk_json_overrides_halt_pause_and_cooldown(tmp_path):
     # Un halt diario de otro día (la mesa aún no ha hecho su update) ya no cuenta.
     write_json(tmp_path / "health.json", {"ts": T0 + 86400 + 60, "cycle": 1})
     assert load_snapshot(tmp_path, SimClock(T0)).status["halt"] == ""
+
+
+def test_alerts_json_is_fresher_than_status_for_rules_and_mute(tmp_path):
+    write_full_state(tmp_path)                                   # status.json: 3 reglas, 7 disparadas, sin silencio
+    write_json(tmp_path / "alerts.json", {"version": 1, "next_id": 6, "rules": [{"id": 4}, {"id": 5}],
+                                          "mute": {"until": T0 + 7200, "silenced": 2}})
+    snap = load_snapshot(tmp_path, SimClock(T0 + 10 * 86400))   # el reloj del panel no cuenta: manda la hora de la mesa
+    assert snap.alert_stats["rules"] == 2 and snap.alert_stats["fired_total"] == 7 and snap.alert_stats["muted"]
+    text = render(build_layout(snap))
+    assert "Alarmas 2 activas, 7 disparadas · SILENCIADAS hasta 01/01 02:00" in text
+    write_json(tmp_path / "health.json", {"ts": T0 + 7300, "cycle": 999})      # la mesa ya pasó el silencio
+    assert load_snapshot(tmp_path, SimClock(T0)).alert_stats["muted"] is False
 
 
 # --------------------------------------------------------------------------- snapshot parcial (formato de hoy)
@@ -316,6 +356,39 @@ def test_empty_state_dir_renders_placeholders(tmp_path):
     text = render(build_layout(snap))
     assert "Sin status.json" in text and "Posiciones (0)" in text and "MODO ?" in text
     assert snap.problems == []
+
+
+def test_dashboard_reads_what_a_real_desk_writes_today(settings, market, clock):
+    """Contra una ``TradingDesk`` real (datos falsos, sin red): el texto de ``status.json`` de hoy se entiende entero
+    (si el formato de ``status_report`` cambia, este test lo detecta)."""
+    from desk.desk import TradingDesk
+    from desk.exchange.paper import PaperBroker
+    from desk.journal import Journal
+    settings.auto_enabled = False
+    state = settings.state_path
+    state.mkdir(parents=True, exist_ok=True)
+    desk = TradingDesk(settings, market, PaperBroker(market, settings, clock, state / "paper_broker.json"), clock,
+                       journal=Journal(state, clock), strategies=[], out=lambda text: None)
+    desk.run_cycle()
+    assert "SOL LONG" in desk.submit("long SOL a mercado")
+    desk.submit("long BTC a 80000")                         # entrada límite pendiente
+    clock.advance(30)
+    desk.run_cycle()
+    desk.write_status_snapshot()
+    snap = load_snapshot(state, clock)
+    st = snap.status
+    acct = desk.broker.account()
+    assert st["equity"] == pytest.approx(acct.equity, abs=0.01) and st["mode"] == "paper"
+    assert st["auto"] is False and st["halt"] == "" and st["symbols"] == list(settings.symbols)
+    [sol] = st["positions"]
+    pos = acct.positions["SOL"]
+    assert (sol["coin"], sol["side"], sol["size"], sol["origin"]) == ("SOL", "long", pytest.approx(pos.size), "comando")
+    assert sol["pnl"] == pytest.approx(pos.unrealized_pnl, abs=0.01) and sol["sl"] and sol["tp"]
+    assert {(o["coin"], o["kind"]) for o in st["orders"]} >= {("SOL", "stop"), ("SOL", "take_profit")}
+    assert [p["coin"] for p in st["pending"]] == ["BTC"] and st["pending"][0]["entry_px"] == 80000
+    assert st["daily_used_pct"] is not None and st["dd_used_pct"] is not None
+    text = render(build_layout(snap))
+    assert "Posiciones (1)" in text and "entrada pendiente" in text and "stop (SL)" in text and snap.problems == []
 
 
 # --------------------------------------------------------------------------- snapshots corruptos
@@ -388,6 +461,8 @@ def test_sparkline_and_notice_levels():
     assert notice_level("HALT por drawdown máximo: -5%") == "critical"
     assert notice_level("equity $1 | PnL día +$0.00 (+0.00%) | posiciones 0 | auto ON | halt no") == "info"
     assert notice_level("ATENCIÓN: no se pudo cerrar BTC") == "warn"
+    assert tui.is_status_line("equity $1,000.00 | PnL día -$2.00 (-0.20%) | posiciones 0 | auto ON (pausa) | halt no")
+    assert not tui.is_status_line("SIN DATOS DE LA CUENTA (timeout) | ciclos seguidos con fallos 4 | halt no")
 
 
 # --------------------------------------------------------------------------- bucle y CLI

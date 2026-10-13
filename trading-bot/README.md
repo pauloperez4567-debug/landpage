@@ -103,6 +103,25 @@ los `[id]` ya ejecutados). **No borres ni edites líneas** del inbox: si el fich
 mesa avisa y sólo ejecuta las líneas con un `[id]` que no haya visto. Para anular un comando que ya se
 ejecutó, envía el contrario (`cancela HYPE`, `cierra HYPE`).
 
+### 4. Panel en vivo y consola interactiva
+
+```bash
+python -m desk dashboard            # panel (sólo lectura) que se refresca cada segundo; Ctrl+C para salir
+python -m desk dashboard --once     # pinta una vez y sale (también sin terminal, p. ej. por ssh o en un log)
+python -m desk console              # consola conectada a la mesa en marcha (por inbox/outbox)
+```
+
+- **Panel**: equity con mini-gráfica, PnL del día en verde/rojo, barras de consumo de la pérdida diaria y del
+  drawdown (verde < 50 %, amarillo < 80 %, rojo), automático/pausa/halt, posiciones, órdenes, playbook, último
+  backtest (**sólo métricas fuera de muestra**, con su advertencia), alarmas por nivel, señales, operaciones
+  cerradas y avisos de la mesa. Sólo lee `state/`: se abre y se cierra sin afectar a la mesa, y un fichero
+  ausente o a medio escribir no lo rompe.
+- **Consola**: los mismos comandos que `send`, con historial (`state/.console_history`, flechas y Ctrl+R),
+  Tab para autocompletar verbos, monedas y temporalidades, respuestas en color y las alarmas y avisos de la
+  mesa en cuanto llegan. `salir` (o Ctrl+D) cierra **sólo la consola**: la mesa sigue en marcha.
+
+(Ambos aceptan `--fast` y `--state-dir` como `send`.)
+
 ---
 
 ## Comandos
@@ -206,6 +225,32 @@ Cada estrategia define su lógica una sola vez (`Strategy.signals`, vectorizada)
 en vivo usan exactamente el mismo código, y la señal en vivo es la última fila de ese cálculo. Que una
 estrategia exista aquí no significa que gane dinero: un backtest no garantiza nada y sólo cuenta el
 resultado fuera de muestra.
+
+### Backtest walk-forward por gráfica y playbook
+
+`desk/optimizer.py` prueba las estrategias sobre una gráfica (moneda + temporalidad) sin hacerse trampas:
+
+- **Walk-forward anclado** (`DESK_BT_FOLDS` tramos): los parámetros de cada tramo se eligen sólo con su pasado
+  (hasta `DESK_BT_MAX_COMBOS` combinaciones, muestreo determinista) y se miden en el bloque siguiente, que no
+  vieron. Lo que se enseña y lo que decide es esa curva **fuera de muestra**; lo de dentro de muestra sale al
+  lado sólo para ver cuánto se infla.
+- **Aprobada** sólo si fuera de muestra: PF ≥ `DESK_BT_MIN_PROFIT_FACTOR`, retorno > 0, ≥ `DESK_BT_MIN_TRADES`
+  operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` **y ventaja estadísticamente significativa** (t del R medio
+  por operación, corregida por el número de estrategias comparadas). Ese último filtro no es decorativo: sobre
+  gráficas de ruido puro (paseos aleatorios), sólo con los otros cuatro 17 de 24 tenían "ganadora"; con él, 0 de 40.
+  Lo normal es que muchas gráficas no tengan ganadora: es la respuesta honesta.
+- Una estrategia que mira el futuro se detecta (sus señales pasadas cambian al añadir velas) y se invalida.
+- Informes en `state/reports/` (`ReportStore`), con resumen en texto, HTML autocontenido (precio con entradas y
+  salidas, capital, drawdown, claro/oscuro) y PNG (`desk/report_render.py`). Las gráficas adoptadas quedan en
+  `state/playbook.json` (`desk/playbook.py`: una estrategia con sus parámetros por moneda + temporalidad; sólo se
+  adopta lo aprobado fuera de muestra).
+
+```python
+from desk.optimizer import optimize, ReportStore
+report = optimize("HYPE", "1h", velas_cerradas, settings, meta=meta)   # ~7.5 s: 5 estrategias x 60 x 4 tramos, 3000 velas
+print(report.summary_text())
+ReportStore(settings.state_dir).save(report)
+```
 
 Reglas de la operativa automática:
 
@@ -339,6 +384,9 @@ trading-bot/
 │   ├── risk.py            RiskManager: tamaño, halts diario/drawdown, cooldown, pausa
 │   ├── strategy.py        Estrategias (liquidity_sweep, squeeze_breakout, ema_trend, rsi_reversion, donchian_breakout)
 │   ├── backtest.py        Backtest por gráfica: ejecución conservadora, métricas
+│   ├── optimizer.py       Walk-forward: parámetros sin mirar el futuro, aprobación fuera de muestra, informes
+│   ├── playbook.py        Gráficas adoptadas en automático (estrategia + parámetros por moneda y temporalidad)
+│   ├── report_render.py   Informes HTML (SVG en línea) y PNG, mini-gráficas de texto
 │   ├── liquidity.py       Zonas de liquidez (libro + liquidaciones; históricas por pivotes para backtest)
 │   ├── commands.py        Comandos ES/EN por reglas + fallback IA
 │   ├── journal.py         Diarios y estado en disco
@@ -366,6 +414,8 @@ En `state/` (o `DESK_STATE_DIR`; `state/fast/` con `--fast`):
 | `health.json` | Salud de cada ciclo: racha de fallos, etapas que fallan, última lectura buena de cuenta y fills |
 | `heartbeat` | Hora del último ciclo que leyó la cuenta y los fills (healthcheck) |
 | `paper_broker.json`, `engine.json`, `risk.json`, `desk.json`, `profile.json` | Estado para sobrevivir a reinicios |
+| `reports/<COIN>_<tf>_<id>.json` | Informes de backtest walk-forward (dentro vs fuera de muestra) y su curva fuera de muestra |
+| `playbook.json` | Gráficas adoptadas en automático: estrategia, parámetros, unidades y métricas fuera de muestra |
 
 Para empezar de cero en paper: detén la mesa y borra `state/`.
 

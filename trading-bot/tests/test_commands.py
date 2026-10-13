@@ -599,9 +599,13 @@ def test_llm_schema_mirrors_command():
     command_fields = {f.name for f in fields(Command)}
     assert set(props) <= command_fields
     assert set(props) == {"action", "coin", "side", "units", "entry_mode", "price", "sl_price", "sl_pct",
-                          "tp_price", "tp_pct", "param", "value"}
+                          "tp_price", "tp_pct", "param", "value",
+                          "interval", "strategy", "days", "alert"}         # fase 2
     for name, schema in props.items():
         assert {"type": "null"} in schema["anyOf"], name          # todos nullable
+    # La API limita los parámetros con unión (anyOf) de un esquema estricto: no crecer sin mirar el límite.
+    assert sum("anyOf" in s for s in props.values()) <= 16
+    assert props["interval"]["anyOf"][0]["enum"] == list(commands.INTERVALS)
     action_enum = props["action"]["anyOf"][0]["enum"]
     assert set(action_enum) == set(LLM_ACTIONS) and all(A(a) for a in action_enum)
     assert "confirm" not in action_enum and "reset_halt" not in action_enum
@@ -824,3 +828,589 @@ def test_command_parser_wiring(settings, llm_settings):
     llm, client = make_llm(llm_settings, fake_response(llm_json(action="close_all")))
     assert CommandParser(llm_settings, llm=llm).parse("sácame de todo ya mismo").action is A.CLOSE_ALL
     assert len(client.messages.calls) == 1
+
+
+# ======================================================================================
+# Fase 2: backtest por gráfica, playbook, alarmas y silencio
+# ======================================================================================
+
+CHART_FIELDS = ("coin", "interval", "days", "strategy")
+
+
+def _phase2(text, settings, action, **expected) -> Command:
+    cmd = parse_rules(text, settings)
+    assert cmd is not None, text
+    assert cmd.action is action and cmd.source == "regex" and cmd.raw == text.strip(), (text, cmd)
+    _assert_fields(cmd, expected)
+    assert cmd.side is None and cmd.units is None and cmd.price is None    # nada de órdenes
+    return cmd
+
+
+BACKTEST_CASES = [
+    # ejemplos del contrato
+    ("backtest HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("backtest BTC 15m 90d", dict(coin="BTC", interval="15m", days=90.0)),
+    ("backtest SOL 4h 180 dias", dict(coin="SOL", interval="4h", days=180.0)),
+    ("backtest SOL 4h 180 días", dict(coin="SOL", interval="4h", days=180.0)),
+    ("optimiza ETH 1h", dict(coin="ETH", interval="1h")),
+    ("prueba HYPE 1h ema_trend", dict(coin="HYPE", interval="1h", strategy="ema_trend")),
+    ("backtest HYPE", dict(coin="HYPE")),                                  # temporalidad por defecto de la mesa
+    # duraciones de la historia
+    ("backtest HYPE 1h 3 meses", dict(coin="HYPE", interval="1h", days=90.0)),
+    ("backtest HYPE 1h 1 año", dict(coin="HYPE", interval="1h", days=365.0)),
+    ("backtest HYPE 4h 2 años", dict(coin="HYPE", interval="4h", days=730.0)),
+    ("backtest HYPE 1h un año", dict(coin="HYPE", interval="1h", days=365.0)),
+    ("backtest HYPE 1h 1y", dict(coin="HYPE", interval="1h", days=365.0)),
+    ("backtest HYPE 1h 6 months", dict(coin="HYPE", interval="1h", days=180.0)),
+    ("backtest HYPE 1h 2 semanas", dict(coin="HYPE", interval="1h", days=14.0)),
+    ("backtest HYPE 1h 1,5 meses", dict(coin="HYPE", interval="1h", days=45.0)),
+    ("backtest HYPE 1h 90 d", dict(coin="HYPE", interval="1h", days=90.0)),
+    ("Backtest hype 1H 90D", dict(coin="HYPE", interval="1h", days=90.0)),
+    ("backtest HYPE 90d", dict(coin="HYPE", days=90.0)),                    # sólo historia
+    # "1d"/"3d": temporalidad salvo que ya haya otra
+    ("backtest btc 1d", dict(coin="BTC", interval="1d")),
+    ("backtest btc 3d", dict(coin="BTC", interval="3d")),
+    ("backtest btc 1d 365d", dict(coin="BTC", interval="1d", days=365.0)),
+    ("backtest btc 365d 1d", dict(coin="BTC", interval="1d", days=365.0)),
+    ("backtest btc 1h 3d", dict(coin="BTC", interval="1h", days=3.0)),
+    ("backtest btc 90 dias 1d", dict(coin="BTC", interval="1d", days=90.0)),
+    ("backtest btc 1w", dict(coin="BTC", interval="1w")),
+    ("backtest btc 1 week", dict(coin="BTC", days=7.0)),
+    # temporalidades con palabras
+    ("backtest de BTC en 15 minutos", dict(coin="BTC", interval="15m")),
+    ("backtest ETH 4 horas", dict(coin="ETH", interval="4h")),
+    ("optimize SOL 15min last 30 days", dict(coin="SOL", interval="15m", days=30.0)),
+    # verbos y relleno
+    ("haz un backtest de HYPE en 1h con los ultimos 90 dias", dict(coin="HYPE", interval="1h", days=90.0)),
+    ("bt HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("optimizar BTC 4h", dict(coin="BTC", interval="4h")),
+    ("test ETH 1h", dict(coin="ETH", interval="1h")),
+    ("backtest HYPE 1h todas las estrategias", dict(coin="HYPE", interval="1h", strategy=None)),
+    ("backtest 1h HYPE", dict(coin="HYPE", interval="1h")),                 # el orden no importa
+    # monedas
+    ("backtest $HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("backtest HYPE-PERP 1h", dict(coin="HYPE", interval="1h")),
+    ("backtest xyz:GOLD 1h", dict(coin="xyz:GOLD", interval="1h")),
+    ("backtest W 1h", dict(coin="W", interval="1h")),                       # "W" suelto es moneda, no semana
+    ("backtest ME 1h", dict(coin="ME", interval="1h")),
+    ("backtest ID 4h", dict(coin="ID", interval="4h")),
+    # estrategias: nombre canónico, con espacios/guiones o una palabra que sólo es suya
+    ("prueba la estrategia rsi_reversion en ETH 15m", dict(coin="ETH", interval="15m", strategy="rsi_reversion")),
+    ("prueba HYPE 1h ema trend", dict(coin="HYPE", interval="1h", strategy="ema_trend")),
+    ("prueba HYPE 1h EMA-Trend", dict(coin="HYPE", interval="1h", strategy="ema_trend")),
+    ("prueba HYPE 1h donchian", dict(coin="HYPE", interval="1h", strategy="donchian_breakout")),
+    ("prueba HYPE 1h squeeze", dict(coin="HYPE", interval="1h", strategy="squeeze_breakout")),
+    ("prueba HYPE 15m liquidity_sweep", dict(coin="HYPE", interval="15m", strategy="liquidity_sweep")),
+    ("backtest HYPE 4h donchian_breakout 1 año",
+     dict(coin="HYPE", interval="4h", days=365.0, strategy="donchian_breakout")),
+    ("backtest ema_trend HYPE 90d 1h", dict(coin="HYPE", interval="1h", days=90.0, strategy="ema_trend")),
+]
+
+
+@pytest.mark.parametrize("text,expected", BACKTEST_CASES, ids=[c[0] for c in BACKTEST_CASES])
+def test_backtest_commands(settings, text, expected):
+    full = {f: None for f in CHART_FIELDS}
+    full.update(expected)
+    _phase2(text, settings, A.BACKTEST, **full)
+
+
+@pytest.mark.parametrize("interval", list(commands.INTERVALS))
+def test_every_exchange_interval_is_a_valid_chart(settings, interval):
+    cmd = parse_rules(f"backtest BTC {interval}", settings)
+    assert cmd is not None and cmd.interval == interval and cmd.days is None
+    assert parse_rules(f"activa BTC {interval}", settings).interval == interval
+
+
+def test_strategy_names_cover_registry_and_known_names():
+    from desk.strategy import STRATEGIES
+    names = commands.strategy_names()
+    assert set(STRATEGIES) <= set(names) and set(commands.KNOWN_STRATEGIES) <= set(names)
+    assert {"ema_trend", "rsi_reversion", "donchian_breakout"} <= set(names)
+
+
+@pytest.mark.parametrize("name", commands.strategy_names())
+def test_every_strategy_name_parses(settings, name):
+    cmd = parse_rules(f"prueba HYPE 1h {name}", settings)
+    assert cmd is not None and cmd.action is A.BACKTEST and cmd.strategy == name
+    assert parse_rules(f"activa HYPE 1h {name}", settings).strategy == name
+    assert commands.strategy_key(name.upper().replace("_", " ")) == name
+
+
+def test_strategy_registered_later_is_accepted(settings, monkeypatch):
+    import desk.strategy as strategy_mod
+    monkeypatch.setitem(strategy_mod.STRATEGIES, "vwap_bounce", strategy_mod.STRATEGIES["ema_trend"])
+    assert parse_rules("prueba HYPE 1h vwap_bounce", settings).strategy == "vwap_bounce"
+    assert commands.strategy_key("macd") is None and commands.strategy_key("breakout") is None   # ambigua
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("1h", "1h"), ("1H", "1h"), ("15m", "15m"), ("15 min", "15m"), ("4 horas", "4h"), ("1 dia", "1d"),
+    ("1 día", "1d"), ("1w", "1w"), ("una hora", "1h"), ("7h", None), ("60m", None), ("90d", None), ("1,5h", None),
+    ("hype", None), ("", None), ("1h 4h", None),
+])
+def test_parse_interval(text, expected):
+    assert commands.parse_interval(text) == expected
+
+
+ADOPT_CASES = [
+    ("activa HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("usa la mejor HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("activa HYPE 1h ema_trend", dict(coin="HYPE", interval="1h", strategy="ema_trend")),
+    ("adopt HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("adopta BTC 4h", dict(coin="BTC", interval="4h")),
+    ("usa la mejor estrategia en SOL 15m", dict(coin="SOL", interval="15m")),
+    ("activa la ganadora de ETH 1h en automático", dict(coin="ETH", interval="1h")),
+    ("usa ema_trend en HYPE 1h", dict(coin="HYPE", interval="1h", strategy="ema_trend")),
+    ("activa HYPE 1 hora", dict(coin="HYPE", interval="1h")),
+    ("activa HYPE 1d", dict(coin="HYPE", interval="1d")),
+    ("enable BTC 4h rsi_reversion", dict(coin="BTC", interval="4h", strategy="rsi_reversion")),
+    ("aplica la mejor a xyz:GOLD 1h", dict(coin="xyz:GOLD", interval="1h")),
+]
+
+
+@pytest.mark.parametrize("text,expected", ADOPT_CASES, ids=[c[0] for c in ADOPT_CASES])
+def test_adopt_commands(settings, text, expected):
+    full = {f: None for f in CHART_FIELDS}
+    full.update(expected)
+    _phase2(text, settings, A.ADOPT, **full)
+
+
+DEACTIVATE_CASES = [
+    ("desactiva HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("desactiva HYPE", dict(coin="HYPE")),                                # todas sus temporalidades
+    ("deactivate BTC 4h", dict(coin="BTC", interval="4h")),
+    ("disable ETH 15m", dict(coin="ETH", interval="15m")),
+    ("desactiva la gráfica de HYPE 1h", dict(coin="HYPE", interval="1h")),
+    ("desactiva HYPE 1d", dict(coin="HYPE", interval="1d")),
+    ("desactiva HYPE en todas las temporalidades", dict(coin="HYPE")),
+    ("quita HYPE 1h del playbook", dict(coin="HYPE", interval="1h")),
+    ("saca SOL del playbook", dict(coin="SOL")),
+    ("remove ETH 4h from playbook", dict(coin="ETH", interval="4h")),
+]
+
+
+@pytest.mark.parametrize("text,expected", DEACTIVATE_CASES, ids=[c[0] for c in DEACTIVATE_CASES])
+def test_deactivate_commands(settings, text, expected):
+    full = {f: None for f in CHART_FIELDS}
+    full.update(expected)
+    _phase2(text, settings, A.DEACTIVATE, **full)
+
+
+SIMPLE_PHASE2 = [
+    ("playbook", A.PLAYBOOK), ("ver playbook", A.PLAYBOOK), ("mi playbook", A.PLAYBOOK),
+    ("gráficas activas", A.PLAYBOOK), ("graficas en automatico", A.PLAYBOOK), ("estrategias activas", A.PLAYBOOK),
+    ("show playbook", A.PLAYBOOK), ("active strategies", A.PLAYBOOK), ("muestra las gráficas activas", A.PLAYBOOK),
+    ("informes", A.REPORTS), ("reports", A.REPORTS), ("últimos backtests", A.REPORTS), ("ultimos informes", A.REPORTS),
+    ("mis informes", A.REPORTS), ("backtests", A.REPORTS), ("latest reports", A.REPORTS), ("ver informes", A.REPORTS),
+    ("informes de backtest", A.REPORTS),
+    ("alertas", A.ALERT_LIST), ("alarmas", A.ALERT_LIST), ("alerts", A.ALERT_LIST), ("mis alertas", A.ALERT_LIST),
+    ("ver alarmas", A.ALERT_LIST), ("alertas activas", A.ALERT_LIST), ("¿qué alertas hay?", A.ALERT_LIST),
+    ("list alerts", A.ALERT_LIST), ("Alarmas", A.ALERT_LIST), ("avisos", A.ALERT_LIST),
+    ("sonido", A.UNMUTE), ("unmute", A.UNMUTE), ("activa avisos", A.UNMUTE), ("activa las alertas", A.UNMUTE),
+    ("reactiva los avisos", A.UNMUTE), ("enciende el sonido", A.UNMUTE), ("enable alerts", A.UNMUTE),
+    ("turn on notifications", A.UNMUTE), ("quita el silencio", A.UNMUTE), ("desilencia", A.UNMUTE),
+    ("sonido on", A.UNMUTE), ("activa las alarmas de nuevo", A.UNMUTE),
+]
+
+
+@pytest.mark.parametrize("text,action", SIMPLE_PHASE2, ids=[c[0] for c in SIMPLE_PHASE2])
+def test_phase2_simple_commands(settings, text, action):
+    cmd = _phase2(text, settings, action)
+    assert cmd.coin is None and cmd.alert is None and cmd.target_id is None and cmd.value is None
+
+
+def _spec(kind, interval=None, repeat=False, **params) -> dict:
+    return {"kind": kind, **params, "interval": interval, "repeat": repeat}
+
+
+ALERT_CASES = [
+    # ejemplos del contrato
+    ("alerta HYPE > 90", "HYPE", _spec("price_above", level=90.0)),
+    ("alerta BTC < 80000", "BTC", _spec("price_below", level=80000.0)),
+    ("alerta SOL cruza 150", "SOL", _spec("price_cross", level=150.0)),
+    ("alerta HYPE rsi < 30 1h", "HYPE", _spec("rsi_below", "1h", level=30.0)),
+    ("alerta ETH rsi > 70 4h", "ETH", _spec("rsi_above", "4h", level=70.0)),
+    ("alerta BTC cruce ema 20 50 1h", "BTC", _spec("ma_cross", "1h", fast=20, slow=50, ma="ema")),
+    ("alerta BTC cruce sma 50 200 1d alcista", "BTC",
+     _spec("ma_cross", "1d", fast=50, slow=200, ma="sma", direction="up")),
+    ("alerta BTC cruce sma 50 200 1d bajista", "BTC",
+     _spec("ma_cross", "1d", fast=50, slow=200, ma="sma", direction="down")),
+    ("alerta SOL zona", "SOL", _spec("zone")),
+    ("alerta SOL zona long", "SOL", _spec("zone", side="long")),
+    ("alerta BTC volumen 3x 15m", "BTC", _spec("volume_spike", "15m", mult=3.0)),
+    ("alerta HYPE mueve 3% 1h", "HYPE", _spec("move_pct", "1h", pct=3.0)),
+    # repetir
+    ("alerta HYPE > 90 siempre", "HYPE", _spec("price_above", repeat=True, level=90.0)),
+    ("alerta HYPE > 90 cada vez", "HYPE", _spec("price_above", repeat=True, level=90.0)),
+    ("alerta HYPE > 90 repeat", "HYPE", _spec("price_above", repeat=True, level=90.0)),
+    ("alert BTC above 100000 always", "BTC", _spec("price_above", repeat=True, level=100000.0)),
+    ("alerta HYPE rsi < 30 1h siempre", "HYPE", _spec("rsi_below", "1h", repeat=True, level=30.0)),
+    ("alerta HYPE > 90 una vez", "HYPE", _spec("price_above", level=90.0)),
+    # sinónimos y formas de decirlo
+    ("alarma HYPE > 90", "HYPE", _spec("price_above", level=90.0)),
+    ("ALARMA hype > 90 SIEMPRE", "HYPE", _spec("price_above", repeat=True, level=90.0)),
+    ("alerta HYPE>90", "HYPE", _spec("price_above", level=90.0)),
+    ("alerta HYPE >= 90", "HYPE", _spec("price_above", level=90.0)),
+    ("alerta HYPE <= 80", "HYPE", _spec("price_below", level=80.0)),
+    ("alerta HYPE por encima de 90", "HYPE", _spec("price_above", level=90.0)),
+    ("alerta HYPE por debajo de 80,5", "HYPE", _spec("price_below", level=80.5)),
+    ("alerta HYPE supera 95", "HYPE", _spec("price_above", level=95.0)),
+    ("alerta HYPE baja de 80", "HYPE", _spec("price_below", level=80.0)),
+    ("alerta HYPE más de 90", "HYPE", _spec("price_above", level=90.0)),
+    ("alerta HYPE 90", "HYPE", _spec("price_cross", level=90.0)),           # nivel sin sentido: cualquiera
+    ("alerta HYPE toca 90", "HYPE", _spec("price_cross", level=90.0)),
+    ("alerta SOL cruza 150 al alza", "SOL", _spec("price_above", level=150.0)),
+    ("alerta SOL cruza 150 a la baja", "SOL", _spec("price_below", level=150.0)),
+    ("avísame si BTC < 80000", "BTC", _spec("price_below", level=80000.0)),
+    ("avisame cuando ETH supere 4000", "ETH", _spec("price_above", level=4000.0)),
+    ("pon una alerta en HYPE > 90", "HYPE", _spec("price_above", level=90.0)),
+    ("nueva alarma SOL < 120", "SOL", _spec("price_below", level=120.0)),
+    ("alert me when ETH < 3000", "ETH", _spec("price_below", level=3000.0)),
+    # números a la española / inglesa (como el resto del parser)
+    ("alerta BTC < 80.000,5", "BTC", _spec("price_below", level=80000.5)),
+    ("alerta BTC < 1.000.000", "BTC", _spec("price_below", level=1_000_000.0)),
+    ("alerta BTC > 100,000.5", "BTC", _spec("price_above", level=100000.5)),
+    ("alerta $BTC > 100000$", "BTC", _spec("price_above", level=100000.0)),
+    # RSI con periodo
+    ("alerta HYPE rsi(14) < 30 1h", "HYPE", _spec("rsi_below", "1h", level=30.0, period=14)),
+    ("alerta HYPE rsi 7 > 80 15m", "HYPE", _spec("rsi_above", "15m", level=80.0, period=7)),
+    ("alerta HYPE rsi14 < 25", "HYPE", _spec("rsi_below", level=25.0, period=14)),
+    ("alerta ETH rsi < 30", "ETH", _spec("rsi_below", level=30.0)),          # temporalidad: la de la mesa de alarmas
+    ("alerta ETH rsi por encima de 70 en velas de 4h", "ETH", _spec("rsi_above", "4h", level=70.0)),
+    ("alerta ETH rsi < 30 en 1 hora", "ETH", _spec("rsi_below", "1h", level=30.0)),
+    # cruces de medias
+    ("alerta BTC cruce ema 50 20 4h", "BTC", _spec("ma_cross", "4h", fast=20, slow=50, ma="ema")),
+    ("alerta BTC ema20 cruza ema50 1h", "BTC", _spec("ma_cross", "1h", fast=20, slow=50, ma="ema")),
+    ("alerta BTC golden cross 1d", "BTC", _spec("ma_cross", "1d", fast=50, slow=200, ma="sma", direction="up")),
+    ("alerta BTC cruce de la muerte 1d", "BTC",
+     _spec("ma_cross", "1d", fast=50, slow=200, ma="sma", direction="down")),
+    ("alerta BTC cruce de medias 1h", "BTC", _spec("ma_cross", "1h")),
+    ("alerta BTC cruce ema 9 21 15m alcista siempre", "BTC",
+     _spec("ma_cross", "15m", repeat=True, fast=9, slow=21, ma="ema", direction="up")),
+    # zona
+    ("alerta SOL zona short", "SOL", _spec("zone", side="short")),
+    ("alerta SOL zona de liquidez long", "SOL", _spec("zone", side="long")),
+    ("alerta SOL zona de compra", "SOL", _spec("zone", side="long")),
+    ("alerta SOL zona de venta", "SOL", _spec("zone", side="short")),
+    ("alerta SOL toca zona short", "SOL", _spec("zone", side="short")),
+    # volumen
+    ("alerta BTC volumen 3 veces 15m", "BTC", _spec("volume_spike", "15m", mult=3.0)),
+    ("alerta BTC volumen x2.5 1h", "BTC", _spec("volume_spike", "1h", mult=2.5)),
+    ("alerta BTC volumen 1h", "BTC", _spec("volume_spike", "1h")),
+    ("alerta BTC pico de volumen > 4x 5m", "BTC", _spec("volume_spike", "5m", mult=4.0)),
+    # movimiento
+    ("alerta HYPE sube 5% 4h", "HYPE", _spec("move_pct", "4h", pct=5.0, direction="up")),
+    ("alerta HYPE cae 3% 1h", "HYPE", _spec("move_pct", "1h", pct=3.0, direction="down")),
+    ("alerta HYPE 3% 1h", "HYPE", _spec("move_pct", "1h", pct=3.0)),
+    ("alerta HYPE se mueve 3 por ciento en 1 hora", "HYPE", _spec("move_pct", "1h", pct=3.0)),
+    ("alerta HYPE mueve 2,5% 15m", "HYPE", _spec("move_pct", "15m", pct=2.5)),
+    # monedas raras
+    ("alert HYPE move 5% 1h", "HYPE", _spec("move_pct", "1h", pct=5.0)),
+    ("alerta W < 0.1", "W", _spec("price_below", level=0.1)),               # "W" suelto es moneda, no semana
+    ("alerta ME > 1.5", "ME", _spec("price_above", level=1.5)),             # ME es moneda...
+    ("alert me when ME > 1.5", "ME", _spec("price_above", level=1.5)),
+    ("alerta ID < 0.2", "ID", _spec("price_below", level=0.2)),
+    ("alerta xyz:GOLD > 3000", "xyz:GOLD", _spec("price_above", level=3000.0)),
+]
+
+
+@pytest.mark.parametrize("text,coin,spec", ALERT_CASES, ids=[c[0] for c in ALERT_CASES])
+def test_alert_add_commands(settings, text, coin, spec):
+    cmd = _phase2(text, settings, A.ALERT_ADD, coin=coin)
+    assert cmd.alert == spec, (text, cmd.alert)
+    assert cmd.interval is None and cmd.target_id is None                  # la temporalidad va en el spec
+
+
+@pytest.mark.parametrize("text,coin,spec", ALERT_CASES, ids=[c[0] for c in ALERT_CASES])
+def test_parsed_alerts_are_accepted_by_alert_manager(tmp_path, settings, clock, text, coin, spec):
+    from desk.alerts import AlertManager
+    mgr = AlertManager(settings, clock, tmp_path / "alerts")
+    cmd = parse_rules(text, settings)
+    rule = mgr.add(cmd.coin, cmd.alert, ref_px=100.0)                       # contrato: add(coin, Command.alert)
+    assert rule.kind == spec["kind"] and rule.repeat is spec["repeat"]
+    if spec["kind"] in commands.CANDLE_ALERT_KINDS:
+        assert rule.interval == (spec["interval"] or "1h")                  # sin temporalidad: la de las alarmas
+
+
+def test_alert_kinds_mirror_alert_manager():
+    from desk.alerts import CANDLE_KINDS, KINDS
+    assert set(commands.ALERT_KINDS) == set(KINDS)
+    assert commands.CANDLE_ALERT_KINDS == CANDLE_KINDS
+
+
+def test_alert_ranges_are_left_to_alert_manager(tmp_path, settings, clock):
+    # Como con los parámetros: el parser no adivina límites; AlertManager responde con un motivo claro.
+    from desk.alerts import AlertManager
+    mgr = AlertManager(settings, clock, tmp_path / "alerts")
+    for text, needle in (("alerta HYPE rsi > 150 1h", "RSI"), ("alerta BTC cruce ema 20 20 1h", "rápida")):
+        cmd = parse_rules(text, settings)
+        assert cmd is not None and cmd.action is A.ALERT_ADD, text
+        with pytest.raises(ValueError, match=needle):
+            mgr.add(cmd.coin, cmd.alert)
+
+
+ALERT_DEL_CASES = [
+    ("borra alerta 3", 3), ("elimina alarma 3", 3), ("borra la alerta #3", 3), ("borra alerta #12", 12),
+    ("delete alert 12", 12), ("remove alert 2", 2), ("cancela la alarma 5", 5), ("borrar alerta numero 4", 4),
+    ("quita la alerta 7", 7),
+    ("borra alertas", None), ("borra todas las alertas", None), ("elimina las alarmas", None),
+    ("delete all alerts", None), ("clear alerts", None), ("borra todas las alarmas activas", None),
+    ("cancela todas las alertas", None),
+]
+
+
+@pytest.mark.parametrize("text,target", ALERT_DEL_CASES, ids=[c[0] for c in ALERT_DEL_CASES])
+def test_alert_del_commands(settings, text, target):
+    _phase2(text, settings, A.ALERT_DEL, target_id=target, coin=None)
+
+
+MUTE_CASES = [
+    ("silencio 30m", 30.0), ("silencia 2h", 120.0), ("mute 15", 15.0), ("silencio", None), ("mute", None),
+    ("silencio 1 hora", 60.0), ("silencia los avisos 45 min", 45.0), ("silencio por 30 minutos", 30.0),
+    ("mute alerts for 2 hours", 120.0), ("silencia 1d", 1440.0), ("silencio 1.5h", 90.0), ("silencio media hora", 30.0),
+    ("mute 1 día", 1440.0), ("silencia todo 2h", 120.0), ("silencia las alarmas", None),
+    ("desactiva avisos", None), ("desactiva las alertas 1h", 60.0), ("apaga las notificaciones", None),
+    ("sin sonido", None), ("sonido off", None), ("turn off alerts", None), ("disable notifications 30 min", 30.0),
+]
+
+
+@pytest.mark.parametrize("text,minutes", MUTE_CASES, ids=[c[0] for c in MUTE_CASES])
+def test_mute_commands(settings, text, minutes):
+    _phase2(text, settings, A.MUTE, value=minutes)
+
+
+PHASE2_INVALID = [
+    # backtest / gráficas
+    "backtest", "backtest 1h", "backtest HYPE 7h", "backtest HYPE 60m", "backtest HYPE 1h 4h", "backtest HYPE 90",
+    "backtest HYPE BTC 1h", "backtest HYPE 1h macd", "backtest HYPE 1h 0d", "backtest HYPE 1h 90d 30d",
+    "backtest HYPE 1h breakout",                      # palabra de dos estrategias: ambigua
+    "backtest HYPE 1h ema_trend rsi_reversion", "backtest HYPE 1h 3%", "backtest HYPE 1h 0,5 dias",
+    "backtest HYPE 1h 1d 3d", "backtest HYPE long 1h", "backtest HYPE 1h ya", "prueba",
+    "activa HYPE", "adopt HYPE",                      # dinero en automático: hace falta la gráfica completa
+    "activa HYPE 1h 90d", "activa 1h", "activa HYPE BTC 1h", "usa la mejor", "activa HYPE 1h macd",
+    "desactiva", "desactiva todo", "desactiva HYPE 1h ema_trend", "desactiva HYPE 90d", "desactiva el bot",
+    "quita del playbook",
+    # alarmas
+    "alerta", "alerta HYPE", "alerta > 90", "alerta HYPE > 90 < 80", "alerta HYPE > 90 95", "alerta HYPE > 90 1h",
+    "alerta HYPE rsi 30", "alerta HYPE rsi cruza 30", "alerta HYPE rsi < 30 1h 4h", "alerta HYPE rsi < 30 7h",
+    "alerta HYPE rsi < 30 50 70", "alerta HYPE zona 3", "alerta HYPE zona 1h", "alerta HYPE zona long short",
+    "alerta HYPE long > 90", "alerta HYPE cruce ema 20 1h", "alerta HYPE cruce ema sma 20 50",
+    "alerta HYPE cruce ema 20 50 > 3", "alerta HYPE volumen 3 15m", "alerta HYPE volumen 3x 2x",
+    "alerta HYPE volumen baja 3x", "alerta HYPE mueve 3", "alerta HYPE mueve 3% 7h", "alerta HYPE mueve 3% 2%",
+    "alerta HYPE mueve 3% cruza", "alerta HYPE BTC > 90", "alerta HYPE > 0", "alerta HYPE > -5",
+    "alerta BTC < 80.000",                            # ¿80 mil u 80? ambiguo, como en las órdenes
+    "alerta BTC < 83,770", "alerta HYPE > 90 siempre una vez", "alerta HYPE rsi < 30 zona", "alerta HYPE 3x",
+    "alerta HYPE x3 > 90", "alerta HYPE > 90 ya", "alerta HYPE > 90 por favor ahora", "alerta HYPE precio",
+    "alertas HYPE", "alerta HYPE rsi > 70 30%",
+    "alerta MOVE > 0.5",                              # "move" es palabra reservada (como en "long MOVE")
+    # borrar alarmas
+    "borra alerta", "borra alerta 0", "borra alerta 3.5", "borra todas las alertas 3", "borra alertas de HYPE",
+    "borra alerta 3 4", "delete alert abc",
+    # silencio
+    "silencio 0", "silencio 30%", "silencio HYPE", "silencio 3 meses", "silencio 1h 30m", "mute 2x",
+    "desactiva alertas 30",                           # sin unidad tras "desactiva": ¿minutos? ¿la alarma 30?
+    "desactiva la alerta 3", "silencia la alerta 3", "sonido alto", "activa avisos HYPE", "unmute 30",
+]
+
+
+@pytest.mark.parametrize("text", PHASE2_INVALID)
+def test_phase2_invalid_or_ambiguous_returns_none(settings, text):
+    assert parse_rules(text, settings) is None, (text, parse_rules(text, settings))
+    assert parse(text, settings) is None
+
+
+@pytest.mark.parametrize("text,action,coin", [
+    # "activa ..." / "desactiva ...": avisos, modo automático y gráficas no se pisan
+    ("activa avisos", A.UNMUTE, None),
+    ("activa HYPE 1h", A.ADOPT, "HYPE"),
+    ("activa el modo automático", A.AUTO_ON, None),
+    ("activa auto", A.AUTO_ON, None),
+    ("activa el auto", A.AUTO_ON, None),
+    ("auto on", A.AUTO_ON, None),
+    ("desactiva auto", A.AUTO_OFF, None),
+    ("desactiva el modo automatico", A.AUTO_OFF, None),
+    ("desactiva avisos", A.MUTE, None),
+    ("desactiva HYPE", A.DEACTIVATE, "HYPE"),
+    ("enable auto", A.AUTO_ON, None),
+    ("enable alerts", A.UNMUTE, None),
+    ("reactiva", A.RESUME, None),
+    ("reactiva avisos", A.UNMUTE, None),
+    ("apaga todo", A.KILL, None),
+    ("apaga avisos", A.MUTE, None),
+    ("apaga el auto", A.AUTO_OFF, None),
+    # cerrar / cancelar siguen siendo de posiciones y órdenes
+    ("cierra HYPE", A.CLOSE, "HYPE"),
+    ("cierra todo", A.CLOSE_ALL, None),
+    ("cancela HYPE", A.CANCEL, "HYPE"),
+    ("cancel all", A.CANCEL, None),
+    ("cancela", A.REJECT, None),
+    ("cancela alerta 3", A.ALERT_DEL, None),
+    # informe (singular) = estado; informes = backtests
+    ("informe", A.STATUS, None),
+    ("report", A.STATUS, None),
+    ("informes", A.REPORTS, None),
+    ("borra parámetros", A.SET_PARAM, None),
+    ("borra alertas", A.ALERT_DEL, None),
+    ("quita el halt", A.RESET_HALT, None),
+    ("quita el silencio", A.UNMUTE, None),
+    ("set leverage to 5", A.SET_PARAM, None),
+    ("pon el apalancamiento a 3", A.SET_PARAM, None),
+    ("pon una alerta en BTC > 100000", A.ALERT_ADD, "BTC"),
+    ("pon un short en BTC", A.OPEN, "BTC"),
+])
+def test_phase2_does_not_steal_existing_commands(settings, text, action, coin):
+    cmd = parse_rules(text, settings)
+    assert cmd is not None and cmd.action is action, (text, cmd)
+    assert cmd.coin == coin
+
+
+@pytest.mark.parametrize("text", ["cierra alertas", "cierra playbook", "cancela backtest", "long alerta",
+                                  "close alerts", "cierra avisos", "backtest durante 1h", "activa nueva 1h",
+                                  "desactiva cuando", "backtest hazme", "alerta activas 3", "desactiva longs"])
+def test_phase2_nouns_are_never_coins(settings, text):
+    # Antes "cierra alertas" era CLOSE de la moneda ALERTAS.
+    assert parse_rules(text, settings) is None
+
+
+def test_phase2_command_roundtrips_through_dict(settings):
+    cmd = parse_rules("alerta BTC cruce sma 50 200 1d alcista siempre", settings)
+    back = Command.from_dict(json.loads(json.dumps(cmd.to_dict())))
+    assert back == cmd and back.alert["direction"] == "up"
+    cmd = parse_rules("backtest HYPE 1h 90d ema_trend", settings)
+    assert Command.from_dict(cmd.to_dict()) == cmd
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("backtest BTC 15m 90d", "backtest + optimización walk-forward de BTC 15m (90 días, todas las estrategias)"),
+    ("prueba HYPE 1h ema_trend",
+     "backtest + optimización walk-forward de HYPE 1h (historia por defecto, estrategia ema_trend)"),
+    ("backtest HYPE", "backtest + optimización walk-forward de HYPE (temporalidad por defecto) "
+                      "(historia por defecto, todas las estrategias)"),
+    ("activa HYPE 1h", "operar en automático HYPE 1h con la ganadora de su último backtest"),
+    ("activa HYPE 1h ema_trend", "operar en automático HYPE 1h con la estrategia ema_trend"),
+    ("desactiva HYPE 1h", "quitar HYPE 1h del playbook"),
+    ("desactiva HYPE", "quitar HYPE del playbook (todas sus temporalidades)"),
+    ("playbook", "ver el playbook (gráficas en automático)"),
+    ("informes", "ver los últimos informes de backtest"),
+    ("alerta HYPE > 90", "crear alarma: HYPE > 90, una vez"),
+    ("alerta BTC < 80000 siempre", "crear alarma: BTC < 80000, siempre"),
+    ("alerta SOL cruza 150", "crear alarma: SOL cruza 150, una vez"),
+    ("alerta HYPE rsi(14) < 30 1h", "crear alarma: HYPE RSI(14) < 30 en 1h, una vez"),
+    ("alerta BTC cruce sma 50 200 1d alcista", "crear alarma: BTC cruce al alza SMA 50/200 en 1d, una vez"),
+    ("alerta BTC cruce de medias 4h", "crear alarma: BTC cruce medias en 4h, una vez"),
+    ("alerta SOL zona long", "crear alarma: SOL entra en zona de liquidez LONG, una vez"),
+    ("alerta SOL zona", "crear alarma: SOL entra en zona de liquidez LONG o SHORT, una vez"),
+    ("alerta BTC volumen 3x 15m", "crear alarma: BTC pico de volumen 3x en 15m, una vez"),
+    ("alerta HYPE cae 3% 1h", "crear alarma: HYPE se mueve 3% a la baja en 1h, una vez"),
+    ("alertas", "ver las alarmas"),
+    ("borra alerta 3", "borrar la alarma #3"),
+    ("borra alertas", "borrar todas las alarmas"),
+    ("silencio 30m", "silenciar los avisos no críticos 30 min"),
+    ("silencia 2h", "silenciar los avisos no críticos 2 h"),
+    ("silencio 1d", "silenciar los avisos no críticos 1 d"),
+    ("silencio 90", "silenciar los avisos no críticos 90 min"),
+    ("silencio", "silenciar los avisos no críticos hasta 'sonido'"),
+    ("sonido", "reactivar los avisos"),
+])
+def test_describe_phase2(settings, text, expected):
+    assert describe(parse_rules(text, settings)) == expected
+
+
+def test_help_text_lists_phase2_examples(settings):
+    examples = ("backtest HYPE 1h", "backtest BTC 15m 90d", "optimiza ETH 1h 3 meses", "prueba HYPE 1h ema_trend",
+                "informes", "ultimos backtests", "activa HYPE 1h", "usa la mejor HYPE 1h", "activa HYPE 1h ema_trend",
+                "desactiva HYPE 1h", "desactiva HYPE", "playbook", "alerta HYPE > 90", "alerta BTC < 80000",
+                "alerta SOL cruza 150", "alerta HYPE rsi < 30 1h", "alerta BTC cruce ema 20 50 1h alcista",
+                "alerta SOL zona long", "alerta BTC volumen 3x 15m", "alerta HYPE mueve 3% 1h", "alertas",
+                "borra alerta 3", "borra alertas", "silencio 30m", "silencio", "sonido")
+    for text in examples:
+        assert text in HELP_TEXT, text
+        assert parse_rules(text, settings) is not None, text
+    assert "FUERA de muestra" in HELP_TEXT                  # un backtest no garantiza nada
+    for interval in commands.INTERVALS:
+        assert interval in HELP_TEXT
+
+
+# --- fase 2 por IA ----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("payload,expected", [
+    (llm_json(action="backtest", coin="hype", interval="1h", days=90, strategy="EMA trend"),
+     dict(action=A.BACKTEST, coin="HYPE", interval="1h", days=90.0, strategy="ema_trend")),
+    (llm_json(action="backtest", coin="BTC"), dict(action=A.BACKTEST, coin="BTC", interval=None, days=None)),
+    (llm_json(action="backtest", coin="SOL", strategy="donchian"), dict(strategy="donchian_breakout")),
+    (llm_json(action="adopt", coin="hype", interval="4h"), dict(action=A.ADOPT, coin="HYPE", interval="4h")),
+    (llm_json(action="adopt", coin="hype", interval="4h", strategy="rsi_reversion", days=30),
+     dict(action=A.ADOPT, strategy="rsi_reversion", days=None)),            # días: no aplica, se ignora
+    (llm_json(action="deactivate", coin="sol"), dict(action=A.DEACTIVATE, coin="SOL", interval=None)),
+    (llm_json(action="deactivate", coin="sol", interval="15m", strategy="ema_trend"),
+     dict(action=A.DEACTIVATE, interval="15m", strategy=None)),
+    (llm_json(action="playbook"), dict(action=A.PLAYBOOK)),
+    (llm_json(action="reports"), dict(action=A.REPORTS)),
+    (llm_json(action="alert_list"), dict(action=A.ALERT_LIST)),
+    (llm_json(action="unmute"), dict(action=A.UNMUTE)),
+    (llm_json(action="alert_add", coin="hype", alert="rsi < 30", interval="1h"),
+     dict(action=A.ALERT_ADD, coin="HYPE", alert=_spec("rsi_below", "1h", level=30.0))),
+    (llm_json(action="alert_add", coin="BTC", alert="< 80000 siempre", interval="1h"),
+     dict(alert=_spec("price_below", repeat=True, level=80000.0))),        # precio: la temporalidad no aplica
+    (llm_json(action="alert_add", coin="HYPE", alert="HYPE > 90"), dict(alert=_spec("price_above", level=90.0))),
+    (llm_json(action="alert_add", coin="SOL", alert="alerta SOL zona long"),
+     dict(coin="SOL", alert=_spec("zone", side="long"))),
+    (llm_json(action="alert_add", coin="BTC", alert="cruce sma 50 200 alcista", interval="1d"),
+     dict(alert=_spec("ma_cross", "1d", fast=50, slow=200, ma="sma", direction="up"))),
+    (llm_json(action="alert_add", coin="BTC", alert="volumen 3x 15m", interval="15m"),
+     dict(alert=_spec("volume_spike", "15m", mult=3.0))),
+    (llm_json(action="alert_del", value=3), dict(action=A.ALERT_DEL, target_id=3, value=None)),
+    (llm_json(action="alert_del"), dict(action=A.ALERT_DEL, target_id=None)),
+    (llm_json(action="mute", value=30), dict(action=A.MUTE, value=30.0)),
+    (llm_json(action="mute"), dict(action=A.MUTE, value=None)),
+])
+def test_llm_phase2_valid(llm_settings, payload, expected):
+    llm, _ = make_llm(llm_settings, fake_response(payload))
+    cmd = llm.interpret("lo que sea")
+    assert cmd is not None and cmd.source == "llm", payload
+    _assert_fields(cmd, expected)
+
+
+@pytest.mark.parametrize("payload", [
+    llm_json(action="backtest"),                                         # sin moneda
+    llm_json(action="backtest", coin="HYPE", interval="7h"),
+    llm_json(action="backtest", coin="HYPE", interval=5),
+    llm_json(action="backtest", coin="HYPE", strategy="macd"),           # estrategia desconocida
+    llm_json(action="backtest", coin="HYPE", strategy=3),
+    llm_json(action="backtest", coin="HYPE", days=0.5),
+    llm_json(action="backtest", coin="HYPE", days=-30),
+    llm_json(action="backtest", coin="HYPE", days="90"),
+    llm_json(action="adopt", coin="HYPE"),                               # sin temporalidad
+    llm_json(action="adopt", coin="HYPE", interval="1h", strategy="la buena"),
+    llm_json(action="deactivate"),
+    llm_json(action="alert_add", coin="HYPE"),                           # sin condición
+    llm_json(action="alert_add", coin="HYPE", alert="lo que sea"),
+    llm_json(action="alert_add", coin="HYPE", alert="BTC > 90"),         # otra moneda
+    llm_json(action="alert_add", alert="HYPE > 90"),                     # sin moneda en el campo
+    llm_json(action="alert_add", coin="HYPE", alert=123),
+    llm_json(action="alert_add", coin="HYPE", alert="rsi < 30 4h", interval="1h"),   # temporalidades distintas
+    llm_json(action="alert_add", coin="HYPE", alert="> 90.000"),         # ambiguo
+    llm_json(action="alert_del", value=2.5),
+    llm_json(action="alert_del", value=-1),
+    llm_json(action="mute", value=-5),
+    llm_json(action="mute", value=0),
+])
+def test_llm_phase2_invalid(llm_settings, payload):
+    llm, _ = make_llm(llm_settings, fake_response(payload))
+    assert llm.interpret("algo raro para la mesa") is None, payload
+
+
+def test_llm_prompt_documents_phase2_actions():
+    for action in ("backtest", "adopt", "deactivate", "playbook", "reports", "alert_add", "alert_list", "alert_del",
+                   "mute", "unmute"):
+        assert f"- {action}" in SYSTEM_PROMPT or f" {action}:" in SYSTEM_PROMPT, action
+        assert action in LLM_ACTIONS
+    for name in commands.KNOWN_STRATEGIES + commands.INTERVALS:
+        assert name in SYSTEM_PROMPT
+
+
+def test_parser_falls_back_to_llm_for_unparsed_phase2_text(llm_settings):
+    llm_cmd = Command(A.ALERT_ADD, raw="x", source="llm", coin="HYPE", alert=_spec("price_above", level=90.0))
+    fake = FakeInterpreter(llm_cmd)
+    assert parse("alerta HYPE > 90", llm_settings, fake).source == "regex" and fake.calls == []
+    assert parse("avísame cuando hype pase de los noventa", llm_settings, fake) is llm_cmd

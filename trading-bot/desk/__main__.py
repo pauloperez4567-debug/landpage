@@ -455,7 +455,7 @@ def cmd_console(args: argparse.Namespace) -> int:
     state_dir = _base_state_dir(args)
     state_dir.mkdir(parents=True, exist_ok=True)
     problems, _ = health_check(state_dir, RealClock().now())
-    return run_console(state_dir, timeout=args.timeout, warnings=[f"la mesa {p}" for p in problems])
+    return run_console(state_dir, timeout=args.timeout, warnings=[f"salud de la mesa: {p}" for p in problems])
 
 
 # --------------------------------------------------------------------------- main

@@ -292,6 +292,28 @@ Campos nuevos ya añadidos en `desk/models.py` (`CommandAction.BACKTEST/ADOPT/DE
 ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/alert/target_id`) y en
 `desk/config.py` (`bt_*`, `auto_default_strategies`, `alert_*`, `daily_loss_warn_frac`, `telegram_*`, `webhook_url`).
 
+## `desk/commands.py` (comandos de la fase 2)
+- Gráfica = moneda + temporalidad de `exchange.intervals` (`15m`, `15 min`, `1 hora` -> `15m`/`1h`). Historia:
+  `90d`, `90 días`, `2 semanas`, `3 meses` (=90), `1 año` (=365). `1d`/`3d` son temporalidad salvo que ya haya otra
+  (`backtest BTC 1h 3d` = 3 días). Estrategias: `strategy_names()` = `strategy.STRATEGIES` ∪ `KNOWN_STRATEGIES`;
+  vale el nombre con espacios/guiones o una palabra que sólo sea suya (`donchian`).
+- `BACKTEST` (`backtest|optimiza|prueba COIN [tf] [días] [estrategia]`; `interval`/`days`/`strategy` None = por
+  defecto/todas). `ADOPT` (`activa|usa la mejor|adopt COIN tf [estrategia]`) exige temporalidad: dinero en automático
+  sin la gráfica completa es ambiguo -> None. `DEACTIVATE` (`desactiva COIN [tf]`, `quita COIN del playbook`).
+  `PLAYBOOK`, `REPORTS` (`informes`; `informe`/`report` en singular siguen siendo STATUS), `ALERT_LIST`.
+- `ALERT_ADD`: `alerta|alarma COIN <condición> [tf] [siempre|cada vez]` -> `Command.coin` + `Command.alert` =
+  `{"kind", <parámetros dados>, "interval", "repeat"}`; los no dados se omiten (defectos y rangos los pone
+  `AlertManager.add`, con mensaje claro). `interval` sólo en alarmas de velas (en precio/zona con temporalidad -> None).
+  Números como en las órdenes (`80.000` ambiguo -> None). `ALERT_DEL` (`borra alerta 3` -> `target_id=3`; `borra
+  alertas` -> None = todas). `MUTE` (`silencio 30m` -> `value=30` minutos; sin duración None), `UNMUTE` (`sonido`).
+- "activa/desactiva avisos|alertas" = UNMUTE/MUTE; "activa/desactiva (el modo) auto" = AUTO_ON/OFF; "cancela alerta 3"
+  = ALERT_DEL, "cancela HYPE" = CANCEL. Las palabras de la fase 2 nunca se toman por moneda ("cierra alertas" -> None).
+- Utilidades: `parse_interval(text)`, `strategy_key(name)`, `describe_alert(coin, spec)`, `ALERT_KINDS` (= claves de
+  `alerts.KINDS`), `CANDLE_ALERT_KINDS`, `INTERVALS`.
+- IA: el esquema añade `interval` (enum), `strategy`, `days` y `alert` (texto con la sintaxis de las reglas, validado
+  por el mismo parser); `value` = minutos en `mute` y número de alarma en `alert_del`. Como mucho 16 campos con unión
+  (límite de la API para esquemas estrictos).
+
 ## `desk/strategy.py` (refactor: una sola lógica para vivo y backtest)
 - Cada estrategia declara `PARAM_GRID: dict[str, list]` (valores a probar) y sus parámetros como atributos.
   `Strategy(settings, clock=None, *, interval=None, **params)` permite fijar temporalidad y parámetros
@@ -376,6 +398,50 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `reasons` explica cada rechazo. Ranking por `bt_objective` fuera de muestra. `winner` = mejor aprobada o None.
 - `ReportStore(state_dir)`: `save(report, result=None) -> path` en `state/reports/<COIN>_<interval>_<id>.json`,
   `latest(coin, interval)`, `list(limit)`, `get(id)`.
+- Implementado (detalles y extensiones compatibles):
+  - Tramos: `walk_forward_splits(n, folds) -> [(train_end, test_start, test_end)]`: `folds + 1` bloques iguales, el
+    tramo k entrena con los bloques `0..k-1` y valida en el `k` (el último bloque se queda el resto). Bloques de al
+    menos 50 velas (`MIN_SEGMENT_BARS`): con menos historia se usan menos tramos (nota); sin ninguno, cada estrategia
+    sale rechazada con "historia insuficiente". `bt_folds < 1` -> 1 tramo (nota).
+  - Combinaciones: `param_combos(cls, settings, max_combos, seed)`: todo el `PARAM_GRID` si cabe; si no, muestra
+    determinista (`random.Random(f"{seed}:{nombre}")`, estable entre procesos). La configuración por defecto va siempre
+    la primera (`tp_r=None` -> `default_tp_r` actual) y gana los empates. Combinaciones inválidas descartadas.
+  - Elección al entrenar: mejor `bt_objective` entre las combinaciones con operaciones suficientes (máx(3, la mitad
+    de las que `bt_min_trades` exigiría a ese ritmo)); desempate por más operaciones y por orden.
+  - Sin fuga: señales una vez por combinación sobre toda la historia (causales) y una simulación por tramo con sólo
+    sus velas; en cada validación las señales de la elegida se recalculan con las velas hasta el final del tramo y se
+    comparan con las del entrenamiento: si difieren, la estrategia mira el futuro y se invalida (`error`).
+  - Fuera de muestra: tramos de validación encadenados (cada uno empieza con el capital final del anterior);
+    `oos_metrics` = `compute_metrics` de esa curva + `n_signals`, `n_skipped`, `t_stat` (t de Student del R medio
+    por operación, `edge_t_stat`) y `t_min` (`required_t_stat(n, m)`: cuantil `1 - 0.05/m`, m = estrategias del
+    informe, Bonferroni). **Filtro extra de aprobación: `t_stat >= t_min`** ("ventaja no significativa ... puede ser
+    suerte"). Motivo: sobre paseos aleatorios de 3000 velas, sólo con los cuatro filtros 17 de 24 gráficas tenían
+    "ganadora"; con la significación, 0 de 40 (las tendencias reales siguen aprobando). `approval_reasons(oos, settings)`.
+  - `StrategyEvaluation` añade `combos`, `error` (evaluación fallida: error, fuga, sin historia), la propiedad
+    `folds_positive` y `oos_result: BacktestResult` (la curva fuera de muestra encadenada; sólo en memoria, no va en
+    `to_dict`). `oos_trades = list[BTTrade]` (en JSON, lista de dicts); `folds = list[FoldResult]` con `fold,
+    train_start_ts, train_end_ts, test_start_ts, test_end_ts` (s UNIX; fin = cierre de la última vela), `train_bars,
+    test_bars, params, is_metrics, oos_metrics, combos, min_train_trades`. `is_metrics` = los parámetros propuestos
+    en el último entrenamiento. `score` = objetivo fuera de muestra (None si falló).
+  - `OptimizationReport.winner` = nombre (str) de la ganadora o None; `winner_evaluation`, `get(nombre)`, `best()`
+    (ganadora o primera evaluable) y `result(strategy=None)` (su `oos_result`). Extras: `objective`, `folds` (int),
+    `seed`, `criteria` (umbrales usados, `alpha`, `compared`), `start_ts`, `end_ts`, `oos_start_ts`, `complete`.
+    `evaluations` ordenadas: aprobadas primero, luego por `score`; fallidas al final. `from_dict` acepta el formato
+    de `ReportStore` (`{"report", "result"}`) y datos raros.
+  - `optimize(..., clock=None, zones=None)`: `created_ts` del `clock` (sin él, el real); `zones` = zonas por vela (sin
+    ellas, `historical_zones` una vez; si fallan, nota y las de liquidez sin señales). `strategies` admite nombres o
+    clases `Strategy` (nombre desconocido -> `ValueError`). `progress(hechas, total, texto)` cada >= 5 % (y al 100 %);
+    si lanza se registra una vez y deja de llamarse. `should_stop()` se consulta entre combinaciones: True -> informe
+    con lo terminado y `complete=False`. Velas desordenadas/repetidas se limpian (nota). Una estrategia que falla
+    sale rechazada con el motivo; `ValueError` sólo por entradas inválidas (columnas, índice, intervalo, nombres).
+    `id` = 8 hex (blake2b de gráfica, hora, velas, semilla y estrategias).
+  - `summary_text(max_rows=10)`: tabla <= 80 columnas (dentro: retorno, PF | fuera: retorno, PF, DD, ops, t,
+    objetivo, ✔/✘), ganadora con parámetros y "activa <COIN> <tf>", motivos de rechazo, notas y `DISCLAIMER`.
+  - `ReportStore(state_dir, *, keep=200)`: fichero = `{"report": to_dict(), "result": BacktestResult.to_dict() | None}`
+    (por defecto `result` = `report.result()`), escritura atómica (`Journal.save_json`); moneda/intervalo saneados
+    en el nombre (`xyz:GOLD` -> `xyz-GOLD`); al guardar se borran los más antiguos por encima de `keep`. Extras:
+    `get_result(id) -> BacktestResult | None`, `path_for(report)`. Ficheros ilegibles se ignoran (log).
+  - Rendimiento medido: 5 estrategias x 60 combinaciones x 4 tramos sobre 3000 velas de 1h = ~7.5 s en un proceso.
 
 ## `desk/playbook.py`
 - `PlaybookEntry(coin, interval, strategy, params, units, adopted_ts, report_id, oos_metrics, enabled=True)`.
@@ -383,12 +449,41 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `remove(coin, interval=None) -> int`, `entries()`, `strategies(settings, clock) -> list[(PlaybookEntry, Strategy)]`.
 - La operativa automática usa las entradas del playbook (más las estrategias por defecto sobre `symbols` si
   `auto_default_strategies`). Cada entrada opera con su temporalidad y sus parámetros.
+- Implementado (detalles y extensiones compatibles):
+  - `playbook.json` = `{"version": 1, "entries": [PlaybookEntry.to_dict(), ...]}` (al leer acepta también una lista o
+    `{clave: entrada}`); escrito con `Journal.save_json`. Ilegible -> se aparta (`*.corrupt-<ts>`) y se empieza vacío;
+    entradas sin moneda/temporalidad/estrategia se ignoran (log).
+  - `Playbook(state_dir, clock=None)`; `adopt(entry, settings=None) -> PlaybookEntry | None` (la sustituida) valida con
+    `validate_entry` (moneda, intervalo, estrategia de `STRATEGIES`, parámetros con `create_strategy`, `units` None o
+    > 0) -> `ValueError` con el motivo; si no se puede guardar, `OSError` y nada cambia. Gráfica = (moneda sin
+    distinguir mayúsculas, temporalidad) (`PlaybookEntry.key`). `units=None` = `settings.auto_units`.
+  - Extras: `get(coin, interval)`, `set_enabled(coin, interval, enabled) -> bool` (pausar sin olvidar), `reload()`,
+    `summary_text()`, `PlaybookEntry.describe()`/`copy()`; `entries()` devuelve copias.
+  - `strategies(settings, clock)`: sólo entradas activas; nunca lanza (una entrada que ya no se puede instanciar se
+    salta con aviso en el log); reutiliza la instancia mientras la entrada no cambie (conserva "una señal por vela").
+  - `entry_from_report(report, strategy=None, *, units=None, clock=None, allow_rejected=False) -> PlaybookEntry`:
+    la ganadora o `strategy`; `ValueError` (texto para el usuario) si no hay ganadora, no se evaluó, la evaluación
+    falló (siempre) o no aprobó fuera de muestra (salvo `allow_rejected=True`). `adopted_ts` del `clock`.
 
 ## `desk/report_render.py`
 - `render_html(report, result, bars) -> str`: HTML autocontenido (SVG en línea, sin dependencias): precio con
   entradas/salidas, curva de capital, drawdown y tabla de estrategias (dentro vs fuera de muestra). Claro y oscuro.
 - `render_png(report, result, bars) -> bytes | None` (matplotlib si está instalado, backend Agg).
 - `sparkline(values, width=40) -> str` (bloques unicode) para consola y Telegram.
+- Implementado (detalles y extensiones compatibles):
+  - `result` = la curva que se enseña, normalmente la fuera de muestra encadenada (`report.result()` o
+    `ReportStore.get_result(id)`); sin `result` se usa la de `report.best()` si está en memoria. Cualquier argumento
+    puede ser None: se pinta lo que se pueda; nunca lanza por datos raros.
+  - HTML: aviso de honestidad arriba y abajo, tarjetas fuera de muestra, precio (cierre + banda máx/mín, resumido a
+    <= 900 puntos) con entradas ▲/▼ y salidas ●/◆ (ganancia/pérdida: forma y color) y los tramos de validación
+    sombreados (T1..Tn), capital y drawdown fuera de muestra, tabla de estrategias (motivos en subfila), tramos con
+    sus parámetros y últimas 60 operaciones. Tokens de color con `prefers-color-scheme` y `data-theme`; móvil sin
+    scroll horizontal (las tablas anchas se desplazan dentro de su tarjeta). Lectura al pasar el ratón/teclado (cruz
+    + texto) con un script en línea opcional; `<title>` por operación. Sin recursos externos; todo texto escapado.
+  - `render_png(..., dpi=110)`: 3 paneles con `matplotlib.figure.Figure` + `FigureCanvasAgg` (sin pyplot ni estado
+    global), fechas en español; None si matplotlib falta o algo falla.
+  - `sparkline`: resume (muestreo uniforme con primero y último) a `width` puntos, ignora no numéricos/no finitos;
+    "" con < 2 valores; serie plana = bloques medios. Misma escala que la de `tui` (el panel usa ésta).
 
 ## `desk/alerts.py`
 - `AlertRule(id, coin, kind, params, interval, repeat, cooldown_s, created_ts, last_fired_ts, fired_count, note)`.
@@ -454,3 +549,30 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `alerts.jsonl` y los avisos `desk` de `outbox.log`).
 - `status.json` (lo escribe la mesa) se amplía con: posiciones, órdenes, playbook, contadores de alarmas, últimas
   señales y consumo de límites de riesgo en %.
+- Implementado (detalles y extensiones compatibles):
+  - `desk/remote.py` (cliente compartido por `send` y la consola, sin lógica duplicada): `send_command(state_dir, text,
+    *, prefix="cli", cmd_id=None) -> SentCommand` (`[<prefix>-xxxxxxxx] texto` con `append_inbox_line`; el outbox se lee
+    desde su tamaño *antes* de enviar), `wait_reply(sent, timeout, clock, *, settle_s=0.5, poll_s=0.25, should_stop=None)
+    -> list[str]` (con el `Clock` inyectado), `no_reply_message(...)`, `validate_command_text`. `__main__` los reexporta.
+  - Panel: `SnapshotReader(state_dir, clock).read() -> Snapshot` (`load_snapshot` = lectura suelta) y funciones puras
+    `build_layout(snap)`, `build_header/positions/orders/playbook/backtest/alerts/signals/trades/notices(snap)`; un panel
+    que falla se pinta como error y los demás siguen. `run_dashboard(state_dir, *, clock=None, console=None,
+    refresh_s=1.0, once=False, max_frames=None, screen=True) -> int`; CLI `dashboard [--once] [--refresh S]`.
+    `status.json` hoy (`line`/`report` en texto) se interpreta entero; los campos ampliados mandan si están:
+    `mode, data, network, equity, available, day_pnl, day_pnl_pct, auto, paused, cooldown, halt, symbols`,
+    `risk{daily_loss_pct, daily_loss_limit_pct, daily_loss_used_pct, drawdown_pct, max_drawdown_pct, drawdown_used_pct}`,
+    `positions[{coin, side|size con signo, size, entry_px, mark_px, unrealized_pnl, pnl_pct, leverage, sl, tp, origin}]`,
+    `orders[{coin, is_buy|side, kind, size, trigger_px|price, reduce_only, tag}]`, `pending[{coin, side, planned_size,
+    entry_px, sl, tp, expires_ts, origin}]`, `playbook` (como `playbook.json`), `alerts` (`AlertManager.stats()`),
+    `signals[{ts, coin, side, strategy, reason}]` (ver `normalize_status`). `risk.json` manda en halt/pausa/cooldown (se
+    guarda al cambiar). JSON a medio escribir -> última lectura buena + aviso; de los diarios sólo líneas completas.
+    Informe = el más reciente legible de `reports/*.json` (`OptimizationReport.to_dict()` solo o en `{"report",
+    "result"}`); sólo métricas fuera de muestra. La línea de estado periódica (`is_status_line`) no sale en avisos.
+  - Consola: `DeskConsole(state_dir, *, clock, console, timeout, input_fn, use_readline, follow, poll_s, warnings)`,
+    `run_console(state_dir, *, timeout, warnings, clock, console)`; ids `[con-xxxxxxxx]`; `completions(prior, text,
+    coins, intervals)` (verbos ES/EN, monedas de `status.json` y del playbook, temporalidades de `INTERVAL_SECONDS`);
+    `Follower(state_dir, clock, *, from_start=False).poll() -> list[Notice]` (sólo lo nuevo; rotación/truncado ->
+    desde el principio; alarmas `muted` no se imprimen; el mismo texto por los dos ficheros sale una vez; respuestas
+    tardías de comandos que se dejaron de esperar). Ctrl+C mientras espera deja de esperar (el comando sigue en el
+    inbox). `salir`/`exit`/`quit`/Ctrl+D cierran sólo la consola. CLI `console [--timeout S]` (avisa con
+    `health_check` si la mesa parece parada).

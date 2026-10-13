@@ -20,8 +20,10 @@ otro terminal, en tmux o en Docker (con el estado montado), y con varias consola
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Union
 
@@ -35,7 +37,7 @@ from .journal import INBOX_FILE, OUTBOX_FILE, read_outbox
 from .notify import normalize_level
 from .remote import DEFAULT_TIMEOUT_S, SentCommand, no_reply_message, send_command, wait_reply
 from .tui import (ALERTS_LOG, LEVEL_LABELS, LEVEL_STYLES, PLAYBOOK_FILE, STATUS_FILE, TEXT_STYLES, desk_notices,
-                  normalize_playbook, normalize_status, notice_level, parse_jsonl, read_json)
+                  is_status_line, normalize_playbook, normalize_status, notice_level, parse_jsonl, read_json)
 
 log = logging.getLogger(__name__)
 
@@ -44,10 +46,12 @@ HISTORY_LENGTH = 2000
 PROMPT = "mesa> "
 CMD_PREFIX = "con"                  # ids de la consola: [con-xxxxxxxx] (los de send son [cli-...])
 FOLLOW_POLL_S = 0.5
-DEDUPE_S = 120.0                    # el mismo texto por alerts.jsonl y outbox.log en este margen sale una vez
+DEDUPE_S = 120.0                    # el mismo texto por alerts.jsonl y por outbox.log en este margen: una vez
 LATE_MAX_S = 24 * 3600.0            # respuestas tardías que se siguen esperando como mucho
 LATE_KEPT = 50
 MAX_READ = 4 * 1024 * 1024          # lo nuevo de un diario que se lee de una vez (si hay más, sólo lo último)
+FP_BYTES = 64                       # huella: últimos bytes ya leídos (detecta un fichero truncado y vuelto a crecer)
+START_SCAN = 64 * 1024              # al abrir, trozo final donde se busca el último salto de línea
 EXIT_WORDS = frozenset({"salir", "exit", "quit"})
 INTERVALS: tuple[str, ...] = tuple(INTERVAL_SECONDS)
 
@@ -55,12 +59,12 @@ INTERVALS: tuple[str, ...] = tuple(INTERVAL_SECONDS)
 OPEN_VERBS = ("long", "short", "compra", "vende", "buy", "sell")
 VERBS: tuple[str, ...] = OPEN_VERBS + (
     "cierra", "close", "flat", "cancela", "cancel", "stop", "sl", "tp",
-    "estado", "status", "posiciones", "positions", "pausa", "pause", "reanuda", "resume", "auto", "kill", "panico",
-    "reset", "si", "no", "confirmar", "confirm", "ayuda", "help",
-    "apalancamiento", "leverage", "riesgo", "risk", "unidad", "unit",
+    "estado", "status", "posiciones", "positions", "pausa", "pause", "reanuda", "resume", "auto", "automatico",
+    "kill", "panico", "apaga", "reset", "restablece", "si", "no", "confirmar", "confirm", "yes", "cancelar", "reject",
+    "ayuda", "help", "apalancamiento", "leverage", "riesgo", "risk", "unidad", "unit",
     "backtest", "adopta", "adopt", "desactiva", "deactivate", "playbook", "informes", "reports",
     "alerta", "alert", "alarmas", "alerts", "borra", "delete", "silencia", "mute", "unmute",
-    "salir", "exit",
+    "salir", "exit", "quit",
 )
 # Verbos que piden moneda; de ellos, los que después piden temporalidad (gráfica = moneda + temporalidad).
 COIN_VERBS = frozenset(OPEN_VERBS + ("cierra", "close", "cancela", "cancel", "stop", "sl", "tp", "backtest", "adopta",
@@ -68,7 +72,8 @@ COIN_VERBS = frozenset(OPEN_VERBS + ("cierra", "close", "cancela", "cancel", "st
 INTERVAL_VERBS = frozenset({"backtest", "adopta", "adopt", "desactiva", "deactivate", "alerta", "alert"})
 OPEN_MODIFIERS = ("zona", "mercado", "ya", "limit", "sl", "tp", "zone", "market")
 FOLLOW_WORDS: dict[str, tuple[str, ...]] = {
-    "auto": ("on", "off"), "reset": ("halt", "params"), "cierra": ("todo",), "close": ("all",),
+    "auto": ("on", "off"), "automatico": ("on", "off"), "reset": ("halt", "params"), "restablece": ("parametros",),
+    "apaga": ("todo",), "cierra": ("todo",), "close": ("all",),
     "cancela": ("todo",), "cancel": ("all",), "borra": ("alarma", "alarmas"), "delete": ("alert", "alerts"),
 }
 
@@ -142,7 +147,7 @@ def format_reply(lines: Iterable[str]) -> Text:
 # --- seguimiento de alarmas y avisos ---------------------------------------------------------------------------
 @dataclass
 class Notice:
-    source: str                     # "alarma" | "mesa" | "respuesta" (tardía, a un comando de esta consola)
+    source: str                     # "alarma" | "mesa" | "estado" (línea periódica) | "respuesta" (tardía)
     level: str
     text: str
     time: str = ""
@@ -150,7 +155,22 @@ class Notice:
     cmd_id: str = ""
 
 
+def _notice_time(rec: dict[str, Any]) -> str:
+    """``YYYY-MM-DD HH:MM:SS`` del aviso: su campo ``time`` o, si no lo trae, su ``ts``."""
+    t = rec.get("time")
+    if isinstance(t, str) and t:
+        return t
+    try:
+        return datetime.fromtimestamp(float(rec.get("ts")), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+BADGE_STYLES = {"info": "bold black on cyan", "warn": "bold black on yellow", "critical": "bold white on red"}
+
+
 def format_notice(n: Notice) -> Text:
+    """``HH:MM:SS  ALARMA  AVISO texto``: la etiqueta dice de dónde viene (alarma / mesa) y su color, el nivel."""
     stamp = n.time[11:19] if len(n.time) >= 19 else n.time
     t = Text()
     if stamp:
@@ -159,11 +179,11 @@ def format_notice(n: Notice) -> Text:
         t.append(f"Respuesta tardía [{n.cmd_id}]:\n", style="bold")
         t.append_text(format_reply(n.text.splitlines()))
         return t
+    if n.source == "estado":                     # la línea de estado periódica: discreta
+        t.append(n.text, style="dim")
+        return t
     lv = normalize_level(n.level)
-    if n.source == "alarma":
-        t.append(" ALARMA ", style="bold black on yellow" if lv != "critical" else LEVEL_STYLES["critical"])
-    else:
-        t.append(" MESA ", style="bold black on cyan" if lv == "info" else LEVEL_STYLES[lv])
+    t.append(" ALARMA " if n.source == "alarma" else " MESA ", style=BADGE_STYLES[lv])
     if lv != "info":
         t.append(f" {LEVEL_LABELS[lv]}", style=LEVEL_STYLES[lv])
     t.append(" ")
@@ -171,29 +191,49 @@ def format_notice(n: Notice) -> Text:
     return color_amounts(t)
 
 
+@dataclass
+class _Cursor:
+    """Hasta dónde se ha leído un diario: inodo, offset (tras la última línea completa) y huella (``FP_BYTES``
+    anteriores al offset: si ya no coinciden, el fichero se reescribió y se vuelve a leer desde el principio)."""
+
+    ino: Optional[int] = None
+    off: int = 0
+    fp: bytes = b""
+
+
 class Follower:
     """Lo nuevo de ``alerts.jsonl`` y de los avisos ``desk`` de ``outbox.log`` desde que se creó (o desde el
     principio con ``from_start``), más las respuestas tardías de los comandos que se dejaron de esperar.
 
-    Sólo consume líneas completas; si un fichero se rota, se trunca o se recrea, vuelve a empezar por el
-    principio del nuevo. ``poll()`` nunca lanza por un fichero ausente o ilegible."""
+    Sólo consume líneas completas (una a medio escribir al abrir se da por nueva cuando se completa); si un
+    fichero se rota, se trunca (aunque vuelva a crecer antes de la siguiente lectura) o se recrea, vuelve a empezar
+    por el principio del nuevo. ``poll()`` nunca lanza por un fichero ausente o ilegible."""
 
     def __init__(self, state_dir: Union[str, Path], clock: Optional[Clock] = None, *, from_start: bool = False):
         self.dir = Path(state_dir)
         self.clock: Clock = clock if clock is not None else RealClock()
-        self._pos: dict[str, tuple[Optional[int], int]] = {}
+        self._cur: dict[str, _Cursor] = {}
         for name in (ALERTS_LOG, OUTBOX_FILE):
-            self._pos[name] = (None, 0) if from_start else self._end(name)
+            self._cur[name] = _Cursor() if from_start else self._end(name)
         self._late: list[tuple[SentCommand, float]] = []
-        self._seen: dict[str, float] = {}
+        self._seen: dict[str, tuple[float, str]] = {}      # texto -> (cuándo, de qué fichero)
         self._lock = threading.Lock()
 
-    def _end(self, name: str) -> tuple[Optional[int], int]:
+    def _end(self, name: str) -> _Cursor:
+        """Cursor tras la última línea completa que hay ahora (lo anterior no se repite al abrir la consola)."""
         try:
-            st = (self.dir / name).stat()
+            with open(self.dir / name, "rb") as f:
+                ino = os.fstat(f.fileno()).st_ino
+                size = f.seek(0, os.SEEK_END)
+                start = max(0, size - START_SCAN)
+                f.seek(start)
+                data = f.read(size - start)
         except OSError:
-            return (None, 0)
-        return (st.st_ino, st.st_size)
+            return _Cursor()
+        end = data.rfind(b"\n")
+        if end < 0:
+            return _Cursor(ino) if start == 0 else _Cursor(ino, size, data[-FP_BYTES:])
+        return _Cursor(ino, start + end + 1, data[:end + 1][-FP_BYTES:])
 
     def watch(self, sent: SentCommand) -> None:
         """Imprimir la respuesta de ``sent`` cuando llegue (se dejó de esperar)."""
@@ -210,29 +250,35 @@ class Follower:
         try:
             st = path.stat()
         except OSError:
-            self._pos[name] = (None, 0)          # aún no existe (o se está rotando): se leerá entero al aparecer
+            self._cur[name] = _Cursor()          # aún no existe (o se está rotando): se leerá entero al aparecer
             return []
-        ino, off = self._pos[name]
-        if (ino is not None and st.st_ino != ino) or st.st_size < off:
-            off = 0                              # rotado, truncado o recreado
-        skip_first = False
-        if st.st_size - off > MAX_READ:
-            off, skip_first = st.st_size - MAX_READ, True
-        if st.st_size == off:
-            self._pos[name] = (st.st_ino, off)
+        cur = self._cur[name]
+        if (cur.ino is not None and st.st_ino != cur.ino) or st.st_size < cur.off:
+            cur = _Cursor()                      # rotado, truncado o recreado
+        if st.st_size == cur.off:
+            self._cur[name] = _Cursor(st.st_ino, cur.off, cur.fp)
             return []
         try:
             with open(path, "rb") as f:
+                if cur.fp:
+                    f.seek(cur.off - len(cur.fp))
+                    if f.read(len(cur.fp)) != cur.fp:
+                        cur = _Cursor()          # truncado y vuelto a crecer: el contenido ya no es el leído
+                off, skip_first = cur.off, False
+                if st.st_size - off > MAX_READ:
+                    off, skip_first = st.st_size - MAX_READ, True
                 f.seek(off)
                 data = f.read(st.st_size - off)
         except OSError:
             return []
         end = data.rfind(b"\n")
-        if end < 0:
-            self._pos[name] = (st.st_ino, off)  # línea a medio escribir: se espera al salto
+        if end < 0:                              # línea a medio escribir: se espera al salto
+            self._cur[name] = _Cursor(st.st_ino, cur.off, cur.fp)
             return []
-        self._pos[name] = (st.st_ino, off + end + 1)
-        lines = data[:end + 1].decode("utf-8", "replace").splitlines()
+        chunk = data[:end + 1]
+        fp = (cur.fp + chunk if off == cur.off else chunk)[-FP_BYTES:]
+        self._cur[name] = _Cursor(st.st_ino, off + end + 1, fp)
+        lines = chunk.decode("utf-8", "replace").splitlines()
         return lines[1:] if skip_first else lines
 
     def poll(self) -> list[Notice]:
@@ -243,10 +289,15 @@ class Follower:
                 if rec.get("muted"):
                     continue                     # silenciada con 'mute': se respeta
                 text = str(rec.get("text") or rec.get("kind") or "")
-                out.append(Notice("alarma", normalize_level(rec.get("level")), text, str(rec.get("time") or ""),
+                if not text:
+                    continue
+                out.append(Notice("alarma", normalize_level(rec.get("level")), text, _notice_time(rec),
                                   coin=str(rec.get("coin") or "")))
             for n in desk_notices(self._new_lines(OUTBOX_FILE)):
-                out.append(Notice("mesa", notice_level(n["text"]), n["text"], n["time"]))
+                if is_status_line(n["text"]):
+                    out.append(Notice("estado", "info", n["text"], n["time"]))
+                else:
+                    out.append(Notice("mesa", notice_level(n["text"]), n["text"], n["time"]))
             out = self._dedupe(out, now)
             keep: list[tuple[SentCommand, float]] = []
             for sent, since in self._late:
@@ -259,16 +310,18 @@ class Follower:
             return out
 
     def _dedupe(self, notices: list[Notice], now: float) -> list[Notice]:
+        """Quita un aviso que ya llegó por el *otro* fichero hace menos de ``DEDUPE_S`` (la mesa puede dejar el mismo
+        texto en ``alerts.jsonl`` y en ``outbox.log``). Una alarma que se repite por el mismo fichero sí sale."""
         out = []
         for n in notices:
             key = " ".join(n.text.split())
             last = self._seen.get(key)
-            if last is not None and now - last < DEDUPE_S:
+            if last is not None and last[1] != n.source and now - last[0] < DEDUPE_S:
                 continue
-            self._seen[key] = now
+            self._seen[key] = (now, n.source)
             out.append(n)
         if len(self._seen) > 500:
-            self._seen = {k: t for k, t in self._seen.items() if now - t < DEDUPE_S}
+            self._seen = {k: v for k, v in self._seen.items() if now - v[0] < DEDUPE_S}
         return out
 
 
@@ -512,8 +565,15 @@ class DeskConsole:
                     break
                 finally:
                     self._at_prompt = False
-                if not self.handle(line):
-                    break
+                try:
+                    if not self.handle(line):
+                        break
+                except KeyboardInterrupt:
+                    self._print(Text("(Ctrl+C) Para cerrar la consola escribe 'salir' o pulsa Ctrl+D.", style="dim"))
+                except Exception as e:  # noqa: BLE001 - un fallo inesperado no cierra la consola
+                    log.exception("consola: fallo procesando %r", line)
+                    self._print(Text(f"Error inesperado en la consola ({type(e).__name__}: {e}); sigue abierta.",
+                                     style="red"))
         finally:
             self.stop_follow()
             self._teardown_readline()
