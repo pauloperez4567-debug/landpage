@@ -647,6 +647,8 @@ _ADOPT_FILLERS = _CHART_FILLERS | frozenset({
     "automatic", "playbook"})
 _DEACTIVATE_FILLERS = _CHART_FILLERS | frozenset({
     "auto", "automatico", "automatica", "playbook", "from", "todas", "temporalidades", "timeframes"})
+# "activa HYPE 1h forzar": activar aunque la estrategia no aprobara fuera de muestra (la mesa avisa del riesgo).
+_FORCE_WORDS = frozenset({"forzar", "forzado", "forzada", "forzando", "fuerza", "force", "forced", "forcing"})
 
 # Vocabulario de alarmas.
 _ALERT_PLURALS = frozenset({"alertas", "alarmas", "alerts", "alarms"})
@@ -705,7 +707,7 @@ _UNMUTE_FILLERS = _NOTICE_NOUNS | frozenset({
 # que se llaman así (ME, ID, W).
 _PHASE2_WORDS = frozenset().union(
     (u for u in _UNIT_CLASS if len(u) > 1), _BACKTEST_VERBS, _BACKTEST_LEAD - {"un", "una", "a", "el", "la"},
-    _ADOPT_VERBS, _DEACTIVATE_VERBS, _BACKTEST_FILLERS, _ADOPT_FILLERS, _DEACTIVATE_FILLERS, _ALERT_HEADS,
+    _ADOPT_VERBS, _DEACTIVATE_VERBS, _BACKTEST_FILLERS, _ADOPT_FILLERS, _DEACTIVATE_FILLERS, _FORCE_WORDS, _ALERT_HEADS,
     _ABOVE_WORDS, _BELOW_WORDS, _CROSS_WORDS, _GOLDEN_WORDS, _DEATH_WORDS, _MA_TYPES, _VOLUME_WORDS, _MOVE_WORDS,
     _REPEAT_WORDS, _NOTICE_NOUNS, _MUTE_VERBS, _UNMUTE_VERBS, _ON_VERBS, _OFF_VERBS, _DELETE_VERBS,
     {"rsi", "bot", "mesa", "trading", "aviso", "notificacion", "silencio", "vez", "cada", "every", "once", "crea",
@@ -834,10 +836,12 @@ def _parse_chart(action: CommandAction, toks: list[str], raw: str) -> Optional[C
     """``[verbo] MONEDA [temporalidad] [días] [estrategia]`` en cualquier orden (BACKTEST/ADOPT/DEACTIVATE).
 
     ``90d``/``90 días``/``3 meses``/``1 año`` son días de historia; ``15m``/``1h``/``4 horas`` temporalidades.
-    ``1d``/``3d`` son las dos cosas: temporalidad salvo que ya haya otra (``backtest BTC 1h 3d`` = 3 días)."""
+    ``1d``/``3d`` son las dos cosas: temporalidad salvo que ya haya otra (``backtest BTC 1h 3d`` = 3 días).
+    ADOPT admite ``forzar``/``force`` (``Command.force``): activar aunque no apruebe fuera de muestra."""
     fillers = {CommandAction.BACKTEST: _BACKTEST_FILLERS, CommandAction.ADOPT: _ADOPT_FILLERS}.get(
         action, _DEACTIVATE_FILLERS)
     coin: Optional[str] = None
+    force = False
     strategy: Optional[str] = None
     intervals: list[str] = []
     days: list[float] = []
@@ -873,6 +877,11 @@ def _parse_chart(action: CommandAction, toks: list[str], raw: str) -> Optional[C
         if toks[i] in fillers:
             i += 1
             continue
+        if toks[i] in _FORCE_WORDS:
+            if action is not CommandAction.ADOPT:
+                return None                                  # sólo tiene sentido al activar
+            force, i = True, i + 1
+            continue
         c = _phase2_coin(toks[i])
         if c is None or coin not in (None, c):
             return None
@@ -897,7 +906,9 @@ def _parse_chart(action: CommandAction, toks: list[str], raw: str) -> Optional[C
         return None                                          # activar/desactivar no llevan historia
     if action is CommandAction.ADOPT:
         # Poner dinero en automático exige la gráfica completa: "activa HYPE" sin temporalidad es ambiguo.
-        return Command(action, raw=raw, coin=coin, interval=interval, strategy=strategy) if interval else None
+        if not interval:
+            return None
+        return Command(action, raw=raw, coin=coin, interval=interval, strategy=strategy, force=force)
     if strategy is not None:
         return None                                          # el playbook tiene una entrada por gráfica
     return Command(action, raw=raw, coin=coin, interval=interval)
@@ -1604,6 +1615,7 @@ Gráficas (moneda + temporalidad: 1m 3m 5m 15m 30m 1h 2h 4h 8h 12h 1d 3d 1w):
   prueba HYPE 1h ema_trend                                          una sola estrategia
   informes | ultimos backtests                                      informes guardados
   activa HYPE 1h | usa la mejor HYPE 1h | activa HYPE 1h ema_trend   operar esa gráfica en automático
+    ... forzar                                                      aunque no apruebe (NO recomendado)
   desactiva HYPE 1h | desactiva HYPE | playbook                     quitar / ver gráficas activas
     (un backtest no garantiza resultados: decide con las métricas FUERA de muestra)
 Alarmas (alerta o alarma):
@@ -1693,7 +1705,8 @@ def describe(cmd: Command) -> str:
                 f" ({', '.join(extra)})")
     if a is CommandAction.ADOPT:
         who = f"la estrategia {cmd.strategy}" if cmd.strategy else "la ganadora de su último backtest"
-        return f"operar en automático {cmd.coin} {cmd.interval} con {who}"
+        forced = " (FORZADO: aunque no apruebe fuera de muestra)" if cmd.force else ""
+        return f"operar en automático {cmd.coin} {cmd.interval} con {who}{forced}"
     if a is CommandAction.DEACTIVATE:
         if cmd.interval:
             return f"quitar {cmd.coin} {cmd.interval} del playbook"

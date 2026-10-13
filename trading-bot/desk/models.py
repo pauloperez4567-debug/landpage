@@ -245,6 +245,7 @@ class Command:
     days: Optional[float] = None         # BACKTEST: días de historia (None = por defecto)
     alert: Optional[dict[str, Any]] = None  # ALERT_ADD: especificación de la alarma (ver ARCHITECTURE.md)
     target_id: Optional[int] = None      # ALERT_DEL: id de la alarma
+    force: bool = False                  # ADOPT: activar aunque no apruebe fuera de muestra ("activa ... forzar")
     id: str = ""                         # asignado por la mesa al recibirlo
 
     def to_dict(self) -> dict[str, Any]:
