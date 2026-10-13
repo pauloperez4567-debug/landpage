@@ -220,13 +220,15 @@ def test_kill_flattens_halts_and_needs_reset(settings, market, clock):
 
 
 # --------------------------------------------------------------------------- halts de riesgo
+# Las pérdidas se simulan con el precio (PnL de la operativa). Restar efectivo al broker sería una retirada:
+# la mesa la detecta como movimiento de saldo y no la cuenta como pérdida (ver test_cash_flow_*).
 def test_daily_loss_halt_blocks_entries_and_lifts_next_day(settings, market, clock):
+    settings.daily_loss_limit_pct = 0.25
     out = Out()
     desk = make_desk(settings, market, clock, out=out)
-    desk.submit("long SOL a mercado")
+    desk.submit("long SOL a mercado")                    # 16.66 SOL, SL 147.77
     desk.run_cycle()
-    desk.broker.cash -= 350.0                             # -3.5% en el día (drawdown 3.5% < 5%)
-    clock.advance(10)
+    move(market, clock, "SOL", 148.2)                     # -0.30% en el día, por encima del SL
     desk.run_cycle()
     assert desk.risk.halted and desk.risk.halt_reason == "daily_loss"
     assert "SOL" in desk.broker.account().positions       # sin flatten por defecto
@@ -242,13 +244,13 @@ def test_daily_loss_halt_blocks_entries_and_lifts_next_day(settings, market, clo
 
 def test_daily_loss_halt_with_flatten_closes_everything(settings, market, clock):
     settings.flatten_on_daily_limit = True
+    settings.daily_loss_limit_pct = 0.25
     hype_book(market)
     desk = make_desk(settings, market, clock)
     desk.submit("long SOL a mercado")
     desk.submit("long HYPE")                               # entrada pendiente: se cancela con el halt
     desk.run_cycle()
-    desk.broker.cash -= 350.0
-    clock.advance(10)
+    move(market, clock, "SOL", 148.2)
     desk.run_cycle()
     assert desk.risk.halt_reason == "daily_loss"
     assert desk.broker.account().positions == {} and desk.broker.open_orders() == []
@@ -256,6 +258,7 @@ def test_daily_loss_halt_with_flatten_closes_everything(settings, market, clock)
 
 
 def test_max_drawdown_halt_flattens_and_only_reset_lifts(settings, market, clock):
+    settings.max_drawdown_pct = 0.5
     out = Out()
     hype_book(market)
     desk = make_desk(settings, market, clock, out=out)
@@ -263,8 +266,8 @@ def test_max_drawdown_halt_flattens_and_only_reset_lifts(settings, market, clock
     desk.submit("short BTC a mercado")
     desk.submit("long HYPE")
     desk.run_cycle()
-    desk.broker.cash -= 600.0                             # -6% desde el máximo
-    clock.advance(10)
+    market.set_price("SOL", 148.2)                         # ~-$30 en SOL y ~-$30 en BTC: -0.6% desde el máximo
+    move(market, clock, "BTC", 84_800.0)
     desk.run_cycle()
     assert desk.risk.halt_reason == "max_drawdown"
     assert desk.broker.account().positions == {} and desk.broker.open_orders() == []
@@ -646,3 +649,313 @@ def test_env_example_documents_every_setting_with_defaults():
     loaded = load_settings(env=env, dotenv_path=None)
     defaults = Settings()
     assert {k: getattr(loaded, k) for k in vars(defaults)} == vars(defaults)
+
+
+# --------------------------------------------------------------------------- regresiones (revisión)
+class FlakyPaper(PaperBroker):
+    """PaperBroker con fallos de transporte: ``down`` tumba cuenta/órdenes/fills; ``fail`` = {(moneda, tipo)} hace
+    fallar esas órdenes (con ``fail_after`` la orden llega al exchange antes del fallo: timeout tras aceptarla)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.down = False
+        self.fail: set = set()
+        self.fail_after = False
+
+    def _check(self, what):
+        if self.down:
+            raise BrokerError(f"{what}: ReadTimeout")
+
+    def account(self):
+        self._check("user_state")
+        return super().account()
+
+    def open_orders(self, coin=None):
+        self._check("frontend_open_orders")
+        return super().open_orders(coin)
+
+    def poll_fills(self):
+        self._check("user_fills_by_time")
+        return super().poll_fills()
+
+    def place_order(self, coin, is_buy, size, kind, **kw):
+        self._check("order")
+        if (coin, OrderKind(kind)) in self.fail:
+            if self.fail_after:
+                super().place_order(coin, is_buy, size, kind, **kw)
+            raise BrokerError(f"order {coin}: ReadTimeout")
+        return super().place_order(coin, is_buy, size, kind, **kw)
+
+
+def flaky_for(market, settings, clock) -> FlakyPaper:
+    return FlakyPaper(market, settings, clock, settings.state_path / "paper_broker.json")
+
+
+def risk_on_disk(settings) -> dict:
+    return json.loads((settings.state_path / "risk.json").read_text(encoding="utf-8"))
+
+
+def test_thousands_separator_typo_is_not_sent(settings, market, clock):
+    desk = make_desk(settings, market, clock)
+    reply = desk.submit("short BTC a 83.825")          # quería 83,825 USD: antes salía un short a mercado
+    assert "punto de miles" in reply and "83825" in reply
+    assert desk.broker.account().positions == {} and desk.broker.open_orders() == []
+    desk.submit("long BTC a mercado")
+    sl = desk.engine.brackets["BTC"].sl
+    reply = desk.submit("stop BTC 83.775")
+    assert reply.startswith("No se movió el SL de BTC") and "punto de miles" in reply
+    assert desk.engine.brackets["BTC"].sl == sl
+
+
+def test_set_stop_command_beyond_liquidation_is_rejected(settings, market, clock):
+    desk = make_desk(settings, market, clock)
+    desk.submit("long SOL a mercado")
+    reply = desk.submit("stop SOL 1")                  # un % sin el símbolo
+    assert reply.startswith("No se movió el SL de SOL") and "liquidación" in reply
+    assert desk.engine.brackets["SOL"].sl == pytest.approx(147.77)
+
+
+def test_close_unknown_coin_is_reported(settings, market, clock):
+    desk = make_desk(settings, market, clock)
+    desk.submit("long SOL a mercado")
+    assert "No conozco la moneda FOO" in desk.submit("cierra FOO")
+    assert "Cerrando todo" in desk.submit("cierra todas las posiciones abiertas")
+    assert desk.broker.account().positions == {}
+
+
+def test_kill_closes_the_rest_when_one_coin_has_no_price(settings, market, clock, monkeypatch):
+    desk = make_desk(settings, market, clock)
+    for coin in ("BTC", "ETH", "SOL"):
+        desk.submit(f"long {coin} a mercado")
+    real = market.bid_ask
+
+    def no_btc(coin):
+        if coin == "BTC":
+            from desk.exchange.base import MarketDataError
+            raise MarketDataError("BTC: libro vacío por un lado")
+        return real(coin)
+    monkeypatch.setattr(market, "bid_ask", no_btc)
+    reply = desk.submit("kill")
+    assert "PÁNICO: 2 posición(es)" in reply and "sin cerrar todavía: BTC" in reply
+    assert list(desk.broker.account().positions) == ["BTC"] and desk.risk.halt_reason == "kill"
+    monkeypatch.setattr(market, "bid_ask", real)       # vuelve el precio: el flatten del ciclo lo cierra
+    clock.advance(10)
+    desk.run_cycle()
+    assert desk.broker.account().positions == {}
+
+
+def test_kill_is_persisted_before_touching_the_exchange(settings, market, clock):
+    broker = flaky_for(market, settings, clock)
+    desk = make_desk(settings, market, clock, broker=broker)
+    desk.submit("long SOL a mercado")
+    desk.run_cycle()
+    broker.down = True                                 # caída del exchange justo durante el pánico
+    reply = desk.submit("kill")
+    assert "ATENCIÓN" in reply and "El halt queda activo" in reply
+    saved = risk_on_disk(settings)                     # en disco ya, sin esperar al siguiente ciclo
+    assert saved["halted"] and saved["halt_reason"] == "kill" and saved["flatten_required"]
+    assert risk_on_disk(settings)["paused"] is False
+    desk.submit("pausa")
+    assert risk_on_disk(settings)["paused"] is True
+    broker.down = False
+    desk2 = make_desk(settings, market, clock)         # crash + reinicio: el kill y su cierre siguen
+    assert desk2.risk.halt_reason == "kill"
+    desk2.run_cycle()
+    assert desk2.broker.account().positions == {}
+
+
+def test_withdrawal_is_not_a_drawdown(settings, market, clock):
+    out = Out()
+    desk = make_desk(settings, market, clock, out=out)
+    desk.submit("long SOL a mercado")
+    desk.submit("short BTC a mercado")
+    desk.run_cycle()
+    hwm = desk.risk.high_water
+    desk.broker.cash -= 1_000.0                        # transferencia perp -> spot (-10 %)
+    clock.advance(10)
+    desk.run_cycle()
+    assert not desk.risk.halted and sorted(desk.broker.account().positions) == ["BTC", "SOL"]
+    assert desk.risk.high_water == pytest.approx(hwm - 1_000.0, abs=1.0)
+    assert "Movimiento de saldo ajeno a la operativa: -$1,000.00" in out.text
+    events = (settings.state_path / "events.jsonl").read_text(encoding="utf-8")
+    assert '"cash_flow"' in events
+    market.set_price("SOL", 148.2)                     # una pérdida real sí cuenta después
+    settings.daily_loss_limit_pct = 0.25
+    move(market, clock, "BTC", 84_800.0)
+    desk.run_cycle()
+    assert desk.risk.halt_reason == "daily_loss"
+
+
+def test_unexplained_drop_with_fills_counts_as_a_loss(settings, market, clock):
+    # Con ejecuciones en el intervalo (p. ej. una liquidación que se lleva más margen que su PnL realizado) una
+    # caída no explicada no se toma por retirada: ante la duda, el halt.
+    desk = make_desk(settings, market, clock)
+    desk.submit("long SOL a mercado")
+    desk.submit("short BTC a mercado")
+    desk.run_cycle()
+    desk.submit("cierra SOL")
+    desk.broker.cash -= 1_000.0
+    clock.advance(10)
+    desk.run_cycle()
+    assert desk.risk.halt_reason == "max_drawdown" and desk.broker.account().positions == {}
+
+
+def test_loss_limit_is_checked_for_commands_between_cycles(settings, market, clock):
+    settings.daily_loss_limit_pct = 0.25
+    desk = make_desk(settings, market, clock)
+    desk.submit("long SOL a mercado")
+    desk.run_cycle()
+    move(market, clock, "SOL", 148.2)                  # cruza el límite mientras la mesa duerme
+    reply = desk.submit("long ETH ya")
+    assert "rechazada por riesgo" in reply and "pérdida del día" in reply
+    assert "ETH" not in desk.broker.account().positions
+
+
+def test_entry_timeout_reply_says_uncertain_and_keeps_approved_levels(settings, market, clock):
+    broker = flaky_for(market, settings, clock)
+    broker.fail, broker.fail_after = {("SOL", OrderKind.MARKET)}, True
+    desk = make_desk(settings, market, clock, broker=broker)
+    reply = desk.submit("long SOL a mercado sl 0.4%")
+    assert "ESTADO INCIERTO" in reply and "NO la repitas" in reply and "Inténtalo de nuevo" not in reply
+    broker.fail = set()
+    desk.run_cycle()
+    br = desk.engine.brackets["SOL"]
+    assert br.origin == "command" and br.sl == pytest.approx(round(150.02 * 0.996, 2))
+    assert tags(broker, "SOL") == ["sl", "tp"]
+
+
+def test_stop_placement_failure_after_entry_is_not_a_retry_request(settings, market, clock):
+    broker = flaky_for(market, settings, clock)
+    broker.fail = {("SOL", OrderKind.STOP)}
+    desk = make_desk(settings, market, clock, broker=broker)
+    reply = desk.submit("long SOL a mercado")
+    assert reply.startswith("SOL LONG") and "NO colocado" in reply and "Inténtalo de nuevo" not in reply
+    broker.fail = set()
+    desk.run_cycle()                                   # la reconciliación lo coloca
+    assert tags(broker, "SOL") == ["sl", "tp"]
+
+
+def test_inbox_history_is_not_replayed_without_desk_state(settings, market, clock):
+    settings.state_path.mkdir(parents=True, exist_ok=True)
+    inbox = settings.state_path / "inbox.txt"
+    inbox.write_text("[old-1] reset halt\n[old-2] long BTC a mercado\n", encoding="utf-8")
+    desk = make_desk(settings, market, clock)
+    desk.run_cycle()
+    desk.submit("kill")
+    (settings.state_path / "desk.json").unlink()      # borrado (o ilegible)
+    desk2 = make_desk(settings, market, clock)
+    assert any("se ignoran" in n for n in desk2.notices)
+    desk2.run_cycle()
+    assert desk2.risk.halt_reason == "kill" and desk2.broker.account().positions == {}
+    assert outbox(settings).count("[old-2] BTC LONG 0.02984 @") == 1
+
+
+def test_rewritten_inbox_only_runs_unseen_ids(settings, market, clock):
+    settings.state_path.mkdir(parents=True, exist_ok=True)
+    inbox = settings.state_path / "inbox.txt"
+    inbox.write_text("[a] reset halt\n[b] long SOL a mercado\n[c] estado\n", encoding="utf-8")
+    desk = make_desk(settings, market, clock)
+    desk.run_cycle()
+    desk.submit("kill")
+    inbox.write_text("[a] reset halt\n[b] long SOL a mercado\n", encoding="utf-8")   # alguien borró una línea
+    desk.run_cycle()
+    assert desk.risk.halt_reason == "kill" and desk.broker.account().positions == {}
+    assert "no se relee su historial" in outbox(settings)
+    inbox.write_text("[d] pausa\n", encoding="utf-8")  # contenido sustituido por un comando nuevo
+    desk.run_cycle()
+    assert desk.risk.paused
+    assert outbox(settings).count("[a] No había ningún halt activo") == 1     # cada id, una sola vez
+    assert outbox(settings).count("[b] SOL LONG 16.66 @") == 1
+
+
+def test_inbox_line_glued_to_a_previous_one_is_split(settings, market, clock):
+    settings.state_path.mkdir(parents=True, exist_ok=True)
+    (settings.state_path / "inbox.txt").write_text("pausa[cli-x1] estado\n", encoding="utf-8")
+    desk = make_desk(settings, market, clock)
+    desk.run_cycle()
+    assert desk.risk.paused and "[cli-x1] Estado de la mesa" in outbox(settings)
+
+
+def test_queued_commands_survive_an_inbox_read_error(settings, market, clock, monkeypatch):
+    desk = make_desk(settings, market, clock)
+    cid = desk.enqueue("pausa")
+
+    def broken():
+        raise OSError("No space left on device")
+    monkeypatch.setattr(desk, "_read_inbox", broken)
+    assert not desk.run_cycle()                        # la etapa de comandos falla...
+    assert desk.risk.paused and f"[{cid}] Mesa en pausa" in outbox(settings)   # ...pero la cola se ejecutó
+
+
+def test_new_inbox_line_cuts_the_backoff_wait(settings, market, clock, monkeypatch):
+    settings.state_path.mkdir(parents=True, exist_ok=True)
+    desk = make_desk(settings, market, clock)
+    desk.error_streak = 6
+    assert desk.next_delay() == MAX_BACKOFF_S
+    real_sleep, calls = clock.sleep, []
+
+    def sleep(s):
+        calls.append(s)
+        real_sleep(s)
+        if len(calls) == 5:                            # `python -m desk send "kill"` a los 5 s
+            with open(settings.state_path / "inbox.txt", "a", encoding="utf-8") as f:
+                f.write("[cli-k] kill\n")
+    monkeypatch.setattr(clock, "sleep", sleep)
+    t0 = clock.now()
+    desk._sleep(desk.next_delay())
+    assert clock.now() - t0 == pytest.approx(5.0)
+
+
+def test_restart_within_the_same_bar_does_not_repeat_the_signal(settings, market, clock):
+    settings.symbols = ["SOL"]
+    stub = StubStrategy(settings, clock, plan={"SOL": LONG})
+    desk = make_desk(settings, market, clock, strategies=[stub], auto=True)
+    desk.run_cycle()
+    assert "SOL" in desk.broker.account().positions
+    desk.submit("cierra SOL")
+    desk.run_cycle()
+    stub2 = StubStrategy(settings, clock, plan={"SOL": LONG})
+    clock.advance(120)                                 # reinicio dentro de la misma vela de 15m
+    desk2 = make_desk(settings, market, clock, strategies=[stub2], auto=True)
+    desk2.run_cycle()
+    assert stub2.calls == [] and desk2.broker.account().positions == {}
+    clock.advance(15 * 60)                             # vela nueva: se vuelve a evaluar
+    desk2.run_cycle()
+    assert stub2.calls == ["SOL"]
+
+
+def test_health_reports_exchange_outage_and_heartbeat_only_on_healthy_cycles(settings, market, clock):
+    broker = flaky_for(market, settings, clock)
+    desk = make_desk(settings, market, clock, broker=broker)
+    desk.submit("long SOL a mercado")
+    desk.run_cycle()
+    hb = settings.state_path / "heartbeat"
+    health = json.loads((settings.state_path / "health.json").read_text(encoding="utf-8"))
+    assert health["failing"] == [] and health["last_ok"]["cuenta"] == clock.now()
+    beat = hb.read_text(encoding="utf-8")
+    broker.down = True
+    for _ in range(3):
+        clock.advance(settings.status_every_seconds)
+        desk.run_cycle()
+    assert hb.read_text(encoding="utf-8") == beat      # sin cuenta no hay latido
+    health = json.loads((settings.state_path / "health.json").read_text(encoding="utf-8"))
+    assert {"cuenta", "fills"} <= set(health["failing"]) and health["error_streak"] == 3
+    assert "ReadTimeout" in health["errors"]["cuenta"] and health["ts"] == clock.now()
+    snap = json.loads((settings.state_path / "status.json").read_text(encoding="utf-8"))
+    assert snap["ts"] == clock.now() and snap["line"].startswith("SIN DATOS DE LA CUENTA")
+    broker.down = False
+    clock.advance(10)
+    desk.run_cycle()
+    assert hb.read_text(encoding="utf-8") != beat
+
+
+def test_reset_params_restores_startup_values(settings, market, clock):
+    desk = make_desk(settings, market, clock)
+    desk.submit("riesgo 0.5")
+    desk.submit("apalancamiento 3")
+    assert settings.risk_per_trade_pct == 0.5 and settings.leverage == 3
+    reply = desk.submit("reset params")
+    assert reply.startswith("Parámetros de arranque restaurados") and "leverage=5" in reply
+    assert settings.risk_per_trade_pct == 1.0 and desk.param_overrides == {}
+    desk2 = make_desk(settings, market, clock)
+    assert desk2.param_overrides == {}

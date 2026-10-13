@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from .clock import Clock
-from .commands import HELP_TEXT, CommandParser, describe
+from .commands import HELP_TEXT, PARAM_DEFAULTS, CommandParser, describe
 from .config import TUNABLE, Settings
 from .engine import PENDING, ClosedTrade, ExecutionEngine, fmt_px, fmt_size, fmt_usd
 from .exchange.base import Broker, BrokerError, MarketData, MarketDataError, round_price
@@ -170,6 +170,7 @@ class TradingDesk:
         # DESK_AUTO=false / --no-auto siempre arrancan en OFF; si no, se respeta el último "auto on/off".
         self.auto_enabled = bool(settings.auto_enabled) and bool(state.get("auto_enabled", True))
         self.param_overrides: dict[str, float] = {}
+        self._param_base = {k: getattr(settings, k) for k in TUNABLE}   # valores de arranque ('reset params')
         self.day_stats: dict[str, Any] = dict(state.get("day_stats") or {})
         restored = []
         for key, value in (state.get("param_overrides") or {}).items():
@@ -514,6 +515,17 @@ class TradingDesk:
         return text
 
     def _cmd_param(self, cmd: Command) -> str:
+        if cmd.param == PARAM_DEFAULTS:
+            if not self.param_overrides:
+                return "No había parámetros cambiados por comando: ya se usan los de arranque."
+            restored = []
+            for key in sorted(self.param_overrides):
+                setattr(self.settings, key, self._param_base[key])
+                restored.append(f"{key}={self._param_base[key]}")
+            self.param_overrides = {}
+            self._save_desk_state()
+            self.journal.event("params_reset", params=restored)
+            return f"Parámetros de arranque restaurados: {', '.join(restored)}."
         if cmd.param is None or cmd.value is None:
             return "Falta el parámetro o el valor. Ejemplo: 'apalancamiento 3', 'riesgo 0.5', 'unidad 250'."
         try:
@@ -580,6 +592,7 @@ class TradingDesk:
                           exc_info=not isinstance(e, (MarketDataError, BrokerError)))
             self.last_errors[name] = msg
             return None
+        self.stage_ok_ts[name] = self.clock.now()
         if self.stage_errors.get(name):
             log.warning("etapa '%s' recuperada tras %d fallo(s)", name, self.stage_errors[name])
             self.stage_errors[name] = 0
@@ -608,7 +621,28 @@ class TradingDesk:
                 log.warning("ciclo %d con fallos en: %s (racha %d; próxima espera %.0f s)", self.cycle,
                             ", ".join(errors), self.error_streak, self.next_delay())
             self._last_cycle_s = max(self.clock.now() - t0, 0.0)
+            self._write_health(errors)
             return not errors
+
+    def health(self) -> dict[str, Any]:
+        """Salud de la mesa (lo que se escribe en ``health.json``): racha de ciclos con fallos, etapas que fallan con
+        su último error y la última vez que cada etapa crítica (``HEALTH_STAGES``) terminó bien."""
+        failing = sorted(k for k, v in self.stage_errors.items() if v)
+        return {"ts": self.clock.now(), "time": self.clock.iso(), "cycle": self.cycle, "started_ts": self.started_ts,
+                "error_streak": self.error_streak, "failing": failing,
+                "errors": {k: self.last_errors[k] for k in failing if k in self.last_errors},
+                "last_ok": {k: self.stage_ok_ts.get(k) for k in HEALTH_STAGES},
+                "next_delay_s": round(self.next_delay(), 1)}
+
+    def _write_health(self, errors: list[str]) -> None:
+        """``health.json`` en cada ciclo; ``heartbeat`` sólo si el ciclo leyó la cuenta y los fills: un latido viejo
+        significa "la mesa no ve el exchange" (o está parada), no sólo "el proceso sigue vivo"."""
+        try:
+            self.journal.touch(HEALTH_FILE, json.dumps(self.health(), ensure_ascii=False) + "\n")
+        except (TypeError, ValueError) as e:      # touch ya registra los errores de disco
+            log.error("no se pudo escribir %s: %s", HEALTH_FILE, e)
+        if not any(stage in errors for stage in HEALTH_STAGES):
+            self.journal.touch(HEARTBEAT_FILE, f"{self.clock.now()}\n")
 
     def next_delay(self) -> float:
         """Espera hasta el próximo ciclo: ``loop_seconds`` o backoff exponencial si hay fallos seguidos."""
@@ -792,7 +826,9 @@ class TradingDesk:
 
         Conservador: si las posiciones no cuadran con los fills recibidos (un fill aún no ha llegado) no se
         clasifica nada; por debajo de ``FLOW_MIN_PCT`` cuenta como PnL (funding, redondeos); en live se descuenta
-        además el funding cobrado/pagado si el broker lo sabe (``funding_since``)."""
+        además el funding cobrado/pagado si el broker lo sabe (``funding_since``). Una *salida* de saldo sólo se
+        clasifica si no hubo ejecuciones entre las dos lecturas: con fills (p. ej. una liquidación que se lleva
+        más margen que su ``closedPnl``) cuenta como pérdida; ante la duda, que salte el halt."""
         eq = float(account.equity) if account.equity is not None else math.nan
         live = {c: p for c, p in account.positions.items() if p.size != 0}
         upnl = sum(float(p.unrealized_pnl or 0.0) for p in live.values())
@@ -810,6 +846,10 @@ class TradingDesk:
         unexplained = (eq - b_eq) - (upnl - b_upnl) - pnl
         threshold = max(FLOW_MIN_USD, abs(b_eq) * FLOW_MIN_PCT / 100.0)
         if abs(unexplained) < threshold:
+            return
+        if unexplained < 0 and moved:
+            log.warning("caída de equity no explicada por los fills (%+.2f USD) en un intervalo con ejecuciones: "
+                        "cuenta como pérdida", unexplained)
             return
         funding_since = getattr(self.broker, "funding_since", None)
         if callable(funding_since):
@@ -981,10 +1021,12 @@ class TradingDesk:
 
     def _stage_status(self) -> None:
         now = self.clock.now()
-        self.journal.touch(HEARTBEAT_FILE, f"{now}\n")
         if self._account_dirty:                  # el automático abrió algo después de leer la cuenta
             self._account_dirty = False
-            self._account = self.broker.account()
+            try:
+                self._account = self.broker.account()
+            except (MarketDataError, BrokerError) as e:
+                log.warning("estado: cuenta no releída (%s); se usa la lectura del ciclo", e)
         acct = self._account
         if acct is not None and now - self._last_equity_ts >= EQUITY_EVERY_S:
             self._last_equity_ts = now
@@ -992,6 +1034,15 @@ class TradingDesk:
                                 sum(1 for p in acct.positions.values() if p.size != 0))
         if now - self._last_status_ts >= self.settings.status_every_seconds:
             self._last_status_ts = now
+            if acct is None:
+                # Sin cuenta no hay informe, pero status.json no se queda congelado con el último informe sano.
+                err = self.last_errors.get("cuenta", "sin lectura de la cuenta")
+                line = (f"SIN DATOS DE LA CUENTA ({err}) | ciclos seguidos con fallos {self.error_streak + 1} | "
+                        f"halt {self.risk.active_halt() or 'no'}")
+                self.notify(line, logging.WARNING)
+                self.journal.save_json(STATUS_NAME, {"ts": now, "time": self.clock.iso(), "line": line,
+                                                     "report": line, "account_ok": False})
+                return
             line = self.status_line(acct)
             self.notify(line)
             self.write_status_snapshot(acct, line)

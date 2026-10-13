@@ -19,9 +19,10 @@ RUN useradd --create-home --uid 10001 desk && mkdir -p /app/state && chown -R de
 USER desk
 VOLUME ["/app/state"]
 
-# Sano si la mesa completó un ciclo en los últimos 10 minutos (el backoff máximo es de 5).
+# Sana si completa ciclos y lee la cuenta y los fills del exchange (en los últimos 10 minutos; el backoff
+# máximo entre ciclos es de 5). Un proceso vivo que no ve el exchange queda "unhealthy".
 HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
-  CMD python -c "import os,sys,time; p='/app/state/heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 600 else 1)"
+  CMD python -m desk health
 
 # SIGTERM (docker stop) -> la mesa termina el ciclo, guarda el estado y sale; los SL/TP quedan puestos.
 STOPSIGNAL SIGTERM

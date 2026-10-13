@@ -248,7 +248,7 @@ def test_l2_book_n_sig_figs_and_short_cache(clock):
     md.l2_book("BTC", n_sig_figs=3)
     assert len(s.info_calls("l2Book")) == 3
     # El libro falso lleva siempre time = T0 + 0.123: la edad del dato es la del exchange, no la de la petición.
-    assert md.last_update_ts("BTC") == pytest.approx(T0 + 0.123)
+    assert md.last_update_ts("BTC") == pytest.approx(T0 + 0.123, abs=1e-6)
     assert md.last_update_ts("ETH") is None
 
 
@@ -447,3 +447,31 @@ def test_liquidations_invalid_key_pauses_longer(clock):
     clock.advance(500)
     md.liquidation_levels("BTC")
     assert len(s.calls) == 2
+
+
+# --- regresiones (revisión) -------------------------------------------------------------------
+
+def test_frozen_book_reports_its_exchange_age(clock):
+    # Un nodo atrasado sirve un libro congelado de hace 1 h: la edad que ve riesgo es la del dato, no la de la
+    # petición (antes salía ~0 s y 'long BTC a mercado' se aprobaba con max_data_age_seconds=120).
+    frozen = dict(BOOK_BTC, time=int((T0 - 3600) * 1000))
+
+    def router(method, url, body, headers):
+        if body and body.get("type") == "l2Book":
+            return FakeResponse(200, frozen)
+        return default_router(method, url, body, headers)
+    md, _ = make(clock, router)
+    md.bid_ask("BTC")
+    assert clock.now() - md.last_update_ts("BTC") == pytest.approx(3600.0)
+
+
+def test_book_time_ahead_of_local_clock_is_capped_at_request_time(clock):
+    ahead = dict(BOOK_BTC, time=int((T0 + 30) * 1000))      # reloj del exchange por delante del local
+
+    def router(method, url, body, headers):
+        if body and body.get("type") == "l2Book":
+            return FakeResponse(200, ahead)
+        return default_router(method, url, body, headers)
+    md, _ = make(clock, router)
+    md.bid_ask("BTC")
+    assert md.last_update_ts("BTC") == pytest.approx(T0, abs=1e-6)

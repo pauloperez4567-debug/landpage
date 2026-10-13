@@ -172,9 +172,13 @@ class Journal:
         self._append(OUTBOX_FILE, "".join(f"{stamp} [{cmd_id}] {ln}\n" for ln in lines))
 
     def touch(self, name: str, text: str = "") -> None:
-        """Escribe un fichero pequeño sin fsync (latido para healthchecks)."""
+        """Escribe un fichero pequeño sin fsync (latido / salud para healthchecks). Atómico (tmp + rename): quien
+        lo lea a la vez ve el contenido anterior o el nuevo, nunca uno a medias."""
+        path = self.dir / name
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            (self.dir / name).write_text(text, encoding="utf-8")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
         except OSError as e:
             log.error("diario: no se pudo escribir %s: %s", name, e)
 

@@ -3,12 +3,16 @@
     python -m desk run [--mode paper|live] [--data hyperliquid|sim|replay:x.csv] [--symbols BTC,ETH]
                        [--no-auto] [--fast] [--cycles N] [--loop-seconds S] [--cmd "N:texto"] [--state-dir DIR]
     python -m desk send "long HYPE"        (escribe en state/inbox.txt y espera la respuesta en outbox.log)
-    python -m desk status                  (último estado guardado por la mesa)
+    python -m desk status                  (último estado guardado por la mesa y avisos de salud)
+    python -m desk health                  (0 = sana; 1 = parada o sin ver el exchange: para healthchecks)
 
 ``--fast`` usa un reloj simulado (``SimClock``) con datos ``sim`` o ``replay``: cada ciclo avanza
 ``loop_seconds`` de tiempo simulado sin esperar, así se simulan días en segundos. Su estado va a
 ``<state_dir>/fast`` (no se mezcla con el paper real) y continúa donde lo dejó la simulación anterior
-salvo ``--fresh``.
+(la hora simulada más reciente que guardó la mesa, también tras un corte brusco) salvo ``--fresh``.
+
+``profile.json`` guarda con qué configuración se creó el estado (modo, datos, reloj y, en live, red y cuenta):
+arrancar con otra sobre el mismo estado se rechaza.
 
 Mientras corre, la consola acepta comandos (``long HYPE``, ``estado``, ``ayuda``...); ``salir`` detiene la mesa.
 """
@@ -16,6 +20,7 @@ Mientras corre, la consola acepta comandos (``long HYPE``, ``estado``, ``ayuda``
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -33,6 +38,13 @@ from .journal import INBOX_FILE, OUTBOX_FILE, Journal, read_outbox
 log = logging.getLogger("desk.cli")
 
 PROFILE_FILE = "profile"     # profile.json: configuración con la que se creó el estado
+HEALTH_FILE = "health.json"  # salud de cada ciclo (la escribe la mesa)
+HEARTBEAT_FILE = "heartbeat"  # último ciclo que leyó la cuenta y los fills
+HEALTH_MAX_AGE_S = 600.0     # sin ciclos en 10 min: parada (el backoff máximo entre ciclos es de 5)
+STAGE_MAX_STALE_S = 600.0    # sin leer la cuenta / los fills en 10 min: no ve el exchange
+# Claves del perfil que existen desde la primera versión; las demás (red, cuenta) sólo se comprueban si el
+# estado las tiene guardadas (un perfil antiguo se acepta y se completa).
+BASE_PROFILE_KEYS = ("mode", "data", "clock")
 
 
 # --------------------------------------------------------------------------- utilidades
@@ -139,8 +151,11 @@ def build_broker(settings: Settings, market: Any, clock: Clock, journal: Journal
         from .exchange.hyperliquid_live import LiveHyperliquidBroker
         saved = journal.load_json("desk", {}) or {}
         since = saved.get("fills_cursor_ts")
+        seen = saved.get("fills_seen")
+        # El cursor es inclusivo: los fills ya entregados en ese milisegundo no se vuelven a entregar.
         return LiveHyperliquidBroker.from_settings(market, settings, clock,
-                                                   fills_since_ts=float(since) if since else None)
+                                                   fills_since_ts=float(since) if since else None,
+                                                   fills_seen=[str(k) for k in seen] if isinstance(seen, list) else None)
     from .exchange.paper import PaperBroker
     broker = PaperBroker.from_settings(market, settings, clock)
     if broker.load_error:
@@ -148,18 +163,73 @@ def build_broker(settings: Settings, market: Any, clock: Clock, journal: Journal
     return broker
 
 
+def live_account(settings: Settings) -> Optional[str]:
+    """Cuenta que opera la mesa en live (``HL_ACCOUNT_ADDRESS`` o la de la clave), en minúsculas; None si no se sabe."""
+    if settings.hl_account_address:
+        return settings.hl_account_address.strip().lower()
+    try:
+        from .exchange.hyperliquid_live import _wallet_from_key
+        return str(_wallet_from_key(settings.hl_private_key).address).lower()
+    except (RuntimeError, ValueError):      # sin eth-account o clave inválida: lo dirá el broker al arrancar
+        return None
+
+
+def build_profile(settings: Settings, fast: bool) -> dict[str, Any]:
+    """Configuración a la que pertenece el estado. En live incluye la red y la cuenta: el máximo de equity y la
+    referencia diaria de testnet no valen para mainnet (dispararían un halt por drawdown y un cierre de todo)."""
+    profile: dict[str, Any] = {"mode": settings.mode, "data": settings.data_source, "clock": "sim" if fast else "real"}
+    if settings.is_live:
+        profile["network"] = "mainnet" if settings.hl_mainnet else "testnet"
+        account = live_account(settings)
+        if account:
+            profile["account"] = account
+    return profile
+
+
 def check_profile(journal: Journal, profile: dict[str, Any]) -> None:
     """El estado guardado (posiciones paper, brackets, riesgo) sólo vale para la misma configuración."""
     saved = journal.load_json(PROFILE_FILE, None)
     if isinstance(saved, dict):
-        old = {k: saved.get(k) for k in profile}
-        if old != profile:
+        keys = [k for k in profile if k in BASE_PROFILE_KEYS or k in saved]
+        old = {k: saved.get(k) for k in keys}
+        new = {k: profile[k] for k in keys}
+        if old != new:
             raise SystemExit(
-                f"El estado en {journal.dir} es de otra configuración ({old}) y ahora se pide {profile}.\n"
-                "Mezclarlos daría posiciones y límites de riesgo sin sentido. Usa otro --state-dir o borra esa carpeta.")
+                f"El estado en {journal.dir} es de otra configuración ({old}) y ahora se pide {new}.\n"
+                "Mezclarlos daría posiciones y límites de riesgo sin sentido (en live, el máximo de equity de otra red "
+                "o cuenta haría saltar el halt por drawdown y cerrar todo). Usa otro --state-dir (p. ej. uno por red "
+                "y cuenta) o borra esa carpeta.")
     data = dict(saved) if isinstance(saved, dict) else {}
     data.update(profile)
     journal.save_json(PROFILE_FILE, data)
+
+
+def _read_json(path: Path) -> Optional[dict[str, Any]]:
+    """JSON de un fichero que escribe la mesa (sin apartarlo si está mal, a diferencia de ``Journal.load_json``)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def resume_clock_ts(state_dir: Path) -> Optional[float]:
+    """Hora simulada desde la que sigue una simulación ``--fast``: la más reciente que guardó la mesa (``clock_ts``
+    al salir, ``health.json`` y ``heartbeat`` de cada ciclo, ``status.json``). Así un corte brusco (SIGKILL, OOM)
+    no hace volver el reloj atrás respecto al estado guardado."""
+    found: list[float] = []
+    prof = _read_json(state_dir / f"{PROFILE_FILE}.json") or {}
+    for d, key in ((prof, "clock_ts"), (_read_json(state_dir / HEALTH_FILE) or {}, "ts"),
+                   (_read_json(state_dir / "status.json") or {}, "ts")):
+        try:
+            found.append(float(d[key]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    try:
+        found.append(float((state_dir / HEARTBEAT_FILE).read_text(encoding="utf-8").strip()))
+    except (OSError, ValueError):
+        pass
+    return max(found) if found else None
 
 
 # --------------------------------------------------------------------------- run
@@ -205,15 +275,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     clock: Clock
     if args.fast:
         from .exchange.sim import DEFAULT_ANCHOR_TS
-        prof = Journal(state_dir, RealClock()).load_json(PROFILE_FILE, {}) or {}
-        start = float(prof.get("clock_ts") or DEFAULT_ANCHOR_TS)
-        clock = SimClock(start)
+        clock = SimClock(resume_clock_ts(state_dir) or DEFAULT_ANCHOR_TS)
     else:
         clock = RealClock()
     setup_logging(state_dir, clock, args.verbose)
     journal = Journal(state_dir, clock)
-    profile = {"mode": settings.mode, "data": settings.data_source, "clock": "sim" if args.fast else "real"}
-    check_profile(journal, profile)
+    check_profile(journal, build_profile(settings, args.fast))
     out = make_out(clock)
 
     if settings.is_live:
@@ -279,8 +346,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         offset = outbox.stat().st_size
     except FileNotFoundError:
         offset = 0
-    with open(state_dir / INBOX_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{cmd_id}] {text}\n")
+    append_inbox_line(state_dir / INBOX_FILE, f"[{cmd_id}] {text}")
     if args.no_wait:
         print(f"Enviado [{cmd_id}] a {state_dir / INBOX_FILE}")
         return 0
@@ -300,9 +366,75 @@ def cmd_send(args: argparse.Namespace) -> int:
         print("\n".join(lines))
         return 0
     print(f"La mesa no respondió en {args.timeout:g} s (¿está corriendo con este estado: {state_dir}?).\n"
-          f"El comando [{cmd_id}] queda en {INBOX_FILE} y se ejecutará cuando la mesa lo lea; para anularlo, "
-          "borra esa línea antes.", file=sys.stderr)
+          f"El comando [{cmd_id}] queda en {INBOX_FILE} y se ejecutará (una sola vez) cuando la mesa lo lea. No "
+          "borres ni edites líneas del inbox: si ya no lo quieres, envía después el comando contrario (p. ej. "
+          "'cancela HYPE' o 'cierra HYPE').", file=sys.stderr)
     return 1
+
+
+def append_inbox_line(path: Path, line: str) -> None:
+    """Añade una línea al inbox con su salto final. Si el fichero no acaba en salto de línea (alguien escribió a
+    mano sin él) antepone uno: si no, el comando se pegaría a esa línea. Con bloqueo para escritores concurrentes."""
+    data = (line.rstrip("\n") + "\n").encode("utf-8")
+    with open(path, "a+b") as f:
+        try:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):     # Windows o sistema de ficheros sin bloqueos
+            pass
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                data = b"\n" + data
+        f.write(data)
+        f.flush()
+
+
+def health_check(state_dir: Path, now: float, max_age: float = HEALTH_MAX_AGE_S,
+                 max_stale: float = STAGE_MAX_STALE_S) -> tuple[list[str], list[str]]:
+    """(problemas, detalles) de la mesa según ``health.json`` / ``heartbeat``. Sin problemas = sana.
+
+    Parada: no escribe ``health.json`` desde hace ``max_age`` s (hora real). Sin exchange: no lee la cuenta o
+    los fills desde hace ``max_stale`` s (hora de la mesa, también simulada)."""
+    problems: list[str] = []
+    info: list[str] = []
+    hp, hb = state_dir / HEALTH_FILE, state_dir / HEARTBEAT_FILE
+    health = _read_json(hp)
+    if health is None:
+        if not hb.exists():
+            return [f"no hay latido ni salud en {state_dir} (¿ha arrancado la mesa con este estado?)"], info
+        age = now - hb.stat().st_mtime        # mesa de una versión sin health.json: sólo el latido
+        if age > max_age:
+            problems.append(f"último latido hace {age / 60:.0f} min: parece detenida")
+        else:
+            info.append(f"último latido hace {age:.0f} s")
+        return problems, info
+    age = now - hp.stat().st_mtime
+    if age > max_age:
+        problems.append(f"no completa ciclos desde hace {age / 60:.0f} min: parece detenida")
+    try:
+        ts = float(health.get("ts") or 0.0)
+        started = float(health.get("started_ts") or ts)
+    except (TypeError, ValueError):
+        ts = started = 0.0
+    last_ok = health.get("last_ok") if isinstance(health.get("last_ok"), dict) else {}
+    errors = health.get("errors") if isinstance(health.get("errors"), dict) else {}
+    for stage, what in (("cuenta", "la cuenta"), ("fills", "las ejecuciones (fills)")):
+        try:
+            ref = float(last_ok.get(stage) or started)
+        except (TypeError, ValueError):
+            ref = started
+        since = ts - ref
+        if since > max_stale:
+            err = f" (último error: {errors[stage]})" if errors.get(stage) else ""
+            never = "desde que arrancó, hace" if not last_ok.get(stage) else "desde hace"
+            problems.append(f"no lee {what} {never} {since / 60:.0f} min{err}")
+    failing = [str(x) for x in health.get("failing") or []]
+    info.append(f"ciclo {health.get('cycle')} a las {health.get('time')} UTC (hora de la mesa), hace {age:.0f} s; "
+                f"ciclos seguidos con fallos: {health.get('error_streak', 0)}"
+                + (f"; etapas fallando: {', '.join(failing)}" if failing else ""))
+    return problems, info
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -314,13 +446,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
     print(snap.get("report") or snap.get("line") or "(vacío)")
     print(f"\n(estado guardado a las {snap.get('time')} UTC, hora de la mesa)")
-    hb = state_dir / "heartbeat"
-    if hb.exists():
-        age = RealClock().now() - hb.stat().st_mtime
-        if age > 600:
-            print(f"ATENCIÓN: último latido de la mesa hace {age / 60:.0f} min: parece detenida.")
-        else:
-            print(f"Último latido hace {age:.0f} s.")
+    problems, info = health_check(state_dir, RealClock().now())
+    for line in info:
+        print(f"Salud: {line}.")
+    for line in problems:
+        print(f"ATENCIÓN: la mesa {line}.")
+    return 0
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    """Para healthchecks (Docker, systemd, cron): 0 si la mesa completa ciclos y ve el exchange, 1 si no."""
+    state_dir = _base_state_dir(args)
+    problems, info = health_check(state_dir, RealClock().now(), args.max_age, args.max_stale)
+    if problems:
+        print("MAL: la mesa " + "; ".join(problems) + ("" if not info else f" [{'; '.join(info)}]"))
+        return 1
+    print("OK: " + "; ".join(info))
     return 0
 
 
@@ -361,6 +502,16 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--fast", action="store_true", help="estado de la simulación --fast")
     st.add_argument("--env-file", default=".env")
     st.set_defaults(func=cmd_status)
+
+    h = sub.add_parser("health", help="salud de la mesa para healthchecks (código de salida 0 = sana)")
+    h.add_argument("--state-dir")
+    h.add_argument("--fast", action="store_true", help="salud de la simulación --fast")
+    h.add_argument("--env-file", default=".env")
+    h.add_argument("--max-age", type=float, default=HEALTH_MAX_AGE_S,
+                   help=f"segundos sin ciclos para darla por parada ({HEALTH_MAX_AGE_S:g})")
+    h.add_argument("--max-stale", type=float, default=STAGE_MAX_STALE_S,
+                   help=f"segundos sin leer la cuenta o los fills para darla por ciega ({STAGE_MAX_STALE_S:g})")
+    h.set_defaults(func=cmd_health)
     return p
 
 

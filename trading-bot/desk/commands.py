@@ -29,7 +29,8 @@ Convenciones del resultado:
   ``price`` si es un precio, ``sl_pct``/``tp_pct`` si viene en %. Sin moneda
   (``sl 2%``, ``tp 3``) cambian el parámetro por defecto (SET_PARAM).
 - SET_PARAM: ``param`` es el nombre canónico (``PARAM_ALIASES``/``TUNABLE``) y
-  ``value`` un float; el rango lo valida ``Settings.set_param``.
+  ``value`` un float; el rango lo valida ``Settings.set_param``. ``param=PARAM_DEFAULTS`` (sin ``value``,
+  ``reset params`` / ``restablece parámetros``) vuelve a los valores de arranque.
 - Números con punto o coma decimal (``85.2`` / ``85,2``); los ambiguos entre
   miles y decimales (``83,770``, ``1.000``) se rechazan (ver ``parse_number``).
 """
@@ -135,6 +136,14 @@ _RESERVED = frozenset().union(
 _AUTO = r"(?:auto|automatico|autonomo|autopilot|autopiloto|automatic|autotrading|auto trading)"
 _ON = r"(?:on|si|yes|activado|activo|activar|encendido|encender|enable|enabled|true|1)"
 _OFF = r"(?:off|no|desactivado|desactivar|apagado|apagar|disable|disabled|false|0)"
+
+# SET_PARAM especial: olvidar los parámetros cambiados por comando (vuelven los de la configuración).
+PARAM_DEFAULTS = "defaults"
+_RESET_PARAMS_RX = re.compile(
+    r"(?:reset|resetea|resetear|restablece|restablecer|restaura|restaurar|borra|borrar|olvida|clear|restore)"
+    r"(?: (?:los|mis|the|my))? (?:parametros|params|parameters|ajustes)"
+    r"(?: (?:por defecto|de arranque|originales|to defaults|default|defaults))?"
+    r"|(?:parametros|params|parameters) (?:por defecto|de arranque|default|defaults)")
 
 _PHRASES: list[tuple[CommandAction, re.Pattern[str]]] = [(a, re.compile(p)) for a, p in [
     (CommandAction.HELP, r"ayuda|help|comandos|commands|menu|que puedes hacer|what can you do"),
@@ -567,6 +576,8 @@ def parse_rules(text: str, settings: Optional[Settings] = None) -> Optional[Comm
     if not toks:
         return None
     joined = " ".join(toks)
+    if _RESET_PARAMS_RX.fullmatch(joined):
+        return Command(CommandAction.SET_PARAM, raw=raw, param=PARAM_DEFAULTS)
     for action, rx in _PHRASES:
         if rx.fullmatch(joined):
             return Command(action, raw=raw)
@@ -926,6 +937,7 @@ Comandos (español o inglés, sin importar mayúsculas ni acentos):
   cancela HYPE | cancel all
   stop HYPE 84.5 | sl HYPE 1% | tp HYPE 90              mover SL/TP de una posición
   apalancamiento 3 | riesgo 0.5 | unidad 250 | sl 2% | tp 3   parámetros
+  reset params | restablece parametros                 volver a los parámetros de arranque
   pausa | reanuda | auto on | auto off | estado | kill | reset halt
   si / confirmar  -  no / cancelar  (comandos pendientes)   ayuda"""
 
@@ -958,6 +970,8 @@ def describe(cmd: Command) -> str:
         level = f"{_fmt(pct)}% desde la entrada" if pct is not None else _fmt(cmd.price)
         return f"mover {what} de {cmd.coin} a {level}"
     if a is CommandAction.SET_PARAM:
+        if cmd.param == PARAM_DEFAULTS:
+            return "volver a los parámetros de arranque"
         return f"cambiar {cmd.param} a {_fmt(cmd.value)}"
     if a is CommandAction.CLOSE:
         return f"cerrar {cmd.coin}"

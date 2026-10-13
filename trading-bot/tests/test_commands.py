@@ -492,6 +492,44 @@ def test_help_text_examples_parse(settings):
         assert parse_rules(text, settings) is not None
 
 
+# --- regresiones (revisión) --------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "cierra todas las posiciones abiertas", "close all open positions", "close all trades",
+    "cierra todas las operaciones", "cierra todo ahora mismo", "cierra todo ya",
+])
+def test_close_everything_with_filler_words_is_close_all(settings, text):
+    # Antes una palabra de relleno ("abiertas", "trades", "mismo") se tomaba por moneda: no se cerraba nada.
+    cmd = parse_rules(text, settings)
+    assert cmd is not None and cmd.action is A.CLOSE_ALL and cmd.coin is None, text
+
+
+@pytest.mark.parametrize("text", ["cierra todo BTC", "close all SOL", "cancela todo HYPE"])
+def test_all_plus_a_coin_is_ambiguous(settings, text):
+    assert parse_rules(text, settings) is None
+
+
+def test_cancel_all_open_orders_with_fillers(settings):
+    cmd = parse_rules("cancela todas las ordenes abiertas", settings)
+    assert cmd is not None and cmd.action is A.CANCEL and cmd.coin is None
+
+
+@pytest.mark.parametrize("text", ["panico ya", "pánico ahora mismo", "kill now", "kill todo ya", "panic right now",
+                                  "apaga todo ya mismo"])
+def test_kill_accepts_urgency_words(settings, text):
+    # "pánico ya" no puede caer en la IA y esperar un "si" con las posiciones abiertas.
+    cmd = parse_rules(text, settings)
+    assert cmd is not None and cmd.action is A.KILL, text
+
+
+@pytest.mark.parametrize("text", ["reset params", "restablece parámetros", "restaura los parametros por defecto",
+                                  "parametros por defecto"])
+def test_reset_params(settings, text):
+    cmd = parse_rules(text, settings)
+    assert cmd is not None and cmd.action is A.SET_PARAM and cmd.param == commands.PARAM_DEFAULTS
+    assert cmd.value is None and describe(cmd) == "volver a los parámetros de arranque"
+
+
 # --- fallback IA: cliente falso ----------------------------------------------------------
 
 class FakeMessages:

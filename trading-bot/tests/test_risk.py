@@ -529,3 +529,41 @@ def test_describe_mentions_state(rm):
     rm.pause()
     text = rm.describe()
     assert "HALT kill" in text and "PAUSA" in text
+
+
+# --------------------------------------------------------------------------- regresiones (revisión)
+def test_limit_far_across_the_book_is_rejected_not_turned_into_market(rm):
+    # "short BTC a 83.825" (miles en español leído como decimal): antes se convertía en un short a mercado.
+    d = rm.evaluate(intent("BTC", SHORT, limit_px=83.825), acct(), META["BTC"], 83_770.0, 83_780.0, 1.0)
+    assert not d.approved and "mal escrito" in d.reason
+    d = ev(rm, intent(limit_px=102.0))                 # cruza el ask un ~2 % (> LIMIT_MAX_CROSS_PCT)
+    assert not d.approved and "por encima del ask" in d.reason
+    d = ev(rm, intent(limit_px=100.5))                 # cruce pequeño: taker al ask, con aviso
+    assert d.approved and d.entry_px == 100.01
+
+
+def test_limit_resting_too_far_from_mid_is_rejected(rm):
+    d = ev(rm, intent(limit_px=70.0))                  # 30 % por debajo del mid
+    assert not d.approved and "del precio actual" in d.reason
+    assert ev(rm, intent(limit_px=85.0, sl_pct=1.0)).approved      # 15 %: dentro del collar
+
+
+def test_evaluate_checks_loss_limits_with_the_fresh_account(rm, settings):
+    # El equity cruzó el límite diario entre ciclos: update() aún no lo vio, pero evaluate() sí.
+    settings.daily_loss_limit_pct = 0.5
+    rm.update(acct(10_000))
+    d = ev(rm, intent(), acct(9_920))
+    assert not d.approved and "pérdida del día" in d.reason and not rm.halted
+    settings.daily_loss_limit_pct = 3.0
+    settings.max_drawdown_pct = 1.0
+    d = ev(rm, intent(), acct(9_850))
+    assert not d.approved and "drawdown" in d.reason
+
+
+def test_cash_flow_moves_high_water_and_day_reference(rm):
+    rm.update(acct(10_000))
+    rm.apply_cash_flow(-1_000.0)                       # retirada / transferencia perp -> spot
+    assert rm.high_water == 9_000 and rm.day_start_equity == 9_000
+    assert rm.update(acct(9_000)) == [] and not rm.halted
+    rm.apply_cash_flow(500.0)                          # depósito: tampoco es ganancia de la operativa
+    assert rm.high_water == 9_500 and rm.day_loss_pct(9_500) == pytest.approx(0.0)

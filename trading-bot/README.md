@@ -60,7 +60,8 @@ python -m desk run --data sim --fast --cycles 3000 --cmd "0:long HYPE" --cmd "20
 - `--fast`: reloj simulado; cada ciclo avanza `DESK_LOOP_SECONDS` (10 s) sin esperar. 3000 ciclos ≈ 8 h
   simuladas en unos segundos. Con `--loop-seconds 60 --cycles 2880` simulas 2 días.
 - `--cmd "N:texto"`: envía un comando antes del ciclo N (repetible).
-- El estado va a `state/fast/` y la siguiente ejecución **continúa** donde lo dejó; `--fresh` empieza de cero.
+- El estado va a `state/fast/` y la siguiente ejecución **continúa** donde lo dejó (la hora simulada más
+  reciente que guardó la mesa, también tras un corte brusco); `--fresh` empieza de cero.
 - También puedes reproducir velas reales: `--data replay:datos/btc_15m.csv` (columnas
   `timestamp,open,high,low,close,volume`).
 
@@ -90,11 +91,17 @@ calculan sólo con el libro de órdenes.
 ```bash
 python -m desk send "long HYPE 2u zona sl 1.5% tp 4%"   # espera la respuesta (30 s)
 python -m desk send --no-wait "cierra todo"
-python -m desk status                                   # último estado guardado
+python -m desk status                                   # último estado guardado y avisos de salud
+python -m desk health                                   # 0 = sana; 1 = parada o sin ver el exchange
 echo "estado" >> state/inbox.txt                         # también vale (una línea por comando)
 ```
 
-(Añade `--fast` a `send`/`status` para hablar con una simulación `--fast`.)
+(Añade `--fast` a `send`/`status`/`health` para hablar con una simulación `--fast`.)
+
+Cada línea del inbox se ejecuta **una sola vez** (la mesa guarda hasta dónde leyó, una huella del fichero y
+los `[id]` ya ejecutados). **No borres ni edites líneas** del inbox: si el fichero encoge o se reescribe, la
+mesa avisa y sólo ejecuta las líneas con un `[id]` que no haya visto. Para anular un comando que ya se
+ejecutó, envía el contrario (`cancela HYPE`, `cierra HYPE`).
 
 ---
 
@@ -134,9 +141,9 @@ y cuando el precio llega: `HYPE LONG: entrada ejecutada: 11.72 @ 85.288` → `HY
 | Comando | Qué hace |
 |---|---|
 | `cierra HYPE` · `close HYPE` | Cierra la posición a mercado (y cancela su entrada pendiente) |
-| `cierra todo` · `close all` · `flat` | Cierra todas las posiciones y cancela todas las entradas |
+| `cierra todo` · `close all` · `flat` · `cierra todas las posiciones abiertas` | Cierra todas las posiciones y cancela todas las entradas (`cierra todo BTC` es ambiguo y no hace nada) |
 | `cancela HYPE` · `cancel all` · `cancela todo` | Cancela órdenes de **entrada** (los SL/TP de posiciones abiertas se mantienen) |
-| `stop HYPE 84.5` · `sl HYPE 84.5` · `mueve el stop de HYPE a 84` | Mueve el SL de la posición (o de la entrada pendiente) |
+| `stop HYPE 84.5` · `sl HYPE 84.5` · `mueve el stop de HYPE a 84` | Mueve el SL de la posición (o de la entrada pendiente). Se rechaza si queda más allá de la liquidación o si, al ensancharlo, la pérdida superaría `DESK_RISK_PER_TRADE_PCT` |
 | `sl HYPE 1%` · `tp HYPE 3%` · `tp HYPE 90` | SL/TP en % desde la entrada o a precio |
 
 ### Control de la mesa
@@ -147,7 +154,7 @@ y cuando el precio llega: `HYPE LONG: entrada ejecutada: 11.72 @ 85.288` → `HY
 | `pausa` · `pause` | No abre nada nuevo (las posiciones abiertas se siguen gestionando) |
 | `reanuda` · `resume` | Quita la pausa (no levanta un halt de riesgo) |
 | `auto on` · `auto off` · `automatico on` | Activa/desactiva la operativa autónoma |
-| `kill` · `panico` · `apaga todo` | **Pánico**: cierra todo, cancela todo y detiene la mesa hasta `reset halt` |
+| `kill` · `panico` · `apaga todo` · `pánico ya` · `kill now` | **Pánico**: cierra todo, cancela todo y detiene la mesa hasta `reset halt`. El halt se guarda en disco antes de tocar el exchange; si una moneda no se puede cerrar (sin precio, red) se cierran las demás y se reintenta cada ciclo |
 | `reset halt` | Levanta un halt de riesgo (diario, drawdown o kill) y reinicia las referencias |
 | `si` · `confirmar` · `yes` — `no` · `cancelar` · `reject` | Confirma / descarta el comando pendiente interpretado por IA (5 min) |
 | `ayuda` · `help` · `?` | Chuleta de comandos |
@@ -167,6 +174,13 @@ Se aplican a las siguientes operaciones y **se recuerdan tras reiniciar** (apare
 | `perdida diaria 2` | `daily_loss_limit_pct` | 0,5–50 |
 | `drawdown 4` | `max_drawdown_pct` | 1–90 |
 | `ttl 60` | `entry_ttl_minutes` | 1–10.080 |
+
+`reset params` · `restablece parámetros` vuelve a los valores de arranque (`.env`) y olvida los cambiados por
+comando (no hace falta borrar `desk.json`).
+
+**Precios con punto de miles**: `83.825` se lee como decimal. Si la moneda cotiza cerca de 83.825 (BTC), la mesa
+no envía nada y pide escribirlo sin separador (`83825`); además, un límite que cruza el libro más de un 1 % o
+reposa a más de un 20 % del precio se rechaza por "¿precio mal escrito?" en vez de ejecutarse a mercado.
 
 ---
 
@@ -206,8 +220,14 @@ permitidos. Reglas por defecto (estilo cuenta de fondeo):
 | Posiciones simultáneas | 3 | Las entradas pendientes cuentan |
 | Exposición | 25.000 USD por moneda, 50.000 USD total | Recorte del tamaño |
 | Racha de pérdidas | 4 seguidas | 120 min sin entradas automáticas |
-| Calidad de mercado | spread ≤ 25 bps, datos ≤ 120 s | Si no, no entra |
+| Calidad de mercado | spread ≤ 25 bps, datos ≤ 120 s | Si no, no entra. La edad es la del libro según el exchange (un nodo con un libro congelado no pasa por dato fresco) |
 | Apalancamiento | `DESK_LEVERAGE` (5x), aislado | Se baja si la liquidación quedaría antes que el SL |
+
+Los límites diario y de drawdown se comprueban también al evaluar cada entrada con la cuenta del momento (un
+comando que llega entre ciclos no abre si la cuenta ya está fuera de límites). Los **depósitos, retiradas y
+transferencias** perp↔spot no cuentan como PnL: la mesa detecta el cambio de equity que no explican las
+ejecuciones ni el PnL no realizado, lo avisa y lo descuenta del máximo de equity y de la referencia del día
+(retirar un 10 % no dispara el halt por drawdown ni cierra las posiciones).
 
 Dimensionamiento: `notional = unidades × DESK_UNIT_MARGIN_USD × apalancamiento`, recortado por las reglas
 anteriores y por el margen disponible. Ejemplo: `long HYPE` con 500 USD/unidad y HYPE limitado a 2x → 1.000 USD
@@ -216,14 +236,23 @@ de notional, SL al 1,5 % → riesgo ≈ 16 USD (0,16 %).
 ## Ejecución
 
 - **Entrada**: zona/límite → orden límite Gtc (caduca a los `DESK_ENTRY_TTL_MINUTES`); mercado → IOC con
-  precio máximo (`DESK_MARKET_SLIPPAGE_BPS`).
+  precio máximo (`DESK_MARKET_SLIPPAGE_BPS`). La operación (con su SL/TP aprobados) se registra *antes* de
+  enviar: si el envío da timeout pero la orden llegó al exchange, la mesa responde "ESTADO INCIERTO: no la
+  repitas" y la reconciliación la encuentra y la protege con esos niveles (o la descarta si no aparece).
+- **Cancelar / caducar**: una entrada sólo se olvida cuando su cancelación se confirma; si falla y la orden se
+  ejecuta, la posición conserva su SL/TP.
+- **Cierres** (`cierra`, `cierra todo`, kill, límites de riesgo): IOC con un 5 % de tolerancia (creciente en
+  cada reintento), no los 10 bps de las entradas. Si el cierre se ejecuta a medias o se rechaza, se reintenta
+  en la reconciliación (hasta 6 intentos; después avisa).
 - **Brackets**: al ejecutarse la entrada se colocan STOP y TAKE-PROFIT *reduce-only* por el tamaño abierto
   (ajustados si la entrada se llena por partes: primero la orden nueva, luego se cancela la vieja).
 - **OCO**: si salta el SL se cancela el TP y viceversa; el PnL neto (con comisiones) se registra en
   `trades.csv` y alimenta el control de rachas.
 - **Reconciliación cada ciclo**: re-coloca SL/TP que falten, cancela órdenes reduce-only huérfanas, detecta
   posiciones cerradas fuera de la mesa y **adopta** posiciones sin bracket (p. ej. tras perder el estado)
-  poniéndoles el SL por defecto. Si el exchange rechaza el SL 3 veces seguidas, la posición se cierra.
+  poniéndoles el SL por defecto (nunca más allá de la liquidación). Si el exchange rechaza el SL 3 veces seguidas
+  (o no se puede colocar por fallos de conexión 10 veces), la posición se cierra. Cada moneda se procesa por
+  separado: un fallo en una no deja sin SL a las demás.
 
 ---
 
@@ -240,8 +269,10 @@ de notional, SL al 1,5 % → riesgo ≈ 16 USD (0,16 %).
    abierta (debe conservar su SL) y comprueba todo en la web de Hyperliquid.
 4. ☐ Ajusta el riesgo a la cuenta real (`unidad`, `riesgo`, `perdida diaria`, `drawdown`); empieza pequeño.
 5. ☐ Activa la operativa automática en testnet unos días (`auto on`).
-6. ☐ Sólo entonces mainnet: `DESK_HL_MAINNET=true` (la consola lo anuncia: `MODO LIVE ... MAINNET (DINERO REAL)`).
-7. ☐ Vigila: `python -m desk status`, `state/outbox.log`, alertas si el healthcheck falla. Ten a mano `kill`.
+6. ☐ Sólo entonces mainnet: `DESK_HL_MAINNET=true` (la consola lo anuncia: `MODO LIVE ... MAINNET (DINERO REAL)`),
+   **con otro `DESK_STATE_DIR`**: `profile.json` guarda la red y la cuenta del estado y la mesa se niega a arrancar
+   en mainnet (u otra cuenta) sobre el estado de testnet (su máximo de equity dispararía el halt por drawdown).
+7. ☐ Vigila: `python -m desk status`, `state/outbox.log`, alertas si `python -m desk health` falla. Ten a mano `kill`.
 
 El modo live exige `DESK_LIVE_CONFIRM=I_UNDERSTAND_REAL_MONEY`, `HL_PRIVATE_KEY` y datos de Hyperliquid; la
 clave nunca se escribe en logs ni en el estado. Al detener la mesa, los SL/TP quedan puestos en el exchange.
@@ -276,7 +307,13 @@ tmux new -s desk 'source venv/bin/activate && python -m desk run'
 
 En los tres casos `SIGTERM`/Ctrl+C termina el ciclo en curso, guarda el estado y sale; al arrancar de nuevo
 recupera posiciones, brackets, límites de riesgo del día y comandos pendientes del inbox (cada línea del inbox
-se ejecuta como mucho una vez).
+se ejecuta como mucho una vez). Un `kill`, `pausa` o halt se guarda en el momento: sobrevive a un corte brusco
+(SIGKILL, OOM). Tampoco se repite la señal automática de una vela ya evaluada.
+
+**Salud**: cada ciclo escribe `health.json` (racha de fallos, etapas que fallan, última lectura buena de la
+cuenta y los fills) y `heartbeat` sólo cuando el ciclo leyó la cuenta y los fills. `python -m desk health`
+devuelve 1 si la mesa no completa ciclos en 10 min o no ve el exchange desde hace 10 min (es el HEALTHCHECK del
+Dockerfile; úsalo en cron/alertas con systemd). `python -m desk status` muestra los mismos avisos.
 
 ---
 
@@ -285,7 +322,7 @@ se ejecuta como mucho una vez).
 ```
 trading-bot/
 ├── desk/
-│   ├── __main__.py        CLI: run / send / status
+│   ├── __main__.py        CLI: run / send / status / health
 │   ├── desk.py            TradingDesk: bucle 24/7, comandos, operativa automática, estado
 │   ├── engine.py          ExecutionEngine: entradas, brackets SL/TP, OCO, reconciliación
 │   ├── risk.py            RiskManager: tamaño, halts diario/drawdown, cooldown, pausa
@@ -313,8 +350,9 @@ En `state/` (o `DESK_STATE_DIR`; `state/fast/` con `--fast`):
 | `equity.csv` | Curva de equity (cada minuto) |
 | `events.jsonl` | Todo lo que pasa: comandos, decisiones de riesgo, órdenes, halts, señales |
 | `desk.log` | Log técnico (rota a los 5 MB) |
-| `status.json` | Último estado (lo muestra `python -m desk status`) |
-| `heartbeat` | Latido de cada ciclo (healthcheck) |
+| `status.json` | Último estado (lo muestra `python -m desk status`); sin cuenta, una línea "SIN DATOS DE LA CUENTA" |
+| `health.json` | Salud de cada ciclo: racha de fallos, etapas que fallan, última lectura buena de cuenta y fills |
+| `heartbeat` | Hora del último ciclo que leyó la cuenta y los fills (healthcheck) |
 | `paper_broker.json`, `engine.json`, `risk.json`, `desk.json`, `profile.json` | Estado para sobrevivir a reinicios |
 
 Para empezar de cero en paper: detén la mesa y borra `state/`.
@@ -330,4 +368,6 @@ python -m pytest -q
 Todos corren sin red (mercados falsos/simulados y SDKs simulados), incluidos los flujos completos: comando →
 orden en zona → ejecución → SL/TP → TP con OCO → PnL; stop-loss; cierra todo; kill; halts diario y de
 drawdown con cierre; reinicio con estado persistido; inbox con offset; confirmación de comandos de IA;
-operativa automática con pausa/auto off; y fallos de datos que no tumban el bucle.
+operativa automática con pausa/auto off; fallos de datos que no tumban el bucle; y regresiones de casos
+límite (SL más allá de la liquidación, cierres que no casan, timeouts con la orden ya en el exchange,
+fills re-entregados, inbox reescrito, retiradas, salud, perfil testnet/mainnet).

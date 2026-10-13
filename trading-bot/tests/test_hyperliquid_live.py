@@ -573,3 +573,28 @@ def test_real_sdk_exchange_signs_our_orders_without_network(market, live_setting
     b.place_order("HYPE", True, 11.73, MARKET)
     wire = sent[-1][1]["action"]["orders"][0]
     assert wire["a"] == 2 and wire["t"] == {"limit": {"tif": "Ioc"}} and wire["s"] == "11.73"
+
+
+# --------------------------------------------------------------------------- regresiones (revisión)
+def test_restart_with_saved_cursor_does_not_redeliver_the_last_fill(market, live_settings, clock, fx, fi, broker):
+    # El cursor es inclusivo (ms del último fill): sin las claves vistas, un reinicio volvía a entregarlo y el motor
+    # duplicaba la posición, el SL/TP y la comisión.
+    t0 = int(clock.now() * 1000)
+    fi.fills = [fill_row(1001, 77, t0 + 1_000)]
+    assert len(broker.poll_fills()) == 1
+    cursor, seen = broker.fills_cursor_ts, broker.fills_seen_keys
+    assert cursor == (t0 + 1_000) / 1000 and seen == ["1001"]
+    b2 = LiveHyperliquidBroker(market, live_settings, clock, exchange=fx, info=fi, fills_since_ts=cursor,
+                               fills_seen=seen)
+    assert b2.poll_fills() == []
+    fi.fills.append(fill_row(1002, 78, t0 + 1_000))            # otro fill del mismo ms: sí se entrega
+    assert [f.order_id for f in b2.poll_fills()] == ["78"]
+
+
+def test_close_without_price_uses_wide_tolerance_even_with_wide_spread(broker, fx, market):
+    market.set_bid_ask("SOL", 149.775, 150.225)               # spread de 30 bps
+    broker.place_order("SOL", False, 40, MARKET, reduce_only=True, tag="kill")
+    limit = fx.calls[-1][4]
+    assert limit < 149.775 * 0.99                              # cruza el mejor bid con margen: casa
+    broker.place_order("SOL", True, 1, MARKET, tag="entry")    # las entradas siguen con 10 bps
+    assert fx.calls[-1][4] == pytest.approx(150.0 * 1.001, rel=1e-4)

@@ -28,6 +28,8 @@ Cada operación gestionada es un ``Bracket`` (uno por moneda) con este ciclo de 
   ``risk_per_trade_pct`` del equity.
 - Cierres a mercado: IOC con un límite ``CLOSE_SLIPPAGE`` peor que la referencia (mid o mark de la posición;
   la tolerancia crece en cada reintento). Lo importante es salir: no se usa el margen estrecho de las entradas.
+- ``on_fills`` es idempotente ante la re-entrega del último instante ya aplicado (el cursor de fills de live es
+  inclusivo y un reinicio puede volver a entregarlo): las claves de esos fills se guardan con el estado.
 
 El estado de los brackets se guarda con ``Journal.save_json("engine")`` y se recarga al construir.
 Los mensajes legibles para el operador se acumulan en ``messages`` (``pop_messages()``).
@@ -219,6 +221,9 @@ class ExecutionEngine:
         self._saved: Optional[dict] = None
         self.load_error = ""
         self.close_failures: dict[str, str] = {}          # monedas que el último close_all() no pudo cerrar
+        # Fills aplicados en el último instante (ts) visto: {clave: veces}. Una re-entrega se descarta.
+        self._last_fill_ts = 0.0
+        self._last_fill_keys: dict[str, int] = {}
         if journal is not None and load:
             self.load_state()
 
@@ -413,6 +418,7 @@ class ExecutionEngine:
         Devuelve las operaciones cerradas (su ``pnl`` va a ``RiskManager.record_trade_result``)."""
         closed: list[ClosedTrade] = []
         touched: dict[str, dict[str, float]] = {}
+        fills = self._drop_redelivered(fills)
         for f in fills:
             if self.journal is not None:
                 self.journal.fill(f)
@@ -479,6 +485,34 @@ class ExecutionEngine:
         if fills:
             self.save_state()
         return closed
+
+    @staticmethod
+    def _fill_key(f: Fill) -> str:
+        return f"{f.order_id}|{f.coin}|{'B' if f.is_buy else 'S'}|{f.size:.10g}|{f.price:.10g}|{f.ts:.3f}"
+
+    def _drop_redelivered(self, fills: list[Fill]) -> list[Fill]:
+        """Quita los fills ya aplicados en el último instante visto (re-entrega tras un reinicio con el cursor
+        inclusivo de live) y actualiza ese registro. Un fill idéntico dentro del mismo lote sí se aplica (dos
+        contrapartidas del mismo tamaño y precio en la misma orden). Sin hora (``ts`` 0) no se deduplica."""
+        prior = dict(self._last_fill_keys)
+        out: list[Fill] = []
+        for f in fills:
+            key = self._fill_key(f)
+            if 0 < f.ts <= self._last_fill_ts and prior.get(key, 0) > 0:
+                prior[key] -= 1
+                log.warning("%s: fill ya aplicado re-entregado (%s); se ignora", f.coin, key)
+                self._event("fill_duplicate", fill=f.to_dict())
+                continue
+            out.append(f)
+        for f in out:
+            if f.ts <= 0:
+                continue
+            if f.ts > self._last_fill_ts:
+                self._last_fill_ts, self._last_fill_keys = f.ts, {}
+            if f.ts == self._last_fill_ts:
+                key = self._fill_key(f)
+                self._last_fill_keys[key] = self._last_fill_keys.get(key, 0) + 1
+        return out
 
     def _exit_role(self, br: Bracket, f: Fill) -> str:
         oid = f.order_id
@@ -1011,6 +1045,7 @@ class ExecutionEngine:
             "version": STATE_VERSION,
             "brackets": {c: b.to_dict() for c, b in sorted(self.brackets.items())},
             "retry_cancel": [list(x) for x in self._retry_cancel],
+            "last_fills": {"ts": self._last_fill_ts, "keys": dict(sorted(self._last_fill_keys.items()))},
         }
 
     def save_state(self, force: bool = False) -> None:
@@ -1036,6 +1071,12 @@ class ExecutionEngine:
             except (KeyError, TypeError, ValueError) as e:
                 log.error("bracket %s ilegible (%s); se ignora (reconcile adoptará la posición)", coin, e)
         self._retry_cancel = [(str(c), str(o)) for c, o in data.get("retry_cancel") or [] if c and o]
+        last = data.get("last_fills") if isinstance(data.get("last_fills"), dict) else {}
+        try:
+            self._last_fill_ts = float(last.get("ts") or 0.0)
+            self._last_fill_keys = {str(k): int(v) for k, v in (last.get("keys") or {}).items() if int(v) > 0}
+        except (TypeError, ValueError, AttributeError):
+            self._last_fill_ts, self._last_fill_keys = 0.0, {}
         self._saved = self.snapshot()
         if self.brackets:
             log.info("motor: %d bracket(s) recargados: %s", len(self.brackets), ", ".join(sorted(self.brackets)))

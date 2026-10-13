@@ -12,7 +12,7 @@ from dataclasses import replace
 import pytest
 
 from desk.engine import CLOSING, OPEN, PENDING, PLACE_GRACE_S, ExecutionEngine, fmt_px, fmt_usd
-from desk.exchange.base import Broker
+from desk.exchange.base import Broker, BrokerError, MarketDataError
 from desk.exchange.paper import PaperBroker
 from desk.journal import Journal
 from desk.models import (AccountState, EntryMode, Fill, Order, OrderKind, OrderStatus, Position, RiskDecision, Side,
@@ -494,3 +494,260 @@ def test_corrupt_engine_state_is_ignored(settings, clock, market, paper):
     e = ExecutionEngine(paper, market, settings, clock, j)
     assert e.brackets == {}
     assert list(settings.state_path.glob("engine.json.corrupt-*"))
+
+
+# --------------------------------------------------------------------------- regresiones (revisión)
+class FlakyBroker(RecordingBroker):
+    """RecordingBroker con fallos de transporte a voluntad: ``fail`` = {(moneda, tipo)} lanza ``BrokerError``;
+    con ``after`` la orden llega al exchange antes del fallo (timeout tras aceptarla)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail: set[tuple[str, OrderKind]] = set()
+        self.after = False
+        self.cancel_ok = True
+
+    def place_order(self, coin, is_buy, size, kind, **kw):
+        if (coin, OrderKind(kind)) in self.fail:
+            if self.after:
+                super().place_order(coin, is_buy, size, kind, **kw)
+            raise BrokerError(f"order {coin}: ReadTimeout")
+        return super().place_order(coin, is_buy, size, kind, **kw)
+
+    def cancel(self, coin, order_id):
+        if not self.cancel_ok:
+            self.calls.append(("cancel-fail", order_id))
+            return False
+        return super().cancel(coin, order_id)
+
+
+@pytest.fixture
+def flaky():
+    return FlakyBroker()
+
+
+@pytest.fixture
+def fengine(flaky, market, settings, clock, journal):
+    return ExecutionEngine(flaky, market, settings, clock, journal)
+
+
+def _sol_long(engine, paper, size=31.91, lev=5, sl=147.02, tp=156.02):
+    d = RiskDecision(True, "ok", lev, size, size * 150.02, 150.02, sl, tp)
+    engine.open(TradeIntent("SOL", LONG, 1, EntryMode.MARKET, "command"), d)
+    engine.on_fills(paper.poll_fills())
+    engine.pop_messages()
+
+
+def test_set_stop_beyond_liquidation_or_risk_budget_is_rejected(engine, paper):
+    # 'stop SOL 1' (un % sin el símbolo): antes se aceptaba y la posición se liquidaba antes que el stop.
+    _sol_long(engine, paper)
+    sl_id = engine.brackets["SOL"].sl_order_id
+    with pytest.raises(ValueError, match="más allá de la liquidación"):
+        engine.set_stop("SOL", 1.0)
+    with pytest.raises(ValueError, match="máximo por operación"):
+        engine.set_stop("SOL", 125.0)                  # antes de la liquidación, pero ~8x el riesgo aprobado
+    br = engine.brackets["SOL"]
+    assert br.sl == 147.02 and br.sl_order_id == sl_id and paper.get_order(sl_id).is_open
+    assert "SL movido a 148" in engine.set_stop("SOL", 148.0)       # acercarlo siempre se puede
+
+
+def test_set_stop_on_pending_entry_cannot_widen_beyond_budget_or_liquidation(engine):
+    engine.open(hype_intent(), hype_decision())        # 11.72 HYPE @ 85.288, 2x, riesgo aprobado ~$15
+    with pytest.raises(ValueError, match="liquidación"):
+        engine.set_stop("HYPE", 10.0)
+    with pytest.raises(ValueError, match="máximo por operación"):
+        engine.set_stop("HYPE", 60.0)
+    assert engine.brackets["HYPE"].sl == 84.009
+
+
+def test_adopted_position_default_stop_never_beyond_liquidation(rengine, rec):
+    rec.positions["SOL"] = Position("SOL", 10.0, 150.0, leverage=50, mark_px=150.0, liq_px=148.0)
+    rengine.reconcile(rec.account())
+    br = rengine.brackets["SOL"]
+    assert br.origin == "adopted" and 148.0 < br.sl < 150.0        # el 1.5 % por defecto (147.75) no vale
+    assert br.sl >= 150.0 - (150.0 - 148.0) / 1.10 - 0.01
+
+
+def test_failed_cancel_on_expiry_keeps_the_planned_bracket(fengine, flaky, clock, settings):
+    order = fengine.open(hype_intent(), hype_decision(entry=85.288, size=100.0, sl=85.032, tp=85.80))
+    flaky.cancel_ok = False
+    clock.advance(settings.entry_ttl_minutes * 60 + 1)
+    fengine.reconcile(flaky.account())
+    br = fengine.brackets["HYPE"]
+    assert br.status == PENDING and br.canceling
+    assert "no se confirmó" in " ".join(fengine.pop_messages())
+    fengine.on_fills([flaky.fill(order.id, 100.0, 85.288)])        # se ejecuta antes de poder cancelarla
+    br = fengine.brackets["HYPE"]
+    assert br.status == OPEN and br.origin == "command" and (br.sl, br.tp) == (85.032, 85.80)
+    assert [c[5] for c in flaky.placed(OrderKind.STOP)] == [85.032]
+    assert [c[5] for c in flaky.placed(OrderKind.TAKE_PROFIT)] == [85.80]
+
+
+def test_failed_cancel_is_retried_and_bracket_dropped_once_confirmed(fengine, flaky):
+    order = fengine.open(hype_intent(), hype_decision())
+    flaky.cancel_ok = False
+    assert fengine.cancel("HYPE") == 0
+    assert fengine.brackets["HYPE"].canceling                       # no se anuncia "cancelada"
+    flaky.cancel_ok = True
+    fengine.reconcile(flaky.account())
+    assert "HYPE" not in fengine.brackets and flaky.orders[order.id].status is OrderStatus.CANCELED
+
+
+def test_close_is_retried_while_position_remains(rengine, rec, clock, market):
+    from desk.engine import CLOSE_RETRY_S, MAX_CLOSE_ATTEMPTS
+    rec.positions["SOL"] = Position("SOL", 100.0, 155.0, leverage=5, mark_px=150.0, liq_px=125.0)
+    rengine.reconcile(rec.account())
+    first = rengine.close("SOL")
+    # Cierre con tolerancia amplia (5 % del mid), no los 10 bps de las entradas.
+    assert first.reduce_only and first.price == pytest.approx(market.mid("SOL") * 0.95, rel=1e-4)
+    rengine.on_fills([rec.fill(first.id, 40.0, 149.9)])             # IOC parcial: quedan 60
+    assert rengine.brackets["SOL"].status == CLOSING
+    clock.advance(CLOSE_RETRY_S)
+    rengine.reconcile(rec.account())
+    closes = [c for c in rec.placed(OrderKind.MARKET)]
+    assert len(closes) == 2 and closes[-1][4] == 60.0
+    assert closes[-1][5] == pytest.approx(market.mid("SOL") * 0.90, rel=1e-4)   # más tolerancia al reintentar
+    rec.reject_kinds = {OrderKind.MARKET}                           # y si el exchange lo rechaza, se sigue intentando
+    for _ in range(MAX_CLOSE_ATTEMPTS + 2):
+        clock.advance(CLOSE_RETRY_S)
+        rengine.reconcile(rec.account())
+    assert len(rec.placed(OrderKind.MARKET)) == MAX_CLOSE_ATTEMPTS
+    assert "no se completó" in " ".join(rengine.pop_messages())
+
+
+def test_late_entry_fill_after_reconcile_is_not_counted_twice(rengine, rec):
+    order = rengine.open(hype_intent(), hype_decision())
+    late = rec.fill(order.id, 11.72, 85.288)                        # la cuenta lo ve antes que el fill
+    rengine.reconcile(rec.account())
+    assert rengine.brackets["HYPE"].position == 11.72
+    rengine.on_fills([late])
+    br = rengine.brackets["HYPE"]
+    assert (br.position, br.filled, br.sl_size) == (11.72, 11.72, 11.72)
+    assert len(rec.placed(OrderKind.STOP)) == 1
+    closed = rengine.on_fills([rec.fill(br.sl_order_id, 11.72, 84.0, realized=-15.1)])
+    assert closed[0].size == 11.72 and closed[0].exit_reason == "sl"
+
+
+def test_close_all_keeps_going_when_one_coin_fails(engine, paper, market, monkeypatch):
+    for coin, size in (("BTC", 0.03), ("ETH", 0.8), ("SOL", 16.0)):
+        paper.place_order(coin, True, size, OrderKind.MARKET)
+    paper.poll_fills()
+    real = market.bid_ask
+
+    def no_btc(coin):
+        if coin == "BTC":
+            raise MarketDataError("BTC: libro vacío por un lado")
+        return real(coin)
+    monkeypatch.setattr(market, "bid_ask", no_btc)
+    orders = engine.close_all("kill")
+    assert sorted(o.coin for o in orders) == ["ETH", "SOL"]
+    assert list(engine.close_failures) == ["BTC"]
+    engine.on_fills(paper.poll_fills())
+    assert list(paper.account().positions) == ["BTC"]
+
+
+def test_entry_timeout_keeps_approved_bracket_and_protects_the_fill(fengine, flaky):
+    flaky.fail, flaky.after = {("HYPE", OrderKind.MARKET)}, True
+    with pytest.raises(BrokerError):
+        fengine.open(hype_intent(EntryMode.MARKET), hype_decision(entry=86.29, size=11.58, sl=85.9, tp=87.07))
+    assert fengine.is_unconfirmed("HYPE")
+    oid = next(iter(flaky.orders))
+    flaky.fill(oid, 11.58, 86.29)                                   # la orden sí se ejecutó en el exchange
+    flaky.fail = set()
+    fengine.reconcile(flaky.account())
+    br = fengine.brackets["HYPE"]
+    assert br.origin == "command" and br.status == OPEN and (br.sl, br.tp) == (85.9, 87.07)
+    assert [c[5] for c in flaky.placed(OrderKind.STOP)] == [85.9]  # no el SL por defecto de una adopción
+
+
+def test_unconfirmed_limit_entry_is_found_or_dropped(fengine, flaky, clock, settings):
+    flaky.fail, flaky.after = {("HYPE", OrderKind.LIMIT)}, True
+    with pytest.raises(BrokerError):
+        fengine.open(hype_intent(), hype_decision())
+    flaky.fail = set()
+    fengine.reconcile(flaky.account())
+    br = fengine.brackets["HYPE"]
+    assert br.entry_order_id == "o1" and "está en el exchange" in " ".join(fengine.pop_messages())
+    clock.advance(settings.entry_ttl_minutes * 60 + 1)              # y caduca con su TTL
+    fengine.reconcile(flaky.account())
+    assert "HYPE" not in fengine.brackets and flaky.orders["o1"].status is OrderStatus.CANCELED
+    flaky.fail, flaky.after = {("SOL", OrderKind.LIMIT)}, False    # nunca llegó: se descarta
+    with pytest.raises(BrokerError):
+        fengine.open(TradeIntent("SOL", LONG, 1, EntryMode.LIMIT, "command", limit_px=140.0),
+                     RiskDecision(True, "ok", 5, 10.0, 1400.0, 140.0, 138.0, 144.0))
+    fengine.reconcile(flaky.account())
+    fengine.reconcile(flaky.account())
+    assert "SOL" not in fengine.brackets and "no aparece en el exchange" in " ".join(fengine.pop_messages())
+
+
+def test_stop_failure_on_one_coin_does_not_lose_other_coins_trades(fengine, flaky):
+    btc = fengine.open(TradeIntent("BTC", LONG, 1, EntryMode.LIMIT, "command", limit_px=83_000.0),
+                       RiskDecision(True, "ok", 5, 0.03, 2490.0, 83_000.0, 82_000.0, 85_000.0))
+    fengine.on_fills([flaky.fill(btc.id, 0.03, 83_000.0)])
+    sol = fengine.open(TradeIntent("SOL", LONG, 1, EntryMode.LIMIT, "command", limit_px=149.0),
+                       RiskDecision(True, "ok", 5, 16.0, 2384.0, 149.0, 147.0, 153.0))
+    flaky.fail = {("SOL", OrderKind.STOP)}
+    batch = [flaky.fill(fengine.brackets["BTC"].sl_order_id, 0.03, 82_000.0, realized=-30.0),
+             flaky.fill(sol.id, 16.0, 149.0)]
+    closed = fengine.on_fills(batch)
+    assert [t.coin for t in closed] == ["BTC"]                     # la pérdida de BTC llega al riesgo
+    br = fengine.brackets["SOL"]
+    assert br.status == OPEN and br.sl_errors == 1 and br.tp_order_id
+    from desk.engine import MAX_SL_ERRORS
+    for _ in range(MAX_SL_ERRORS):                                  # SL imposible por conexión: cierre de seguridad
+        fengine.reconcile(flaky.account())
+    assert fengine.brackets["SOL"].status == CLOSING and fengine.brackets["SOL"].exit_reason == "no_sl"
+
+
+def test_reconcile_failure_on_one_coin_does_not_starve_the_others(fengine, flaky, clock):
+    from desk.engine import CLOSE_RETRY_S
+    flaky.positions["BTC"] = Position("BTC", 0.03, 83_000.0, leverage=5, mark_px=83_000.0)
+    flaky.positions["SOL"] = Position("SOL", 16.0, 150.0, leverage=5, mark_px=150.0)
+    flaky.fail = {("BTC", OrderKind.MARKET), ("BTC", OrderKind.STOP)}
+    fengine.reconcile(flaky.account())                              # adopta las dos; el SL de BTC falla
+    with pytest.raises(BrokerError):
+        fengine.close("BTC")                                        # el cierre de BTC también falla (red)
+    flaky.orders.clear()                                            # SL/TP de SOL desaparecen del exchange
+    clock.advance(CLOSE_RETRY_S)
+    fengine.reconcile(flaky.account())                              # BTC vuelve a fallar...
+    assert {o.coin for o in flaky.open_orders() if o.kind is OrderKind.STOP} == {"SOL"}   # ...SOL se protege
+
+
+def test_redelivered_fills_after_restart_are_ignored(engine, paper, market, settings, clock, journal):
+    d = hype_decision(entry=86.29, size=11.58, sl=85.0, tp=88.87)
+    engine.open(hype_intent(EntryMode.MARKET), d)
+    fills = paper.poll_fills()
+    engine.on_fills(fills)
+    br = engine.brackets["HYPE"]
+    before = (br.filled, br.position, br.fees, br.sl_order_id)
+    engine2 = ExecutionEngine(paper, market, settings, clock, Journal(settings.state_path, clock))   # reinicio
+    assert engine2.on_fills(list(fills)) == []                      # cursor inclusivo: el último fill otra vez
+    br2 = engine2.brackets["HYPE"]
+    assert (br2.filled, br2.position, br2.fees, br2.sl_order_id) == before
+    rows = list(csv.DictReader(open(settings.state_path / "fills.csv", encoding="utf-8")))
+    assert len(rows) == 1
+    twin = replace(fills[0], order_id="otra")                        # mismo instante, otra orden: sí cuenta
+    engine2.on_fills([twin])
+    assert engine2.brackets["HYPE"].filled == pytest.approx(2 * 11.58)
+
+
+def test_old_exit_fill_is_not_imputed_to_a_new_trade(rengine, rec, clock):
+    # Re-entrega tras reiniciar: el cierre de la operación ANTERIOR no puede caer en el bracket nuevo (falseaba su
+    # PnL y el que va al riesgo).
+    old_ts = clock.now()
+    clock.advance(60)
+    order = rengine.open(hype_intent(EntryMode.MARKET), hype_decision(entry=86.29, size=11.58, sl=85.0, tp=88.87))
+    rengine.on_fills([rec.fill(order.id, 11.58, 86.29, ts=clock.now())])
+    old_exit = Fill(order_id="viejo", coin="HYPE", is_buy=False, size=11.58, price=84.0, fee=0.4, ts=old_ts,
+                    tag="sl", realized_pnl=-23.4)
+    assert rengine.on_fills([old_exit]) == []
+    br = rengine.brackets["HYPE"]
+    assert br.position == 11.58 and br.realized == 0.0 and br.exit_size == 0.0
+    assert "fuera de una operación gestionada" in " ".join(rengine.pop_messages())
+
+
+def test_identical_partial_fills_in_separate_batches_without_time_are_applied(rengine, rec):
+    order = rengine.open(hype_intent(), hype_decision())
+    rengine.on_fills([rec.fill(order.id, 3.0, 85.288)])
+    rengine.on_fills([rec.fill(order.id, 3.0, 85.288)])             # otra contrapartida igual (sin hora)
+    assert rengine.brackets["HYPE"].filled == 6.0

@@ -43,6 +43,8 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   con cabecera `X-API-Key`; `data["symbols"][coin]["longs"|"shorts"]`, cada posición con `liq_price` y `value`.
   Sin clave → `[]`. Cache corto (30 s).
 - `requests.Session`, timeout 10 s, reintentos con backoff en 429/5xx, errores → `MarketDataError`.
+- `last_update_ts(coin)` = hora del último libro **según el exchange** (`time` del l2Book, nunca posterior a la
+  petición); sin libro, la de la última petición. Un nodo que sirve un libro congelado no pasa por dato fresco.
 - Inyectable `session` para tests (los tests NO usan red: mockear la sesión).
 
 ### `desk/exchange/sim.py` — mercados offline
@@ -77,11 +79,14 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   `hyperliquid.utils.constants.MAINNET_API_URL/TESTNET_API_URL`) y `eth_account.Account.from_key`.
   Import perezoso (el resto del bot funciona sin el SDK instalado).
 - Sólo construible si `settings.validate()` pasó en modo live; testnet salvo `hl_mainnet=True`.
-- LIMIT → `{"limit":{"tif":...}}`; MARKET → IOC límite agresivo (mid ± `market_slippage_bps`);
+- LIMIT → `{"limit":{"tif":...}}`; MARKET → IOC límite agresivo (mid ± `market_slippage_bps`; un MARKET
+  `reduce_only` sin `price` usa `CLOSE_SLIPPAGE` = 5 %: con 10 bps un cierre no casa en cuanto el spread pasa de ~20 bps);
   STOP/TP → `{"trigger":{"triggerPx":px,"isMarket":True,"tpsl":"sl"|"tp"}}` con `reduce_only=True`.
   Precios con `round_price`, tamaños con `round_size`.
 - `account()` desde `info.user_state(address)`; `open_orders()` desde `info.frontend_open_orders`;
-  `poll_fills()` desde `info.user_fills_by_time` desde el último ts visto (dedupe por `tid`).
+  `poll_fills()` desde `info.user_fills_by_time` desde el último ts visto (inclusive; dedupe por `tid`).
+  Constructor con `fills_since_ts` y `fills_seen` (tids ya entregados en ese ms); `fills_cursor_ts` y
+  `fills_seen_keys` los expone para que la mesa los guarde: un reinicio no re-entrega el último fill.
 - Errores de transporte → `BrokerError`; respuestas `status != "ok"` o `statuses[i].error` → orden REJECTED.
 
 ### `desk/liquidity.py`
@@ -131,7 +136,10 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   `pausa`/`pause`, `reanuda`/`resume`, `auto on|off` / `automatico on|off`, `estado`/`status`/`posiciones`,
   `kill` / `panico` / `apaga todo`, `reset halt`, `apalancamiento 3` / `leverage 3` / `riesgo 0.5` / `unidad 250`
   (SET_PARAM con nombre canónico de `PARAM_ALIASES`), `si`/`confirmar`/`yes`/`confirm`, `no`/`cancelar`/`reject`,
-  `ayuda`/`help`.
+  `ayuda`/`help`. KILL admite sufijos de urgencia (`pánico ya`, `kill now`). `cierra todas las posiciones
+  abiertas` / `close all trades` = CLOSE_ALL (las palabras de relleno nunca se toman por moneda); `cierra todo BTC`
+  / `cancela todo HYPE` son ambiguos → None. `reset params` / `restablece parámetros` → `SET_PARAM` con
+  `param=PARAM_DEFAULTS` ("defaults") y sin `value`: la mesa vuelve a los parámetros de arranque.
 - Monedas: mayúsculas; acepta prefijos HIP-3 tipo `xyz:GOLD`.
 - `SET_SL`/`SET_TP` llevan `price` (precio absoluto) **o** `sl_pct`/`tp_pct` (`sl HYPE 2%`: distancia desde la
   entrada; la mesa lo convierte a precio). Sin moneda (`sl 2%`, `tp 3`) son `SET_PARAM` de los valores por defecto.
@@ -156,6 +164,13 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   rechaza si halted/pausado, `max_open_positions` alcanzado, ya hay posición en la moneda, spread >
   `max_spread_bps`, datos viejos, notional < mínimo; TP por defecto a `default_tp_r` R.
   Tamaño redondeado con `round_size`. Las órdenes de reducción/cierre nunca pasan por aquí (siempre permitidas).
+- `evaluate` comprueba también pérdida diaria y drawdown con el `account.equity` recibido (puede ir por delante
+  del último `update()`: comandos entre ciclos). Collar de las entradas límite/zona: si cruzan el libro más de
+  `LIMIT_MAX_CROSS_PCT` (1 %) o reposan a más de `LIMIT_MAX_DISTANCE_PCT` (20 %) del mid → rechazo ("¿precio mal
+  escrito?"), nunca una conversión silenciosa a mercado.
+- `apply_cash_flow(amount)`: depósito (+) / retirada o transferencia (−) ajena a la operativa; se traslada al
+  máximo de equity y a la referencia del día (no es ganancia ni pérdida). La detecta la mesa.
+- Utilidades: `estimated_liq_px(entry, lev, is_long, mmr)`, `maintenance_rate(settings, max_lev)`, `LIQ_BUFFER`.
 
 ### `desk/engine.py` — `ExecutionEngine`
 - `ExecutionEngine(broker, market, settings, clock, journal=None, *, load=True)`; estado persistible de brackets
@@ -164,23 +179,36 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   → `ClosedTrade` (coin, side, origin, size, entry_px, exit_px, `pnl` neto = realizado − comisiones, gross_pnl,
   fees, exit_reason `sl|tp|close|close_all|flatten|kill|no_sl|liquidation|external`, opened_ts, closed_ts).
 - `open(intent, decision, *, cmd_id="") -> Order`: fija apalancamiento (un `ValueError` del broker → orden
-  `REJECTED` local), coloca entrada (ZONE/LIMIT → LIMIT Gtc en `decision.entry_px`; MARKET → MARKET con peor
-  precio `entry_px ± market_slippage_bps`), registra bracket pendiente {coin, sl, tp, origin, expires_ts (sólo
-  límites, `entry_ttl_minutes`)}. Rechaza si ya hay un bracket en la moneda.
+  `REJECTED` local), registra y **guarda** el bracket pendiente {coin, sl, tp, origin, expires_ts (sólo límites,
+  `entry_ttl_minutes`)} y *después* coloca la entrada (ZONE/LIMIT → LIMIT Gtc en `decision.entry_px`; MARKET →
+  MARKET con peor precio `entry_px ± market_slippage_bps`). Rechaza si ya hay un bracket en la moneda. Un
+  `BrokerError` al enviar se propaga pero el bracket queda *sin confirmar* (`is_unconfirmed(coin)`): `reconcile`
+  busca la orden en el exchange (misma moneda, lado y tamaño) o la posición y la protege con el SL/TP aprobados,
+  o la descarta tras 2 comprobaciones.
 - `on_fills(fills) -> list[ClosedTrade]`: identifica cada fill por id de orden (entrada/SL/TP/cierre) y, si no,
   por etiqueta y dirección. Entrada (total o parcial) → coloca/ajusta STOP y TAKE_PROFIT reduce-only por el tamaño
   abierto (la orden nueva antes de cancelar la vieja). Posición plana tras SL/TP/cierre → cancela la otra (OCO) y
   el resto de entrada, escribe `trades.csv` y devuelve la operación (la mesa pasa `pnl` a
-  `RiskManager.record_trade_result`). Fills sin bracket → aviso y diario.
+  `RiskManager.record_trade_result`). Fills sin bracket → aviso y diario. Idempotente ante la re-entrega del
+  último instante ya aplicado (claves persistidas en `engine.json`); un fill anterior a la creación del bracket
+  (− 5 s) no se le imputa. Lo que `reconcile` ya dio por ejecutado sin fill (`assumed`) no se suma dos veces.
+  Cada moneda se procesa aparte: un `BrokerError` al proteger una no pierde las operaciones cerradas de otras.
 - `reconcile(account) -> list[ClosedTrade]`: caduca entradas no ejecutadas; descarta entradas que desaparecen del
   exchange (2 comprobaciones); da por abierta una entrada cuya posición aparece sin fill; cierra brackets cuya
   posición desapareció (2 comprobaciones, `external`); re-coloca SL/TP que falten (con 5 s de gracia tras colocar);
-  cierra la posición si el SL se rechaza 3 veces; adopta posiciones sin bracket (origen `adopted`, reutiliza
-  STOP/TP reduce-only existentes o pone SL `default_sl_pct`); cancela reduce-only huérfanas sin posición.
-- `close(coin, reason="close", *, account=None) -> Order|None`, `close_all(reason="close_all") -> list[Order]`,
-  `set_stop(coin, px) -> str`, `set_take_profit(coin, px) -> str` (`ValueError` con el motivo si el nivel queda del
-  lado equivocado o no hay posición/entrada; sobre una entrada pendiente sólo cambia el nivel), `cancel(coin|None)
-  -> int` (sólo órdenes de entrada: los SL/TP de posiciones abiertas se mantienen), `reference_px(coin)`.
+  cierra la posición si el SL se rechaza 3 veces (o no se puede colocar por conexión 10 veces); adopta posiciones sin
+  bracket (origen `adopted`, reutiliza STOP/TP reduce-only existentes o pone SL `default_sl_pct`, nunca más allá de
+  la liquidación); cancela reduce-only huérfanas sin posición; reintenta (cada 10 s, hasta 6 envíos) los cierres
+  `CLOSING` que dejaron posición. Una entrada que caduca o se cancela sólo se descarta si la cancelación se
+  confirma (si no, queda `canceling` con su SL/TP). Cada moneda por separado (un fallo no frena a las demás).
+- `close(coin, reason="close", *, account=None) -> Order|None` (IOC reduce-only con límite `CLOSE_SLIPPAGE` peor
+  que el mid, o que el mark de la posición sin datos de mercado; crece con cada reintento), `close_all(reason=
+  "close_all") -> list[Order]` (moneda a moneda: las que fallan van a `close_failures` {moneda: motivo} y no frenan
+  a las demás; no cuenta las órdenes rechazadas), `set_stop(coin, px) -> str`, `set_take_profit(coin, px) -> str`
+  (`ValueError` con el motivo si el nivel queda del lado equivocado, no hay posición/entrada, el SL queda más allá
+  de la liquidación −con `LIQ_BUFFER`− o, al ensancharlo, la pérdida superaría `risk_per_trade_pct` del equity;
+  sobre una entrada pendiente sólo cambia el nivel), `cancel(coin|None) -> int` (sólo órdenes de entrada
+  confirmadas: los SL/TP de posiciones abiertas se mantienen), `reference_px(coin)`, `is_unconfirmed(coin)`.
 - Mensajes legibles para el operador en `messages` / `pop_messages()`. Formato: `fmt_px`, `fmt_usd`, `fmt_size`.
 
 ### `desk/journal.py` — `Journal`
@@ -188,7 +216,8 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   `trade(record)` → `trades.csv`; `equity(ts, equity, available=None, positions=None)` → `equity.csv`;
   `save_json(name, obj)`/`load_json(name, default)` atómicos (tmp + fsync + rename; ilegible → `*.corrupt-<ts>`);
   `outbox(cmd_id, text)` → `outbox.log`, un renglón por línea: `<fecha hora> [<id>] <texto>` (avisos: id `desk`);
-  `touch(name, text)`; `inbox_path`/`outbox_path`. `read_outbox(path, cmd_id, offset) -> (líneas, offset)`.
+  `touch(name, text)` (sin fsync, atómico); `inbox_path`/`outbox_path`. `read_outbox(path, cmd_id, offset) ->
+  (líneas, offset)`.
 - Añadir a un diario nunca lanza (error de disco → log); `save_json` sí lanza `OSError`.
 
 ### `desk/desk.py` — `TradingDesk`
@@ -203,29 +232,54 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   nunca muere. Tras abrir (comando o señal) se sincronizan los fills al momento: una entrada a mercado queda
   protegida con SL/TP sin esperar al siguiente ciclo.
 - `submit(text, source="consola", cmd_id=None) -> str` (respuesta legible, también a `outbox.log` con el id),
-  `enqueue(text, cmd_id=None) -> id`. Inbox: offset guardado antes de ejecutar (como mucho una vez); líneas
-  `[id] texto` usan ese id; líneas a medio escribir esperan al salto de línea; `#` = comentario.
+  `enqueue(text, cmd_id=None) -> id`. Inbox: offset guardado antes de ejecutar (como mucho una vez) junto a una
+  huella de los últimos bytes leídos y los últimos `[id]` ejecutados; si el fichero encoge o se reescribe no se
+  relee desde 0: sólo se ejecutan `[id]` no vistos (y se avisa). Sin `desk.json` válido el historial del inbox se
+  ignora (salvo en un estado nuevo, sin `outbox.log`). Líneas `[id] texto` usan ese id; un `[id]` a mitad de línea
+  separa dos comandos pegados; líneas a medio escribir esperan al salto de línea; `#` = comentario. Si la lectura
+  del inbox falla, la cola en memoria se procesa igual. Una línea nueva en el inbox corta la espera entre ciclos.
+- Un `BrokerError` tras enviar una entrada no es "inténtalo de nuevo": la respuesta dice ESTADO INCIERTO (no
+  repetir) y la reconciliación la resuelve. Un fallo al colocar el SL tras la entrada se informa ("NO colocado")
+  y se reintenta.
 - Comandos de IA (`source="llm"`) que no sean de sólo lectura/freno (estado, ayuda, pausa, auto off) quedan
   pendientes de `si`/`no` 5 min si `llm_confirm_trades`.
 - `SET_SL`/`SET_TP` con `%` se convierten a precio desde la entrada de la posición (o de la entrada pendiente).
 - `SET_PARAM` y `auto on/off` se guardan en `desk.json` y se restauran al arrancar (`DESK_AUTO=false`/`--no-auto`
-  siempre arrancan en OFF).
-- KILL = `risk.halt("kill", flatten=True)` + cancelar entradas + `close_all("kill")`. Halts → cancelar entradas
-  pendientes; evento "flatten" → `close_all("flatten")` (se repite cada ciclo mientras quede exposición).
+  siempre arrancan en OFF). `SET_PARAM` con `param=PARAM_DEFAULTS` vuelve a los valores de arranque.
+- El estado de riesgo (`risk.json`) se guarda en cuanto cambia (comandos y eventos), no sólo en "guardar".
+- Movimientos de saldo: entre dos lecturas de la cuenta, el cambio de equity que no explican las ejecuciones
+  (realizado − comisiones) ni el PnL no realizado, con las posiciones cuadradas y por encima de 0,5 % (y del funding
+  si el broker lo conoce: `funding_since(ts)`), es un depósito/retirada → `risk.apply_cash_flow` + aviso. Una
+  salida sólo se clasifica en un intervalo sin ejecuciones (con fills cuenta como pérdida: ante la duda, el halt).
+- KILL = `risk.halt("kill", flatten=True)` + **guardar `risk.json`** + cancelar entradas + `close_all("kill")`; la
+  respuesta lista las monedas sin cerrar. Halts → cancelar entradas pendientes; evento "flatten" →
+  `close_all("flatten")` (se repite cada ciclo mientras quede exposición).
 - La operativa automática evalúa cada estrategia una vez por vela (por moneda) y sólo en símbolos sin posición,
-  sin entrada pendiente y sin bracket: las posiciones abiertas por comando (origen "command") no las toca.
+  sin entrada pendiente y sin bracket: las posiciones abiertas por comando (origen "command") no las toca. La vela
+  evaluada por (moneda, estrategia) se guarda en `desk.json` (`bar_seen`): un reinicio no repite la señal.
+- Salud: al final de cada ciclo `health.json` (`health()`: ts, ciclo, racha de fallos, etapas que fallan con su
+  último error, última vez que `cuenta` y `fills` terminaron bien) y `heartbeat` sólo si el ciclo leyó la cuenta y
+  los fills. Sin cuenta, `status.json` se reescribe con una línea "SIN DATOS DE LA CUENTA".
 - `status_line()` (`equity | PnL día | posiciones | auto ON/OFF | halt`), `status_report()`, `summary()`,
-  `request_stop()`, `next_delay()`. Estado: `desk.json`, `risk.json`, `engine.json`, `status.json`, `heartbeat`.
+  `request_stop()`, `next_delay()`, `health()`. Estado: `desk.json`, `risk.json`, `engine.json`, `status.json`,
+  `health.json`, `heartbeat`.
 - SIGINT/SIGTERM → guardar estado y salir limpio (las órdenes SL/TP quedan en el exchange); segunda señal fuerza.
 
 ### `desk/__main__.py` — CLI
 - `python -m desk run [--mode paper|live] [--data hyperliquid|sim|replay:x.csv] [--symbols ...] [--no-auto]
   [--fast] [--fresh] [--cycles N] [--loop-seconds S] [--cmd "N:texto"] [--state-dir DIR] [--no-input] [-v]`
   - `--fast`: `SimClock` (sólo datos sim/replay); estado en `<state_dir>/fast`, continúa la simulación anterior
-    (`profile.json` guarda `clock_ts`) salvo `--fresh`.
-  - `profile.json` guarda modo/datos/reloj del estado: arrancar con otra configuración sobre el mismo estado se
-    rechaza (no mezclar posiciones paper de sim con datos reales, ni paper con live).
+    desde la hora más reciente guardada (`clock_ts` de `profile.json`, `health.json`, `heartbeat`, `status.json`:
+    también tras un SIGKILL) salvo `--fresh`.
+  - `profile.json` guarda modo/datos/reloj del estado y, en live, la red (`network`: testnet/mainnet) y la cuenta
+    (`account`): arrancar con otra configuración sobre el mismo estado se rechaza (no mezclar posiciones paper de
+    sim con datos reales, paper con live, ni testnet con mainnet u otra cuenta). Un perfil antiguo sin red/cuenta
+    se acepta y se completa. `build_profile(settings, fast)`, `check_profile(journal, profile)`.
   - Consola interactiva si stdin es un terminal (`salir` detiene la mesa).
 - `python -m desk send "long HYPE" [--timeout 30] [--no-wait] [--fast|--state-dir]` (añade `[cli-xxxx] texto` al
-  inbox y espera la respuesta con ese id en `outbox.log`).
-- `python -m desk status [--fast|--state-dir]` (lee `status.json` y la edad del `heartbeat`).
+  inbox con `append_inbox_line`: con bloqueo y anteponiendo un salto si la última línea no lo tenía; espera la
+  respuesta con ese id en `outbox.log`).
+- `python -m desk status [--fast|--state-dir]` (lee `status.json` y los avisos de `health_check`).
+- `python -m desk health [--fast|--state-dir] [--max-age 600] [--max-stale 600]`: 0 si la mesa completa ciclos
+  (`health.json` reciente) y lee la cuenta y los fills; 1 si no (HEALTHCHECK del Dockerfile).
+  `build_broker` pasa al broker live `fills_cursor_ts` y `fills_seen` guardados en `desk.json`.

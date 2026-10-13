@@ -327,7 +327,7 @@ class RiskManager:
             parts.append(f"cooldown auto hasta {_hhmm(self.cooldown_until)}")
         if self.last_equity is not None:
             parts.append(f"día {self.day} {-self.day_loss_pct():+.2f}%")
-            parts.append(f"dd {self.drawdown_pct():.2f}% (máx. {self.high_water:.2f})")
+            parts.append(f"dd {self.drawdown_pct():.2f}% desde el máximo de equity ${self.high_water:,.2f}")
         parts.append(f"pérdidas seguidas {self.consecutive_losses}/{self.settings.max_consecutive_losses}")
         return "riesgo: " + (" | ".join(parts) if parts else "OK")
 

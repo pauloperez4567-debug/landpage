@@ -6,6 +6,7 @@
 #   systemctl daemon-reload && systemctl enable --now desk
 #   journalctl -u desk -f                          # ver la salida en vivo
 #   sudo -u desk /opt/trading-bot/venv/bin/python -m desk send "estado"   (desde /opt/trading-bot)
+#   sudo -u desk /opt/trading-bot/venv/bin/python -m desk health          (0 = sana; para alertas/cron)
 [Unit]
 Description=Mesa de trading automatizada (desk) 24/7
 Wants=network-online.target
