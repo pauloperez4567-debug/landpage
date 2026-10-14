@@ -1,0 +1,645 @@
+# Arquitectura de la mesa (`desk`)
+
+Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
+
+```
+                 comandos (stdin / inbox / CLI "send")
+                              │
+                       commands.parse()  ── regex ES/EN ──► Command
+                              │              └─ fallback IA (Claude) + confirmación
+                              ▼
+ estrategias ──Signal──► TradingDesk (desk.py) ──TradeIntent──► RiskManager.evaluate()
+ (strategy.py)            bucle 24/7                                   │ RiskDecision
+      ▲                      │                                         ▼
+ liquidity.py ◄── MarketData │                              ExecutionEngine (engine.py)
+ indicators.py               │                                         │ órdenes + brackets SL/TP
+                             └──────────── journal.py ◄────────────────┤
+                                       (estado, CSV, JSONL)             ▼
+                                                              Broker: PaperBroker | LiveHyperliquidBroker
+```
+
+## Módulos base (ya escritos, no cambiar interfaces sin actualizar este archivo)
+
+- `desk/models.py`: `Side`, `OrderKind`, `OrderStatus`, `EntryMode`, `AssetMeta`, `Order`, `Fill`,
+  `Position`, `AccountState`, `Zone`, `CommandAction`, `Command`, `Signal`, `TradeIntent`, `RiskDecision`.
+- `desk/config.py`: `Settings`, `load_settings(env=None, dotenv_path=".env", **overrides)`,
+  `PARAM_ALIASES`, `TUNABLE`, `LIVE_CONFIRM_PHRASE`.
+- `desk/clock.py`: `Clock`, `RealClock`, `SimClock` (``sleep`` avanza el tiempo al instante).
+- `desk/indicators.py`: `sma, ema, wilder, rsi, true_range, atr, bollinger, keltner, adx, squeeze`.
+- `desk/exchange/base.py`: `MarketData`, `Broker`, `MarketDataError`, `BrokerError`,
+  `round_size`, `round_price`, `CANDLE_COLUMNS`.
+- `tests/conftest.py`: `FakeMarketData`, `make_candles`, fixtures `clock`, `market`, `settings`.
+
+## Módulos a implementar
+
+### `desk/exchange/hyperliquid_data.py` — `HyperliquidMarketData(MarketData)`
+- REST público `POST https://api.hyperliquid.xyz/info` (testnet: `https://api.hyperliquid-testnet.xyz/info`).
+- `meta()`/`coins()` desde `{"type":"meta"}` (`universe[i].name/szDecimals/maxLeverage`), cacheado.
+- `bid_ask()`/`l2_book()` desde `{"type":"l2Book","coin":c,"nSigFigs":n}` (`levels[0]`=bids, `levels[1]`=asks,
+  cada nivel `{"px","sz","n"}` en strings).
+- `candles()` desde `{"type":"candleSnapshot","req":{"coin","interval","startTime","endTime"}}`
+  (campos `t,o,h,l,c,v`), devuelve DataFrame con `CANDLE_COLUMNS`.
+- `liquidation_levels()` opcional: si hay `MOONDEV_API_KEY`, `GET https://api.moondev.com/api/positions/all.json`
+  con cabecera `X-API-Key`; `data["symbols"][coin]["longs"|"shorts"]`, cada posición con `liq_price` y `value`.
+  Sin clave → `[]`. Cache corto (30 s).
+- `requests.Session`, timeout 10 s, reintentos con backoff en 429/5xx, errores → `MarketDataError`.
+- `last_update_ts(coin)` = hora del último libro **según el exchange** (`time` del l2Book, nunca posterior a la
+  petición); sin libro, la de la última petición. Un nodo que sirve un libro congelado no pasa por dato fresco.
+- Inyectable `session` para tests (los tests NO usan red: mockear la sesión).
+
+### `desk/exchange/sim.py` — mercados offline
+- `SimMarketData(MarketData)`: paseo aleatorio determinista (semilla) por moneda, avanza con el `Clock`
+  inyectado; libro sintético con "muros" de liquidez y niveles de liquidación sintéticos; velas
+  generadas a partir del camino de precios. Sirve para la demo sin red: `DESK_DATA=sim`.
+- `ReplayMarketData(MarketData)`: reproduce un CSV de velas (`timestamp,open,high,low,close,volume`)
+  avanzando con el `Clock`; precio actual = interpolación dentro de la vela en curso. `DESK_DATA=replay:<csv>`.
+
+### `desk/exchange/paper.py` — `PaperBroker(Broker)`
+- Constructor: `PaperBroker(market: MarketData, settings: Settings, clock: Clock, state_file: Path|None)`.
+- Equity inicial `settings.paper_start_equity`. Comisiones taker/maker en bps, deslizamiento en bps.
+- MARKET: ejecuta al instante contra ask (compra) / bid (venta) + deslizamiento; si se pasa `price` y el
+  ejecutable es peor, se rechaza.
+- LIMIT: si es ejecutable al colocar (compra ≥ ask / venta ≤ bid) → taker inmediato (salvo `Alo`, que se
+  rechaza); si no, reposa. En `step()`: compra se ejecuta si ask ≤ precio límite (a precio límite, maker);
+  venta si bid ≥ precio límite.
+- STOP/TAKE_PROFIT (`reduce_only=True` obligatorio): se disparan con el mid. Stop de un long (orden de venta)
+  cuando mid ≤ trigger; TP de un long cuando mid ≥ trigger; simétrico para shorts. Ejecutan como MARKET.
+- `reduce_only`: recorta al tamaño de la posición; si no hay posición en sentido opuesto → rechazo.
+  Si la posición queda plana, las órdenes reduce-only restantes de esa moneda se cancelan.
+- Posición: precio medio en aumentos, PnL realizado en reducciones, giro (flip) permitido.
+  Margen aislado = notional / leverage. Precio de liquidación aproximado con margen de mantenimiento;
+  en `step()` si el mark cruza la liquidación → cierre forzado (`Fill.liquidation=True`).
+- Validaciones: tamaño ≥ 10^-sz_decimals, notional ≥ `min_notional_usd`, margen disponible suficiente,
+  apalancamiento ≤ `max_leverage`.
+- `poll_fills()` entrega cada fill una vez. `save_state()` escribe JSON atómico (tmp + rename) y el
+  constructor lo recarga si existe (sobrevive a reinicios).
+
+### `desk/exchange/hyperliquid_live.py` — `LiveHyperliquidBroker(Broker)`
+- Usa `hyperliquid-python-sdk` (`hyperliquid.exchange.Exchange`, `hyperliquid.info.Info`,
+  `hyperliquid.utils.constants.MAINNET_API_URL/TESTNET_API_URL`) y `eth_account.Account.from_key`.
+  Import perezoso (el resto del bot funciona sin el SDK instalado).
+- Sólo construible si `settings.validate()` pasó en modo live; testnet salvo `hl_mainnet=True`.
+- LIMIT → `{"limit":{"tif":...}}`; MARKET → IOC límite agresivo (mid ± `market_slippage_bps`; un MARKET
+  `reduce_only` sin `price` usa `CLOSE_SLIPPAGE` = 5 %: con 10 bps un cierre no casa en cuanto el spread pasa de ~20 bps);
+  STOP/TP → `{"trigger":{"triggerPx":px,"isMarket":True,"tpsl":"sl"|"tp"}}` con `reduce_only=True`.
+  Precios con `round_price`, tamaños con `round_size`.
+- `account()` desde `info.user_state(address)`; `open_orders()` desde `info.frontend_open_orders`;
+  `poll_fills()` desde `info.user_fills_by_time` desde el último ts visto (inclusive; dedupe por `tid`).
+  Constructor con `fills_since_ts` y `fills_seen` (tids ya entregados en ese ms); `fills_cursor_ts` y
+  `fills_seen_keys` los expone para que la mesa los guarde: un reinicio no re-entrega el último fill.
+- Errores de transporte → `BrokerError`; respuestas `status != "ok"` o `statuses[i].error` → orden REJECTED.
+
+### `desk/liquidity.py`
+- Funciones puras + un envoltorio:
+  - `book_levels(book) -> list[(px, usd)]`
+  - `liq_levels(levels, side=None) -> list[(px, usd)]` (con `side`, sólo liquidaciones de posiciones de
+    ese lado: longs → zonas LONG, shorts → zonas SHORT; los niveles sin lado se conservan)
+  - `find_zone(coin, side, mid, book_pts, liq_pts, settings) -> Zone|None`: agrupa en tramos de
+    `zone_width_pct` del precio; sólo del lado correcto (LONG: por debajo del mid; SHORT: por encima);
+    descarta lo que esté a menos de `zone_min_distance_pct` o más de `zone_max_distance_pct`;
+    puntuación = `zone_book_weight`·usd_libro + `zone_liq_weight`·usd_liq; devuelve el tramo de mayor
+    puntuación con `source` "book"/"liq"/"mixed" y `distance_pct`.
+    Tramos anclados en el mid: el tramo j cubre distancias [j·ancho, (j+1)·ancho) del lado que toca (ninguna
+    zona contiene el precio). El filtro de distancia se aplica a cada punto y al centro del tramo (la entrada).
+    Empate de puntuación → gana el tramo más cercano. Fuente con peso ≤ 0 → ignorada.
+  - `LiquidityScanner(market, settings, n_sig_figs=3).zone(coin, side) -> Zone|None` y
+    `.zones(coin) -> dict[Side, Zone|None]` (ambos lados con una sola lectura; es lo que piden las
+    estrategias). Usa `l2_book(coin, n_sig_figs=3)` + `liquidation_levels(coin)`; `MarketDataError` en
+    precio/libro → None; si sólo fallan las liquidaciones, sigue con el libro.
+
+### `desk/strategy.py`
+- `Strategy` (ABC): `name`, `interval`, `lookback`, `evaluate(coin, candles, mid, zones: dict[Side, Zone|None]) -> Signal|None`.
+- `LiquiditySweepStrategy` (15m): reversión tras barrer una zona de liquidez: la vela anterior perfora la
+  zona LONG (low ≤ zone.high) y la última cierra por encima de `zone.low`, RSI(14) < 40 y subiendo → LONG
+  con `EntryMode.MARKET`, SL bajo `zone.low - 0.5·ATR`, TP a `default_tp_r` R. Simétrico para SHORT.
+- `SqueezeBreakoutStrategy` (1h): fin de squeeze (BB dentro de Keltner) en la vela anterior y no en la
+  actual, ADX(14) > 25, cierre fuera de Bollinger → entrada MARKET en dirección de la ruptura, SL a
+  1.5·ATR, TP a `default_tp_r` R.
+- `build_strategies(settings, clock=None) -> list[Strategy]` según `settings.strategies` (sin duplicados;
+  nombre desconocido → `ValueError`). Registro en `STRATEGIES`. Constructor: `Strategy(settings, clock=None)`.
+- Sólo señales sobre velas cerradas: la mesa pasa las velas tal cual las da `MarketData.candles` y
+  `evaluate(..., now=None)` decide con `closed_candles(candles, interval, now)`: con hora conocida (`now` o el
+  `clock` del constructor) descarta la última si `apertura + duración > now`; sin hora asume que la última
+  está en curso (Hyperliquid siempre la incluye) y la descarta. **Recomendado: `build_strategies(settings,
+  clock)`.** Con hora conocida, si la última cerrada tiene más de una vela + 120 s de retraso → sin señal.
+- Como mucho una señal por moneda y vela cerrada (la mesa evalúa cada `strategy_seconds`).
+- `lookback` = velas a pedir (incluida la posible vela en curso); `min_bars` = velas cerradas mínimas.
+
+### `desk/commands.py`
+- `parse(text, settings, llm=None) -> Command | None` y `CommandParser` con fallback IA.
+- Regex español + inglés, insensible a mayúsculas/acentos. Ejemplos que DEBEN funcionar:
+  `long HYPE`, `short btc`, `compra SOL`, `vende ETH`, `long HYPE 2 unidades` / `2u` / `2 units`,
+  `long HYPE en zona` / `en zona de liquidez` / `zona` (ZONE), `long HYPE a mercado` / `market` / `ya` (MARKET),
+  `long HYPE a 85.2` / `@85.2` / `limit 85.2` (LIMIT), `sl 1.5%` / `stop 84.5`, `tp 4%` / `tp 90`,
+  combinables (`long HYPE 2u zona sl 1.5% tp 4%`), `cierra HYPE` / `close HYPE`, `cierra todo` / `close all` / `flat`,
+  `cancela HYPE` / `cancel all`, `stop HYPE 84.5` / `sl HYPE 84.5` (SET_SL sobre posición), `tp HYPE 90` (SET_TP),
+  `pausa`/`pause`, `reanuda`/`resume`, `auto on|off` / `automatico on|off`, `estado`/`status`/`posiciones`,
+  `kill` / `panico` / `apaga todo`, `reset halt`, `apalancamiento 3` / `leverage 3` / `riesgo 0.5` / `unidad 250`
+  (SET_PARAM con nombre canónico de `PARAM_ALIASES`), `si`/`confirmar`/`yes`/`confirm`, `no`/`cancelar`/`reject`,
+  `ayuda`/`help`. KILL admite sufijos de urgencia (`pánico ya`, `kill now`). `cierra todas las posiciones
+  abiertas` / `close all trades` = CLOSE_ALL (las palabras de relleno nunca se toman por moneda); `cierra todo BTC`
+  / `cancela todo HYPE` son ambiguos → None. `reset params` / `restablece parámetros` → `SET_PARAM` con
+  `param=PARAM_DEFAULTS` ("defaults") y sin `value`: la mesa vuelve a los parámetros de arranque.
+- Monedas: mayúsculas; acepta prefijos HIP-3 tipo `xyz:GOLD`.
+- `SET_SL`/`SET_TP` llevan `price` (precio absoluto) **o** `sl_pct`/`tp_pct` (`sl HYPE 2%`: distancia desde la
+  entrada; la mesa lo convierte a precio). Sin moneda (`sl 2%`, `tp 3`) son `SET_PARAM` de los valores por defecto.
+- Fallback IA (`LLMCommandInterpreter`): sólo si la regex no entiende, `settings.llm_enabled` y el SDK
+  `anthropic` + credenciales están disponibles. Modelo `settings.llm_model` (por defecto `claude-opus-5-5`),
+  esfuerzo bajo, salida estructurada JSON (`output_config.format` json_schema) que mapea a `Command`,
+  `fallbacks="default"` (beta `server-side-fallback-2026-07-01`). Comprobar `stop_reason` (`refusal` → None).
+  Resultado con `source="llm"`. Nunca lanzar: cualquier error → None. Interfaz inyectable para tests.
+
+### `desk/risk.py` — `RiskManager`
+- `RiskManager(settings, clock)`; estado persistible (`to_dict`/`from_dict`): día UTC, equity al inicio del
+  día, máximo de equity (high-water mark), pérdidas consecutivas, cooldown hasta, `halted` + motivo.
+- `update(account) -> list[str]` (eventos): rollover diario; si pérdida del día ≥ `daily_loss_limit_pct`
+  → halt "daily_loss" (se levanta solo al día siguiente); si drawdown desde HWM ≥ `max_drawdown_pct`
+  → halt "max_drawdown" + evento "flatten" (sólo se levanta con RESET_HALT).
+- `record_trade_result(pnl)`: racha de pérdidas → cooldown de `loss_cooldown_minutes` para entradas automáticas.
+- `evaluate(intent, account, meta, bid, ask, data_age_s) -> RiskDecision`:
+  apalancamiento = min(settings.leverage, meta.max_leverage); precio de entrada (zona/límite/mercado);
+  SL por defecto `default_sl_pct` si no viene (si `require_stop`); valida lado correcto del SL/TP;
+  notional = units·unit_margin_usd·leverage, recortado para que la pérdida en el SL ≤ `risk_per_trade_pct`
+  del equity, ≤ `max_notional_per_coin_usd`, ≤ exposición bruta restante, ≤ margen disponible;
+  rechaza si halted/pausado, `max_open_positions` alcanzado, ya hay posición en la moneda, spread >
+  `max_spread_bps`, datos viejos, notional < mínimo; TP por defecto a `default_tp_r` R.
+  Tamaño redondeado con `round_size`. Las órdenes de reducción/cierre nunca pasan por aquí (siempre permitidas).
+- `evaluate` comprueba también pérdida diaria y drawdown con el `account.equity` recibido (puede ir por delante
+  del último `update()`: comandos entre ciclos). Collar de las entradas límite/zona: si cruzan el libro más de
+  `LIMIT_MAX_CROSS_PCT` (1 %) o reposan a más de `LIMIT_MAX_DISTANCE_PCT` (20 %) del mid → rechazo ("¿precio mal
+  escrito?"), nunca una conversión silenciosa a mercado.
+- `apply_cash_flow(amount)`: depósito (+) / retirada o transferencia (−) ajena a la operativa; se traslada al
+  máximo de equity y a la referencia del día (no es ganancia ni pérdida). La detecta la mesa.
+- Utilidades: `estimated_liq_px(entry, lev, is_long, mmr)`, `maintenance_rate(settings, max_lev)`, `LIQ_BUFFER`.
+
+### `desk/engine.py` — `ExecutionEngine`
+- `ExecutionEngine(broker, market, settings, clock, journal=None, *, load=True)`; estado persistible de brackets
+  (`journal.save_json("engine")`, se recarga al construir; un fichero ilegible se aparta y se ignora).
+- Un `Bracket` por moneda: `PENDING` (entrada enviada) → `OPEN` (posición con SL/TP) → `CLOSING` (cierre enviado)
+  → `ClosedTrade` (coin, side, origin, size, entry_px, exit_px, `pnl` neto = realizado − comisiones, gross_pnl,
+  fees, exit_reason `sl|tp|close|close_all|flatten|kill|no_sl|liquidation|external`, opened_ts, closed_ts).
+- `open(intent, decision, *, cmd_id="") -> Order`: fija apalancamiento (un `ValueError` del broker → orden
+  `REJECTED` local), registra y **guarda** el bracket pendiente {coin, sl, tp, origin, expires_ts (sólo límites,
+  `entry_ttl_minutes`)} y *después* coloca la entrada (ZONE/LIMIT → LIMIT Gtc en `decision.entry_px`; MARKET →
+  MARKET con peor precio `entry_px ± market_slippage_bps`). Rechaza si ya hay un bracket en la moneda. Un
+  `BrokerError` al enviar se propaga pero el bracket queda *sin confirmar* (`is_unconfirmed(coin)`): `reconcile`
+  busca la orden en el exchange (misma moneda, lado y tamaño) o la posición y la protege con el SL/TP aprobados,
+  o la descarta tras 2 comprobaciones.
+- `on_fills(fills) -> list[ClosedTrade]`: identifica cada fill por id de orden (entrada/SL/TP/cierre) y, si no,
+  por etiqueta y dirección. Entrada (total o parcial) → coloca/ajusta STOP y TAKE_PROFIT reduce-only por el tamaño
+  abierto (la orden nueva antes de cancelar la vieja). Posición plana tras SL/TP/cierre → cancela la otra (OCO) y
+  el resto de entrada, escribe `trades.csv` y devuelve la operación (la mesa pasa `pnl` a
+  `RiskManager.record_trade_result`). Fills sin bracket → aviso y diario. Idempotente ante la re-entrega del
+  último instante ya aplicado (claves persistidas en `engine.json`); un fill anterior a la creación del bracket
+  (− 5 s) no se le imputa. Lo que `reconcile` ya dio por ejecutado sin fill (`assumed`) no se suma dos veces.
+  Cada moneda se procesa aparte: un `BrokerError` al proteger una no pierde las operaciones cerradas de otras.
+- `reconcile(account) -> list[ClosedTrade]`: caduca entradas no ejecutadas; descarta entradas que desaparecen del
+  exchange (2 comprobaciones); da por abierta una entrada cuya posición aparece sin fill; cierra brackets cuya
+  posición desapareció (2 comprobaciones, `external`); re-coloca SL/TP que falten (con 5 s de gracia tras colocar);
+  cierra la posición si el SL se rechaza 3 veces (o no se puede colocar por conexión 10 veces); adopta posiciones sin
+  bracket (origen `adopted`, reutiliza STOP/TP reduce-only existentes o pone SL `default_sl_pct`, nunca más allá de
+  la liquidación); cancela reduce-only huérfanas sin posición; reintenta (cada 10 s, hasta 6 envíos) los cierres
+  `CLOSING` que dejaron posición. Una entrada que caduca o se cancela sólo se descarta si la cancelación se
+  confirma (si no, queda `canceling` con su SL/TP). Cada moneda por separado (un fallo no frena a las demás).
+- `close(coin, reason="close", *, account=None) -> Order|None` (IOC reduce-only con límite `CLOSE_SLIPPAGE` peor
+  que el mid, o que el mark de la posición sin datos de mercado; crece con cada reintento), `close_all(reason=
+  "close_all") -> list[Order]` (moneda a moneda: las que fallan van a `close_failures` {moneda: motivo} y no frenan
+  a las demás; no cuenta las órdenes rechazadas), `set_stop(coin, px) -> str`, `set_take_profit(coin, px) -> str`
+  (`ValueError` con el motivo si el nivel queda del lado equivocado, no hay posición/entrada, el SL queda más allá
+  de la liquidación −con `LIQ_BUFFER`− o, al ensancharlo, la pérdida superaría `risk_per_trade_pct` del equity;
+  sobre una entrada pendiente sólo cambia el nivel), `cancel(coin|None) -> int` (sólo órdenes de entrada
+  confirmadas: los SL/TP de posiciones abiertas se mantienen), `reference_px(coin)`, `is_unconfirmed(coin)`.
+- Mensajes legibles para el operador en `messages` / `pop_messages()`. Formato: `fmt_px`, `fmt_usd`, `fmt_size`.
+
+### `desk/journal.py` — `Journal`
+- `Journal(state_dir, clock=None)`: `event(kind, /, **data)` → `events.jsonl`; `fill(fill)` → `fills.csv`;
+  `trade(record)` → `trades.csv`; `equity(ts, equity, available=None, positions=None)` → `equity.csv`;
+  `save_json(name, obj)`/`load_json(name, default)` atómicos (tmp + fsync + rename; ilegible → `*.corrupt-<ts>`);
+  `outbox(cmd_id, text)` → `outbox.log`, un renglón por línea: `<fecha hora> [<id>] <texto>` (avisos: id `desk`);
+  `touch(name, text)` (sin fsync, atómico); `inbox_path`/`outbox_path`. `read_outbox(path, cmd_id, offset) ->
+  (líneas, offset)`.
+- Añadir a un diario nunca lanza (error de disco → log); `save_json` sí lanza `OSError`.
+
+### `desk/desk.py` — `TradingDesk`
+- `TradingDesk(settings, market, broker, clock, parser=None, journal=None, *, strategies=None, scanner=None,
+  risk=None, engine=None, out=None)`; `run_forever(max_cycles=None, *, install_signals=True, before_cycle=None)
+  -> int` y `run_cycle() -> bool` (False si alguna etapa falló).
+- Ciclo (cada `loop_seconds`): leer comandos (cola en memoria + `state/inbox.txt` con offset persistido) →
+  `broker.step()` → `poll_fills` → `engine.on_fills` → `account` → `risk.update` (halt/flatten) →
+  `engine.reconcile` → cada `strategy_seconds`, si auto y no pausado/halted/cooldown: estrategias por
+  símbolo → intents → riesgo → engine → guardar estado → línea de estado cada `status_every_seconds`.
+- Cada etapa en su propio try/except; fallos en ciclos consecutivos → espera `loop_seconds·2^n` (máx. 300 s);
+  nunca muere. Tras abrir (comando o señal) se sincronizan los fills al momento: una entrada a mercado queda
+  protegida con SL/TP sin esperar al siguiente ciclo.
+- `submit(text, source="consola", cmd_id=None) -> str` (respuesta legible, también a `outbox.log` con el id),
+  `enqueue(text, cmd_id=None) -> id`. Inbox: offset guardado antes de ejecutar (como mucho una vez) junto a una
+  huella de los últimos bytes leídos y los últimos `[id]` ejecutados; si el fichero encoge o se reescribe no se
+  relee desde 0: sólo se ejecutan `[id]` no vistos (y se avisa). Sin `desk.json` válido el historial del inbox se
+  ignora (salvo en un estado nuevo, sin `outbox.log`). Líneas `[id] texto` usan ese id; un `[id]` a mitad de línea
+  separa dos comandos pegados; líneas a medio escribir esperan al salto de línea; `#` = comentario. Si la lectura
+  del inbox falla, la cola en memoria se procesa igual. Una línea nueva en el inbox corta la espera entre ciclos.
+- Un `BrokerError` tras enviar una entrada no es "inténtalo de nuevo": la respuesta dice ESTADO INCIERTO (no
+  repetir) y la reconciliación la resuelve. Un fallo al colocar el SL tras la entrada se informa ("NO colocado")
+  y se reintenta.
+- Comandos de IA (`source="llm"`) que no sean de sólo lectura/freno (estado, ayuda, pausa, auto off) quedan
+  pendientes de `si`/`no` 5 min si `llm_confirm_trades`.
+- `SET_SL`/`SET_TP` con `%` se convierten a precio desde la entrada de la posición (o de la entrada pendiente).
+- `SET_PARAM` y `auto on/off` se guardan en `desk.json` y se restauran al arrancar (`DESK_AUTO=false`/`--no-auto`
+  siempre arrancan en OFF). `SET_PARAM` con `param=PARAM_DEFAULTS` vuelve a los valores de arranque.
+- El estado de riesgo (`risk.json`) se guarda en cuanto cambia (comandos y eventos), no sólo en "guardar".
+- Movimientos de saldo: entre dos lecturas de la cuenta, el cambio de equity que no explican las ejecuciones
+  (realizado − comisiones) ni el PnL no realizado, con las posiciones cuadradas y por encima de 0,5 % (y del funding
+  si el broker lo conoce: `funding_since(ts)`), es un depósito/retirada → `risk.apply_cash_flow` + aviso. Una
+  salida sólo se clasifica en un intervalo sin ejecuciones (con fills cuenta como pérdida: ante la duda, el halt).
+- KILL = `risk.halt("kill", flatten=True)` + **guardar `risk.json`** + cancelar entradas + `close_all("kill")`; la
+  respuesta lista las monedas sin cerrar. Halts → cancelar entradas pendientes; evento "flatten" →
+  `close_all("flatten")` (se repite cada ciclo mientras quede exposición).
+- La operativa automática evalúa cada estrategia una vez por vela (por moneda) y sólo en símbolos sin posición,
+  sin entrada pendiente y sin bracket: las posiciones abiertas por comando (origen "command") no las toca. La vela
+  evaluada por (moneda, estrategia) se guarda en `desk.json` (`bar_seen`): un reinicio no repite la señal.
+- Salud: al final de cada ciclo `health.json` (`health()`: ts, ciclo, racha de fallos, etapas que fallan con su
+  último error, última vez que `cuenta` y `fills` terminaron bien) y `heartbeat` sólo si el ciclo leyó la cuenta y
+  los fills. Sin cuenta, `status.json` se reescribe con una línea "SIN DATOS DE LA CUENTA".
+- `status_line()` (`equity | PnL día | posiciones | auto ON/OFF | halt`), `status_report()`, `summary()`,
+  `request_stop()`, `next_delay()`, `health()`. Estado: `desk.json`, `risk.json`, `engine.json`, `status.json`,
+  `health.json`, `heartbeat`.
+- SIGINT/SIGTERM → guardar estado y salir limpio (las órdenes SL/TP quedan en el exchange); segunda señal fuerza.
+
+### `desk/__main__.py` — CLI
+- `python -m desk run [--mode paper|live] [--data hyperliquid|sim|replay:x.csv] [--symbols ...] [--no-auto]
+  [--fast] [--fresh] [--cycles N] [--loop-seconds S] [--cmd "N:texto"] [--state-dir DIR] [--no-input] [-v]`
+  - `--fast`: `SimClock` (sólo datos sim/replay); estado en `<state_dir>/fast`, continúa la simulación anterior
+    desde la hora más reciente guardada (`clock_ts` de `profile.json`, `health.json`, `heartbeat`, `status.json`:
+    también tras un SIGKILL) salvo `--fresh`.
+  - `profile.json` guarda modo/datos/reloj del estado y, en live, la red (`network`: testnet/mainnet) y la cuenta
+    (`account`): arrancar con otra configuración sobre el mismo estado se rechaza (no mezclar posiciones paper de
+    sim con datos reales, paper con live, ni testnet con mainnet u otra cuenta). Un perfil antiguo sin red/cuenta
+    se acepta y se completa. `build_profile(settings, fast)`, `check_profile(journal, profile)`.
+  - Consola interactiva si stdin es un terminal (`salir` detiene la mesa).
+- `python -m desk send "long HYPE" [--timeout 30] [--no-wait] [--fast|--state-dir]` (añade `[cli-xxxx] texto` al
+  inbox con `append_inbox_line`: con bloqueo y anteponiendo un salto si la última línea no lo tenía; espera la
+  respuesta con ese id en `outbox.log`).
+- `python -m desk status [--fast|--state-dir]` (lee `status.json` y los avisos de `health_check`).
+- `python -m desk health [--fast|--state-dir] [--max-age 600] [--max-stale 600]`: 0 si la mesa completa ciclos
+  (`health.json` reciente) y lee la cuenta y los fills; 1 si no (HEALTHCHECK del Dockerfile).
+  `build_broker` pasa al broker live `fills_cursor_ts` y `fills_seen` guardados en `desk.json`.
+- `python -m desk backtest|dashboard|console ...`: ver Fase 2 (integración en la mesa y `tui`/`console`).
+
+---
+
+# Fase 2: backtest por gráfica, playbook, alarmas e interactividad
+
+Campos nuevos ya añadidos en `desk/models.py` (`CommandAction.BACKTEST/ADOPT/DEACTIVATE/PLAYBOOK/REPORTS/
+ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/alert/target_id`) y en
+`desk/config.py` (`bt_*`, `auto_default_strategies`, `alert_*`, `daily_loss_warn_frac`, `telegram_*`, `webhook_url`).
+
+## `desk/commands.py` (comandos de la fase 2)
+- Gráfica = moneda + temporalidad de `exchange.intervals` (`15m`, `15 min`, `1 hora` -> `15m`/`1h`). Historia:
+  `90d`, `90 días`, `2 semanas`, `3 meses` (=90), `1 año` (=365). `1d`/`3d` son temporalidad salvo que ya haya otra
+  (`backtest BTC 1h 3d` = 3 días). Estrategias: `strategy_names()` = `strategy.STRATEGIES` ∪ `KNOWN_STRATEGIES`;
+  vale el nombre con espacios/guiones o una palabra que sólo sea suya (`donchian`).
+- `BACKTEST` (`backtest|optimiza|prueba COIN [tf] [días] [estrategia]`; `interval`/`days`/`strategy` None = por
+  defecto/todas). `ADOPT` (`activa|usa la mejor|adopt COIN tf [estrategia]`) exige temporalidad: dinero en automático
+  sin la gráfica completa es ambiguo -> None. `DEACTIVATE` (`desactiva COIN [tf]`, `quita COIN del playbook`).
+  `PLAYBOOK`, `REPORTS` (`informes`; `informe`/`report` en singular siguen siendo STATUS), `ALERT_LIST`.
+- `ALERT_ADD`: `alerta|alarma COIN <condición> [tf] [siempre|cada vez]` -> `Command.coin` + `Command.alert` =
+  `{"kind", <parámetros dados>, "interval", "repeat"}`; los no dados se omiten (defectos y rangos los pone
+  `AlertManager.add`, con mensaje claro). `interval` sólo en alarmas de velas (en precio/zona con temporalidad -> None).
+  Números como en las órdenes (`80.000` ambiguo -> None). `ALERT_DEL` (`borra alerta 3` -> `target_id=3`; `borra
+  alertas` -> None = todas). `MUTE` (`silencio 30m` -> `value=30` minutos; sin duración None), `UNMUTE` (`sonido`).
+- "activa/desactiva avisos|alertas" = UNMUTE/MUTE; "activa/desactiva (el modo) auto" = AUTO_ON/OFF; "cancela alerta 3"
+  = ALERT_DEL, "cancela HYPE" = CANCEL. Las palabras de la fase 2 nunca se toman por moneda ("cierra alertas" -> None).
+- Utilidades: `parse_interval(text)`, `strategy_key(name)`, `describe_alert(coin, spec)`, `ALERT_KINDS` (= claves de
+  `alerts.KINDS`), `CANDLE_ALERT_KINDS`, `INTERVALS`.
+- IA: el esquema añade `interval` (enum), `strategy`, `days` y `alert` (texto con la sintaxis de las reglas, validado
+  por el mismo parser); `value` = minutos en `mute` y número de alarma en `alert_del`. Como mucho 16 campos con unión
+  (límite de la API para esquemas estrictos).
+
+## `desk/strategy.py` (refactor: una sola lógica para vivo y backtest)
+- Cada estrategia declara `PARAM_GRID: dict[str, list]` (valores a probar) y sus parámetros como atributos.
+  `Strategy(settings, clock=None, *, interval=None, **params)` permite fijar temporalidad y parámetros
+  (nombre desconocido -> `ValueError`). `params() -> dict` devuelve los valores actuales.
+- `signals(bars, zones=None) -> pd.DataFrame` **vectorizado**, mismo índice que `bars`, columnas
+  `side` ("long"/"short"/""), `entry_mode` ("market"/"zone"/"limit"), `entry_px`, `sl`, `tp`, `reason`.
+  La fila i sólo usa datos de filas <= i (sin look-ahead). `zones` es un DataFrame por vela con
+  `long_low, long_high, long_usd, short_low, short_high, short_usd` (NaN = sin zona).
+- En vivo, `_evaluate_closed` = última fila de `signals(bars, zones_df)` donde la última fila de zonas
+  viene del `LiquidityScanner` (paridad exacta vivo/backtest).
+- `liquidity.historical_zones(bars, settings) -> DataFrame`: zonas aproximadas para el pasado (no hay libro
+  ni liquidaciones históricas): clusters de máximos/mínimos de pivote confirmados (sin look-ahead) con
+  volumen como peso. Documentar la limitación.
+- Estrategias nuevas registradas en `STRATEGIES`: `ema_trend` (cruce EMA rápida/lenta + filtro ADX),
+  `rsi_reversion` (RSI extremo + toque de Bollinger, objetivo media), `donchian_breakout` (ruptura de canal
+  N velas + stop ATR). Todas con SL/TP coherentes y `PARAM_GRID`.
+- Implementado (detalles y extensiones compatibles):
+  - `PARAMS: tuple[str, ...]` = parámetros ajustables (`PARAM_GRID` es un subconjunto); valores con el tipo
+    del defecto (entero no entero, NaN, `fast >= slow`... -> `ValueError`). `tp_r=None` (por defecto) = usa
+    `default_tp_r` en caliente; con número, TP fijo a ese R (lo que se optimiza). `min_bars`/`lookback` son de
+    instancia y crecen con los periodos (los de `liquidity_sweep` 30/120 y `squeeze_breakout` 50/150 no cambian).
+  - `signals(bars, zones=None, *, ref_px=None)`: `ref_px` = precio de referencia de la última fila (en vivo el
+    mid; sin él, el cierre). Columna extra `confidence`. `SIGNAL_COLUMNS`, `empty_signals(index)`.
+    Las primeras `min_bars - 1` filas y las de OHLC inválido (vela o anterior) nunca dan señal. `uses_zones`
+    (sólo `liquidity_sweep`): sin zonas no hay señal. `signal_at(signals, pos, coin) -> Signal|None`.
+  - Paridad: `evaluate(bars[:i+1], mid=None|cierre)` == fila `i` de `signals` sobre toda la historia (exacto).
+    En vivo las medias recursivas (EMA/Wilder) arrancan `lookback` velas atrás: diferencia despreciable, no cero.
+  - `create_strategy(name, settings, clock=None, *, interval=None, **params)` (nombre normalizado).
+  - `liquidity`: `ZONE_COLUMNS`, `zones_frame(index, zones_dict, coin)` (zonas vivas en la última fila, con
+    `long_source`/`short_source` opcionales), `row_zones(zones_df, pos, coin) -> dict[Side, Zone|None]`,
+    `historical_zones(..., *, pivot_bars=3, max_age=300)`: pivote con 3 velas a cada lado, usado desde su
+    confirmación, se borra al *cerrar* más allá (una mecha no lo borra) o a las 300 velas; rejilla y filtros de
+    `find_zone` anclados en el cierre; fuente `HIST_SOURCE` ("pivots").
+  - `indicators.wilder` reescrita sobre floats (mismo resultado bit a bit, ~50x más rápida).
+
+## `desk/backtest.py`
+- `BTTrade(coin, side, entry_ts, entry_px, exit_ts, exit_px, size, pnl, pnl_pct, r_multiple, fees, exit_reason, bars_held)`;
+  `exit_reason` in {"sl","tp","end","flip"}.
+- `BacktestResult(coin, interval, strategy, params, start_ts, end_ts, bars, trades, equity: pd.Series, metrics: dict)`
+  con `to_dict()` (equity muestreada a <= 500 puntos).
+- `metrics`: `total_return_pct, cagr_pct, sharpe, sortino, max_drawdown_pct, calmar, win_rate_pct, profit_factor,
+  expectancy_r, n_trades, avg_trade_pct, avg_bars_held, exposure_pct, best_trade_pct, worst_trade_pct, fees_usd`.
+- `run_backtest(strategy, bars, settings, *, coin, meta=None, start_equity=None, zones=None) -> BacktestResult`:
+  señal al cierre de la vela i -> MARKET al open de i+1 ± `paper_slippage_bps` (comisión taker);
+  ZONE/LIMIT: límite en `entry_px` válido `entry_ttl_minutes`, se ejecuta si la vela lo toca (comisión maker);
+  una posición a la vez; SL/TP intravela, si una vela toca ambos -> **SL primero**; hueco a través del SL ->
+  ejecución al open (peor). Dimensionamiento igual que el riesgo en vivo (`auto_units`, `unit_margin_usd`,
+  apalancamiento min(settings, meta), recorte por `risk_per_trade_pct` en el SL y `max_notional_per_coin_usd`).
+  5000 velas con un juego de parámetros en < 100 ms.
+- Implementado (detalles y extensiones compatibles):
+  - `run_backtest(..., signals=None, trade_from=None, allow_flip=False)`: `signals` = señales ya calculadas
+    (sobre estas velas o una historia más larga con el mismo inicio: son causales); `trade_from` = posición o
+    marca de tiempo de la primera vela operada (las anteriores sólo calientan; equity y métricas empiezan ahí);
+    `allow_flip=False` como en vivo (con posición no se evalúa); True -> señal contraria cierra (`"flip"`) al open.
+    Sin `zones`, las estrategias con `uses_zones` usan `historical_zones`. `ValueError` si faltan columnas o el
+    índice no es `DatetimeIndex`.
+  - Reglas concretas: MARKET se descarta si al open de i+1 el SL/TP ya quedan del lado equivocado (el riesgo lo
+    rechazaría); límite: sólo cuentan velas que terminan antes de la caducidad, ejecución al precio límite y en
+    esa vela sólo cuenta el SL; hueco a través del TP -> al TP (sin regalo); salidas SL/TP/fin = taker + desliz.;
+    lo abierto se cierra al cierre de la última vela (`"end"`). Sin funding, liquidaciones ni spread.
+  - `BTTrade.side` = "long"/"short"; `entry_ts`/`exit_ts` = apertura (s UNIX) de la vela donde ocurre;
+    `pnl` neto; `pnl_pct` = pnl / equity al entrar · 100; `r_multiple` = pnl / (size·|entrada − SL|);
+    `bars_held` cuenta la vela de entrada y la de salida. `to_dict()/from_dict()` en ambas clases.
+  - `BacktestResult.to_dict(max_points=500)`: `equity` = `[[ts, valor], ...]` (incluye primero y último).
+    `equity` (Series) = capital marcado a mercado al cierre de cada vela, índice = apertura de la vela.
+  - `metrics` incluye además `n_signals` y `n_skipped` (señales operables / descartadas por niveles, tamaño o
+    caducidad). Todo finito: `profit_factor` sin pérdidas = `PF_CAP` (999); Sharpe/Sortino anualizados con
+    velas 24/7 y sin tipo libre de riesgo.
+  - `compute_metrics(trades, equity, start_equity, interval, *, n_bars=None, end_ts=None) -> dict` y
+    `position_size(settings, meta, equity, entry, sl) -> (size, leverage)` (mismo cálculo que
+    `RiskManager.evaluate` con la cuenta plana) son públicas para el optimizador.
+
+## `desk/optimizer.py`
+- `StrategyEvaluation(strategy, params, is_metrics, oos_metrics, oos_trades, folds, score, passed, reasons)`.
+- `OptimizationReport(id, coin, interval, days, bars, created_ts, evaluations, winner, notes)` con
+  `to_dict()/from_dict()` y `summary_text()` (tabla en español: dentro vs fuera de muestra).
+- `optimize(coin, interval, bars, settings, *, strategies=None, meta=None, seed=7, progress=None, should_stop=None)`:
+  walk-forward anclado de `bt_folds` tramos; en cada tramo se elige la mejor combinación (<= `bt_max_combos`,
+  muestreo determinista) en el tramo de entrenamiento y se mide en el siguiente (fuera de muestra). Los
+  parámetros propuestos para adoptar = mejores del último entrenamiento. Aprobada sólo si fuera de muestra:
+  PF >= `bt_min_profit_factor`, retorno > 0, operaciones >= `bt_min_trades`, DD <= `bt_max_drawdown_pct`;
+  `reasons` explica cada rechazo. Ranking por `bt_objective` fuera de muestra. `winner` = mejor aprobada o None.
+- `ReportStore(state_dir)`: `save(report, result=None) -> path` en `state/reports/<COIN>_<interval>_<id>.json`,
+  `latest(coin, interval)`, `list(limit)`, `get(id)`.
+- Implementado (detalles y extensiones compatibles):
+  - Tramos: `walk_forward_splits(n, folds) -> [(train_end, test_start, test_end)]`: `folds + 1` bloques iguales, el
+    tramo k entrena con los bloques `0..k-1` y valida en el `k` (el último bloque se queda el resto). Bloques de al
+    menos 50 velas (`MIN_SEGMENT_BARS`): con menos historia se usan menos tramos (nota); sin ninguno, cada estrategia
+    sale rechazada con "historia insuficiente". `bt_folds < 1` -> 1 tramo (nota).
+  - Combinaciones: `param_combos(cls, settings, max_combos, seed)`: todo el `PARAM_GRID` si cabe; si no, muestra
+    determinista (`random.Random(f"{seed}:{nombre}")`, estable entre procesos). La configuración por defecto va siempre
+    la primera (`tp_r=None` -> `default_tp_r` actual) y gana los empates. Combinaciones inválidas descartadas.
+  - Elección al entrenar: mejor `bt_objective` entre las combinaciones con operaciones suficientes (máx(3, la mitad
+    de las que `bt_min_trades` exigiría a ese ritmo)); desempate por más operaciones y por orden.
+  - Sin fuga: señales una vez por combinación sobre toda la historia (causales) y una simulación por tramo con sólo
+    sus velas; en cada validación las señales de la elegida se recalculan con las velas hasta el final del tramo y se
+    comparan con las del entrenamiento: si difieren, la estrategia mira el futuro y se invalida (`error`).
+  - Fuera de muestra: tramos de validación encadenados (cada uno empieza con el capital final del anterior);
+    `oos_metrics` = `compute_metrics` de esa curva + `n_signals`, `n_skipped`, `t_stat` (t de Student del R medio
+    por operación, `edge_t_stat`) y `t_min` (`required_t_stat(n, m)`: cuantil `1 - 0.05/m`, m = estrategias del
+    informe, Bonferroni). **Filtro extra de aprobación: `t_stat >= t_min`** ("ventaja no significativa ... puede ser
+    suerte"). Motivo: sobre paseos aleatorios de 3000 velas, sólo con los cuatro filtros 17 de 24 gráficas tenían
+    "ganadora"; con la significación, 0 de 40 (las tendencias reales siguen aprobando). `approval_reasons(oos, settings)`.
+  - `StrategyEvaluation` añade `combos`, `error` (evaluación fallida: error, fuga, sin historia), la propiedad
+    `folds_positive` y `oos_result: BacktestResult` (la curva fuera de muestra encadenada; sólo en memoria, no va en
+    `to_dict`). `oos_trades = list[BTTrade]` (en JSON, lista de dicts); `folds = list[FoldResult]` con `fold,
+    train_start_ts, train_end_ts, test_start_ts, test_end_ts` (s UNIX; fin = cierre de la última vela), `train_bars,
+    test_bars, params, is_metrics, oos_metrics, combos, min_train_trades`. `is_metrics` = los parámetros propuestos
+    en el último entrenamiento. `score` = objetivo fuera de muestra (None si falló).
+  - `OptimizationReport.winner` = nombre (str) de la ganadora o None; `winner_evaluation`, `get(nombre)`, `best()`
+    (ganadora o primera evaluable) y `result(strategy=None)` (su `oos_result`). Extras: `objective`, `folds` (int),
+    `seed`, `criteria` (umbrales usados, `alpha`, `compared`), `start_ts`, `end_ts`, `oos_start_ts`, `complete`.
+    `evaluations` ordenadas: aprobadas primero, luego por `score`; fallidas al final. `from_dict` acepta el formato
+    de `ReportStore` (`{"report", "result"}`) y datos raros.
+  - `optimize(..., clock=None, zones=None)`: `created_ts` del `clock` (sin él, el real); `zones` = zonas por vela (sin
+    ellas, `historical_zones` una vez; si fallan, nota y las de liquidez sin señales). `strategies` admite nombres o
+    clases `Strategy` (nombre desconocido -> `ValueError`). `progress(hechas, total, texto)` cada >= 5 % (y al 100 %);
+    si lanza se registra una vez y deja de llamarse. `should_stop()` se consulta entre combinaciones: True -> informe
+    con lo terminado y `complete=False`. Velas desordenadas/repetidas se limpian (nota). Una estrategia que falla
+    sale rechazada con el motivo; `ValueError` sólo por entradas inválidas (columnas, índice, intervalo, nombres).
+    `id` = 8 hex (blake2b de gráfica, hora, velas, semilla y estrategias).
+  - `summary_text(max_rows=10)`: tabla <= 80 columnas (dentro: retorno, PF | fuera: retorno, PF, DD, ops, t,
+    objetivo, ✔/✘), ganadora con parámetros y "activa <COIN> <tf>", motivos de rechazo, notas y `DISCLAIMER`.
+  - `ReportStore(state_dir, *, keep=200)`: fichero = `{"report": to_dict(), "result": BacktestResult.to_dict() | None}`
+    (por defecto `result` = `report.result()`), escritura atómica (`Journal.save_json`); moneda/intervalo saneados
+    en el nombre (`xyz:GOLD` -> `xyz-GOLD`); al guardar se borran los más antiguos por encima de `keep`. Extras:
+    `get_result(id) -> BacktestResult | None`, `path_for(report)`. Ficheros ilegibles se ignoran (log).
+  - Rendimiento medido: 5 estrategias x 60 combinaciones x 4 tramos sobre 3000 velas de 1h = ~7.5 s en un proceso.
+
+## `desk/playbook.py`
+- `PlaybookEntry(coin, interval, strategy, params, units, adopted_ts, report_id, oos_metrics, enabled=True)`.
+- `Playbook(state_dir)` (`state/playbook.json`, escritura atómica): `adopt(entry)` (una entrada por moneda+temporalidad),
+  `remove(coin, interval=None) -> int`, `entries()`, `strategies(settings, clock) -> list[(PlaybookEntry, Strategy)]`.
+- La operativa automática usa las entradas del playbook (más las estrategias por defecto sobre `symbols` si
+  `auto_default_strategies`). Cada entrada opera con su temporalidad y sus parámetros.
+- Implementado (detalles y extensiones compatibles):
+  - `playbook.json` = `{"version": 1, "entries": [PlaybookEntry.to_dict(), ...]}` (al leer acepta también una lista o
+    `{clave: entrada}`); escrito con `Journal.save_json`. Ilegible -> se aparta (`*.corrupt-<ts>`) y se empieza vacío;
+    entradas sin moneda/temporalidad/estrategia se ignoran (log).
+  - `Playbook(state_dir, clock=None)`; `adopt(entry, settings=None) -> PlaybookEntry | None` (la sustituida) valida con
+    `validate_entry` (moneda, intervalo, estrategia de `STRATEGIES`, parámetros con `create_strategy`, `units` None o
+    > 0) -> `ValueError` con el motivo; si no se puede guardar, `OSError` y nada cambia. Gráfica = (moneda sin
+    distinguir mayúsculas, temporalidad) (`PlaybookEntry.key`). `units=None` = `settings.auto_units`.
+  - Extras: `get(coin, interval)`, `set_enabled(coin, interval, enabled) -> bool` (pausar sin olvidar), `reload()`,
+    `summary_text()`, `PlaybookEntry.describe()`/`copy()`; `entries()` devuelve copias.
+  - `strategies(settings, clock)`: sólo entradas activas; nunca lanza (una entrada que ya no se puede instanciar se
+    salta con aviso en el log); reutiliza la instancia mientras la entrada no cambie (conserva "una señal por vela").
+  - `entry_from_report(report, strategy=None, *, units=None, clock=None, allow_rejected=False) -> PlaybookEntry`:
+    la ganadora o `strategy`; `ValueError` (texto para el usuario) si no hay ganadora, no se evaluó, la evaluación
+    falló (siempre) o no aprobó fuera de muestra (salvo `allow_rejected=True`). `adopted_ts` del `clock`.
+
+## `desk/report_render.py`
+- `render_html(report, result, bars) -> str`: HTML autocontenido (SVG en línea, sin dependencias): precio con
+  entradas/salidas, curva de capital, drawdown y tabla de estrategias (dentro vs fuera de muestra). Claro y oscuro.
+- `render_png(report, result, bars) -> bytes | None` (matplotlib si está instalado, backend Agg).
+- `sparkline(values, width=40) -> str` (bloques unicode) para consola y Telegram.
+- Implementado (detalles y extensiones compatibles):
+  - `result` = la curva que se enseña, normalmente la fuera de muestra encadenada (`report.result()` o
+    `ReportStore.get_result(id)`); sin `result` se usa la de `report.best()` si está en memoria. Cualquier argumento
+    puede ser None: se pinta lo que se pueda; nunca lanza por datos raros.
+  - HTML: aviso de honestidad arriba y abajo, tarjetas fuera de muestra, precio (cierre + banda máx/mín, resumido a
+    <= 900 puntos) con entradas ▲/▼ y salidas ●/◆ (ganancia/pérdida: forma y color) y los tramos de validación
+    sombreados (T1..Tn), capital y drawdown fuera de muestra, tabla de estrategias (motivos en subfila), tramos con
+    sus parámetros y últimas 60 operaciones. Tokens de color con `prefers-color-scheme` y `data-theme`; móvil sin
+    scroll horizontal (las tablas anchas se desplazan dentro de su tarjeta). Lectura al pasar el ratón/teclado (cruz
+    + texto) con un script en línea opcional; `<title>` por operación. Sin recursos externos; todo texto escapado.
+  - `render_png(..., dpi=110)`: 3 paneles con `matplotlib.figure.Figure` + `FigureCanvasAgg` (sin pyplot ni estado
+    global), fechas en español; None si matplotlib falta o algo falla.
+  - `sparkline`: resume (muestreo uniforme con primero y último) a `width` puntos, ignora no numéricos/no finitos;
+    "" con < 2 valores; serie plana = bloques medios. Misma escala que la de `tui` (el panel usa ésta).
+
+## `desk/alerts.py`
+- `AlertRule(id, coin, kind, params, interval, repeat, cooldown_s, created_ts, last_fired_ts, fired_count, note)`.
+- Tipos (`Command.alert["kind"]`): `price_above`, `price_below`, `price_cross` (`level`); `rsi_below`, `rsi_above`
+  (`level`, `period`=14); `ma_cross` (`fast`, `slow`, `ma`="sma"|"ema", `direction`="up"|"down"|"any");
+  `zone` (`side`="long"|"short"|None: el precio entra en la zona de liquidez); `volume_spike` (`mult`, `lookback`=20);
+  `move_pct` (`pct`, ventana = `interval`). `Command.alert` = `{"kind":..., <params>, "interval":..., "repeat": bool}`.
+- `AlertManager(settings, clock, state_dir, notifier)`: `add(coin, spec) -> AlertRule`, `remove(id) -> bool`, `clear() -> int`,
+  `rules()`, `evaluate(market, scanner=None) -> list[str]` (cada ciclo; nunca lanza; indicadores sobre velas cerradas
+  con caché por ciclo), `system(kind, text, level="info", key=None, coin=None)` (avisos de la mesa con anti-spam por
+  `key` y `alert_cooldown_seconds`), `mute(minutes|None)`, `unmute()` (los críticos nunca se silencian).
+- Persistencia: reglas en `state/alerts.json`; cada aviso disparado en `state/alerts.jsonl`
+  (`{"ts","level","kind","coin","text","rule_id"}`), que leen el panel y la consola.
+- Implementado (extensiones compatibles): `AlertRule` añade `severity` ("warn" por defecto; "critical" no se silencia) y
+  `state` (referencia del cruce `s` y última vela evaluada `bar`, persistidos). Claves opcionales del spec: `interval`
+  (velas, "1h" por defecto), `repeat`, `cooldown_s` (por defecto `alert_cooldown_seconds`), `note`, `severity`,
+  `immediate`; `move_pct` admite `direction` (`pct` negativo = caída). `add(coin, spec, *, ref_px=None)` (mid actual:
+  referencia de los cruces de precio; spec inválido -> `ValueError` con el motivo), `get(id)`, `list_text()`, `stats()`
+  (contadores para `status.json`), `describe_rule(rule)`. `system(..., image=None) -> bool` (False = omitido por
+  anti-spam o silenciado; un crítico con texto distinto pasa el anti-spam). `mute()`/`unmute()` devuelven la respuesta
+  para el usuario; al caducar el silencio se avisa del recuento. Los avisos silenciados van a `alerts.jsonl` con
+  `"muted": true`.
+- Semántica: **cruces, no estados** (`price_above 100` creada con el precio en 105 no dispara hasta que baje a <= 100
+  y vuelva a superarlo; `immediate: True` = dispara también si ya se cumple). Precio = mid cada ciclo; indicadores sobre
+  velas cerradas, una vez por vela y sólo con velas que cierran después de crear la alarma; las velas se piden sólo
+  cuando puede haber cerrado una nueva. `zone`: el precio entra en la zona vista en el ciclo anterior. Una vez
+  (`repeat=False`) = dispara y se elimina.
+
+## `desk/notify.py`
+- `Notifier(channels)`: `send(text, level="info", kind="", coin=None, image=None)`; envío de red en un hilo con cola
+  (la mesa nunca se bloquea por HTTP); errores de red se registran y se tragan.
+- Canales: `ConsoleChannel(out, bell)` (colores con rich si está disponible), `FileChannel(path)` (jsonl),
+  `TelegramChannel(token, chat_ids, min_level, session=None)` (`sendMessage`, `sendPhoto` si hay imagen),
+  `WebhookChannel(url, min_level, session=None)` (JSON con `content` y `text`: vale para Discord y Slack).
+- Niveles: "info" < "warn" < "critical".
+- Implementado (extensiones compatibles): `Notifier(channels, *, clock=None, threaded=True, queue_size=500)` con
+  `flush(timeout) -> bool`, `close()`, `describe()`, contadores `sent`/`failed`/`dropped` y `last_error` (sin secretos);
+  cola llena -> se descarta el aviso más antiguo. `build_notifier(settings, out=None, *, console=True, clock=None,
+  session=None, file_path=None)` monta los canales según `telegram_*`, `webhook_url` y `alert_min_level_*`.
+  Telegram: texto plano, troceo a 4000 caracteres (`split_message`), "info" sin sonido, `sendPhoto` multipart (si la
+  foto falla el texto llega igual), un reintento ante 429. Webhook troceado a 1900 (límite de Discord). Errores pasan
+  por `redact`: nunca se registran el token ni la ruta del webhook (`safe_url` = sólo el host).
+
+## `desk/telegram_bot.py`
+- `TelegramBot(token, chat_ids, submit, clock=None, session=None)`: long polling de `getUpdates` (timeout 25 s) en un
+  hilo daemon; sólo acepta mensajes de `chat_ids` (el resto se ignora sin responder y se registra);
+  `/start` y `/help` -> ayuda; un `/comando` se traduce a texto (`/estado` -> "estado"); cada texto se pasa a
+  `submit(text, source="telegram") -> str` y la respuesta vuelve al chat. `start()`, `stop()`. Nunca registra el token.
+- Implementado (extensiones compatibles): kwargs `poll_timeout=25`, `max_age_s=300` (mensajes más antiguos según el
+  `clock` no se ejecutan y se avisa al chat; `None` lo desactiva, p. ej. con un `SimClock`), `api_base`. `poll_once()
+  -> int` (un `getUpdates` + tratamiento, nunca lanza), `reply(chat_id, text, reply_to=None) -> bool`,
+  `translate_command(text)` (`/cierra_todo@Bot` -> "cierra todo"). Offset en memoria **confirmado a Telegram antes de
+  ejecutar** (como mucho una vez: un reinicio no repite un "long"); ediciones y mensajes no de texto no se ejecutan.
+  Backoff 1, 2, 4... 60 s (respeta `retry_after`; 401/404 -> 300 s); `start()` devuelve False sin token.
+
+## `desk/tui.py` y `desk/console.py`
+- `python -m desk dashboard`: panel `rich.live` de sólo lectura sobre los archivos de estado (`status.json`,
+  `alerts.jsonl`, `playbook.json`, índice de informes, `events.jsonl`): cabecera (modo, equity, PnL del día, barras
+  de consumo de pérdida diaria y drawdown, auto/halt), posiciones con PnL en color, órdenes, playbook, últimas
+  alarmas y señales, último backtest. Refresco 1 s; tolera archivos ausentes o a medio escribir.
+- `python -m desk console`: consola interactiva conectada a una mesa en marcha (inbox/outbox): historial readline,
+  autocompletado de verbos/monedas/temporalidades, respuestas en color y alarmas en tiempo real (hilo que sigue
+  `alerts.jsonl` y los avisos `desk` de `outbox.log`).
+- `status.json` (lo escribe la mesa) se amplía con: posiciones, órdenes, playbook, contadores de alarmas, últimas
+  señales y consumo de límites de riesgo en %.
+- Implementado (detalles y extensiones compatibles):
+  - `desk/remote.py` (cliente compartido por `send` y la consola, sin lógica duplicada): `send_command(state_dir, text,
+    *, prefix="cli", cmd_id=None) -> SentCommand` (`[<prefix>-xxxxxxxx] texto` con `append_inbox_line`; el outbox se lee
+    desde su tamaño *antes* de enviar), `wait_reply(sent, timeout, clock, *, settle_s=0.5, poll_s=0.25, should_stop=None)
+    -> list[str]` (con el `Clock` inyectado), `no_reply_message(...)`, `validate_command_text`. `__main__` los reexporta.
+  - Panel: `SnapshotReader(state_dir, clock).read() -> Snapshot` (`load_snapshot` = lectura suelta) y funciones puras
+    `build_layout(snap)`, `build_header/positions/orders/playbook/backtest/alerts/signals/trades/notices(snap)`; un panel
+    que falla se pinta como error y los demás siguen. `run_dashboard(state_dir, *, clock=None, console=None,
+    refresh_s=1.0, once=False, max_frames=None, screen=True) -> int`; CLI `dashboard [--once] [--refresh S]`.
+    `status.json` hoy (`line`/`report` en texto) se interpreta entero; los campos ampliados mandan si están:
+    `mode, data, network, equity, available, day_pnl, day_pnl_pct, auto, paused, cooldown, halt, symbols`,
+    `risk{daily_loss_pct, daily_loss_limit_pct, daily_loss_used_pct, drawdown_pct, max_drawdown_pct, drawdown_used_pct}`,
+    `positions[{coin, side|size con signo, size, entry_px, mark_px, unrealized_pnl, pnl_pct, leverage, sl, tp, origin}]`,
+    `orders[{coin, is_buy|side, kind, size, trigger_px|price, reduce_only, tag}]`, `pending[{coin, side, planned_size,
+    entry_px, sl, tp, expires_ts, origin}]`, `playbook` (como `playbook.json`), `alerts` (`AlertManager.stats()`),
+    `signals[{ts, coin, side, strategy, reason}]` (ver `normalize_status`). `risk.json` manda en halt/pausa/cooldown (se
+    guarda al cambiar). JSON a medio escribir -> última lectura buena + aviso; de los diarios sólo líneas completas.
+    Informe = el más reciente legible de `reports/*.json` (`OptimizationReport.to_dict()` solo o en `{"report",
+    "result"}`); sólo métricas fuera de muestra. La línea de estado periódica (`is_status_line`) no sale en avisos.
+  - Consola: `DeskConsole(state_dir, *, clock, console, timeout, input_fn, use_readline, follow, poll_s, warnings)`,
+    `run_console(state_dir, *, timeout, warnings, clock, console)`; ids `[con-xxxxxxxx]`; `completions(prior, text,
+    coins, intervals)` (verbos ES/EN, monedas de `status.json` y del playbook, temporalidades de `INTERVAL_SECONDS`);
+    `Follower(state_dir, clock, *, from_start=False).poll() -> list[Notice]` (sólo lo nuevo; rotación/truncado ->
+    desde el principio; alarmas `muted` no se imprimen; el mismo texto por los dos ficheros sale una vez; respuestas
+    tardías de comandos que se dejaron de esperar). Ctrl+C mientras espera deja de esperar (el comando sigue en el
+    inbox). `salir`/`exit`/`quit`/Ctrl+D cierran sólo la consola. CLI `console [--timeout S]` (avisa con
+    `health_check` si la mesa parece parada).
+
+## `desk/desk.py`, `desk/jobs.py` y `desk/__main__.py` (integración de la fase 2)
+- `TradingDesk(..., out=None, *, notifier=None, alerts=None, playbook=None, reports=None, backtests=None,
+  telegram=None, http_session=None)`: sin inyectar, construye `build_notifier(settings, out=pantalla)` (la pantalla es
+  un `ConsoleChannel` más), `AlertManager(settings, clock, state_dir, notifier)`, `Playbook(state_dir, clock)`,
+  `ReportStore(state_dir)`, `BacktestWorker(settings, reports, clock, threaded=not SimClock)` y, si hay
+  `telegram_bot_token`, un `TelegramBot(token, chat_ids, self.submit, clock, session, max_age_s=None con SimClock)` que
+  se arranca en `run_forever` y se para en `shutdown` (fuera del lock). Sin chats autorizados el bot arranca igual:
+  ignora todo y registra el id del chat (sirve para descubrirlo). `http_session` se comparte con el canal de Telegram
+  y el webhook (tests sin red).
+- Ciclo: `comandos → broker → fills → cuenta → riesgo → reconciliación → estrategias → alarmas → backtests → guardar →
+  estado`. "alarmas" = `alerts.evaluate(market, scanner)` + frescura de los datos de las monedas con posición (cada
+  60 s). "backtests" = `backtests.poll()` → aviso por cada trabajo terminado (con reloj simulado ahí se ejecutan).
+- `notify(text, level=INFO, *, kind="desk", key=None, coin=None, image=None, push=True)`: log + `outbox.log` (id
+  `desk`) y, con `push`, `alerts.system(kind, text, nivel, key, coin, image)` → `alerts.jsonl` + canales (pantalla,
+  Telegram, webhook). Nivel: `logging.WARNING` → "warn", `>= ERROR` → "critical". Con `key` un aviso repetido dentro de
+  `alert_cooldown_seconds` se omite del todo (también del outbox); silenciado (`mute`) se omite en los canales pero no
+  en el outbox. `push=False` (línea de estado periódica, "SIN DATOS DE LA CUENTA"): sólo log, outbox y pantalla.
+  Avisos: arranque/parada (`start`/`stop`, info), mensajes del motor en el ciclo (`exec`/`trade`: ejecuciones, SL/TP,
+  cierres con PnL), señales automáticas abiertas (`signal`), halts y cierres por riesgo (`halt`, critical), consumo de
+  la pérdida diaria >= `daily_loss_warn_frac` y del drawdown >= 80 % (`risk`, warn, una vez por cruce con histéresis de
+  10 puntos), racha de fallos 3/10/50/100... (`errors`, warn) y recuperación, datos viejos (`data`, warn, clave por
+  moneda), backtest terminado (`backtest`, info, con el PNG) o fallido (warn), playbook degradado (`playbook`, warn).
+  Lo que ejecuta un comando va en su respuesta, no se empuja a los canales.
+- Comandos: `BACKTEST` (moneda conocida; temporalidad por defecto la de la estrategia pedida o `1h`; días por defecto
+  `bt_default_days`; velas con `jobs.fetch_bars` al momento; < `2·MIN_SEGMENT_BARS` velas → no se lanza; trabajo con
+  copia de `Settings`) → "Backtest HYPE 1h (120 días, 2880 velas, 5 estrategias) en marcha..." y al terminar aviso con
+  `summary_text`, rutas HTML/PNG/JSON y, si hay ganadora, "activa COIN tf". `ADOPT` = `ReportStore.latest(coin, tf)` →
+  `entry_from_report(report, strategy, allow_rejected=force)` → `Playbook.adopt`; sin ganadora y con `forzar` se toma
+  `report.best()`; lo forzado empieza por "ATENCIÓN — FORZADO". `DEACTIVATE` = `Playbook.remove`. `PLAYBOOK`,
+  `REPORTS` (incluye el trabajo en marcha), `ALERT_ADD` (`alerts.add(coin, spec, ref_px=mid)`; el aviso de "punto de
+  miles" también vale para el nivel), `ALERT_LIST`, `ALERT_DEL` (`target_id` None = todas), `MUTE`, `UNMUTE`. Sin
+  confirmación por IA (además de estado/ayuda/pausa/auto off): `BACKTEST`, `PLAYBOOK`, `REPORTS`, `ALERT_LIST`, `MUTE`.
+- Operativa automática: `auto_slots()` = entradas activas del playbook (su temporalidad, parámetros y `units` o
+  `auto_units`) y, si `auto_default_strategies`, las estrategias por defecto sobre `symbols` (salvo la misma
+  estrategia@temporalidad que el playbook ya cubre en esa moneda). Por moneda, el playbook primero. Origen de las
+  señales `auto:<estrategia>@<tf>` (antes `auto:<estrategia>`; `risk.is_auto` sólo mira el prefijo). "Una evaluación
+  por vela" con clave `(moneda, estrategia@tf)` en `bar_seen`. Una estrategia que lanza no frena a las demás: se
+  reintenta en la vela siguiente y la etapa queda marcada como fallida en ese ciclo.
+- `status.json` = `{ts, time, line, report}` + `account_ok, mode, data, network, equity, available, day_pnl,
+  day_pnl_pct, drawdown_pct, auto, paused, cooldown, halt, symbols, risk{daily_loss_pct, daily_loss_limit_pct,
+  daily_loss_used_pct, drawdown_pct, max_drawdown_pct, drawdown_used_pct, daily_loss_warn_frac}, positions[{coin, side,
+  size, entry_px, mark_px, unrealized_pnl, pnl_pct, leverage, liq_px, sl, tp, origin}], orders[{coin, is_buy, kind, size,
+  trigger_px, price, reduce_only, tag}], pending[{coin, side, planned_size, entry_px, sl, tp, expires_ts, origin}],
+  strategies, playbook (como playbook.json), alerts (stats), signals (últimas 20: ts, time, coin, side, strategy
+  "nombre@tf", source "playbook"|"defecto", reason, opened, result), backtests (`BacktestWorker.describe()`),
+  notifier {channels, sent, failed, dropped, last_error}, telegram {running, handled, ignored, errors, last_error}`.
+  `origin` usa las etiquetas del informe de texto ("comando", "adoptada", "sin gestionar" o el `auto:...`). Se reescribe
+  tras un comando, una señal, un cierre o un backtest, y como mucho cada `SNAPSHOT_EVERY_S` (30 s de reloj) si no.
+- `shutdown()`: para Telegram, cancela los backtests (aviso si había), guarda, avisa "Mesa detenida" y cierra el
+  notifier (entrega lo pendiente).
+- `desk/jobs.py`: `bars_for(days, tf) -> (n, recortado)` (tope `MAX_BARS - 1` = 4999 cerradas), `fetch_bars(market,
+  coin, tf, days, clock) -> (velas cerradas, notas)`, `BacktestJob(id, coin, interval, days, strategy, bars, meta,
+  requested_ts, cmd_id, notes, source, settings)`, `BacktestOutcome(job, report, report_path, html_path, png_path, png,
+  error, canceled, elapsed_s)`, `run_job(job, settings, store, clock, *, should_stop, progress, render=True)`
+  (`optimize` → `ReportStore.save` → `.html`/`.png` junto al JSON; un fallo al pintar no pierde el informe; se podan
+  los HTML/PNG huérfanos) y `BacktestWorker(settings, store, clock, *, threaded=True, max_queue=4, runner=run_job)`:
+  `submit(job) -> por delante` (`ValueError` si la cola está llena o se está apagando), `poll() -> [BacktestOutcome]`
+  (sin hilo ejecuta aquí lo pendiente), `busy_with(coin, tf, strategy)`, `busy_chart(coin, tf)`, `pending()`,
+  `has_results()`, `describe()`, `stop(timeout)` (cancela la cola y pide parar al que corre; `optimize` lo consulta
+  entre combinaciones). Una excepción del trabajo → `BacktestOutcome.error`; el hilo nunca muere.
+- CLI `python -m desk backtest --coin SOL [--interval 1h] [--days N] [--strategy X] [--data sim|hyperliquid|replay:x]
+  [--csv x.csv] [--state-dir D] [--fast] [--no-render]`: sin arrancar la mesa; `sim` termina la historia en la hora
+  simulada del estado (`resume_clock_ts`) o en el ancla; `--csv` = `ReplayMarketData(offset=0)` con el reloj al final
+  del CSV. Informes en `<state>/reports` (con datos sim/replay, `state/fast` por defecto: nunca junto a la mesa real).
+  Código de salida 0 aunque no haya ganadora; 2 por argumentos inválidos; 1 si no hay datos.

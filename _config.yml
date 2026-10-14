@@ -1,0 +1,3 @@
+# El bot de trading vive en el mismo repositorio pero no forma parte del sitio web.
+exclude:
+  - trading-bot/

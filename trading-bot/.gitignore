@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Estado de la mesa (posiciones paper, diarios, logs) y secretos
+state/
+.env
+*.corrupt-*
