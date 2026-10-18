@@ -19,7 +19,7 @@ import json
 import logging
 import math
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -52,7 +52,9 @@ def _finite(v: Any) -> Optional[float]:
 @dataclass
 class PlaybookEntry:
     """Una gráfica en automático. ``units`` None = ``settings.auto_units``; ``oos_metrics`` = métricas fuera de
-    muestra del informe del que salió (``report_id``), sólo informativas."""
+    muestra del informe del que salió (``report_id``): la curva encadenada, que valida el *procedimiento*
+    (reoptimizar en cada tramo); ``adopted_metrics`` = las de estos ``params`` en su propio tramo fuera de muestra
+    (el último, con ``fold``). Sólo informativas: un backtest no garantiza resultados futuros."""
 
     coin: str
     interval: str
@@ -63,6 +65,7 @@ class PlaybookEntry:
     report_id: str
     oos_metrics: dict[str, Any]
     enabled: bool = True
+    adopted_metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def key(self) -> tuple[str, str]:
@@ -72,7 +75,8 @@ class PlaybookEntry:
     def to_dict(self) -> dict[str, Any]:
         return {"coin": self.coin, "interval": self.interval, "strategy": self.strategy, "params": dict(self.params),
                 "units": self.units, "adopted_ts": self.adopted_ts, "report_id": self.report_id,
-                "oos_metrics": dict(self.oos_metrics), "enabled": self.enabled}
+                "oos_metrics": dict(self.oos_metrics), "enabled": self.enabled,
+                "adopted_metrics": dict(self.adopted_metrics)}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "PlaybookEntry":
@@ -88,27 +92,38 @@ class PlaybookEntry:
                    units=_finite(d.get("units")), adopted_ts=_finite(d.get("adopted_ts")) or 0.0,
                    report_id=str(d.get("report_id") or ""),
                    oos_metrics=dict(d["oos_metrics"]) if isinstance(d.get("oos_metrics"), dict) else {},
-                   enabled=enabled if isinstance(enabled, bool) else str(enabled).lower() not in ("0", "false", "no"))
+                   enabled=enabled if isinstance(enabled, bool) else str(enabled).lower() not in ("0", "false", "no"),
+                   adopted_metrics=dict(d["adopted_metrics"]) if isinstance(d.get("adopted_metrics"), dict) else {})
 
     def copy(self) -> "PlaybookEntry":
-        return replace(self, params=dict(self.params), oos_metrics=dict(self.oos_metrics))
+        return replace(self, params=dict(self.params), oos_metrics=dict(self.oos_metrics),
+                       adopted_metrics=dict(self.adopted_metrics))
 
     def describe(self) -> str:
-        """Una línea legible: gráfica, estrategia, parámetros, unidades y métricas fuera de muestra."""
+        """Una línea legible: gráfica, estrategia, parámetros, unidades y métricas fuera de muestra (las del
+        procedimiento y, si se conocen, las de estos parámetros en su propio tramo)."""
         from .optimizer import format_params
-        m = self.oos_metrics
         oos = ""
-        if m:
-            pf = _finite(m.get("profit_factor"))
-            parts = [f"{_finite(m.get('total_return_pct')) or 0.0:+.1f} %",
-                     "PF ∞" if pf is not None and pf >= 999 else f"PF {pf or 0.0:.2f}",
-                     f"DD {_finite(m.get('max_drawdown_pct')) or 0.0:.1f} %", f"{int(_finite(m.get('n_trades')) or 0)} ops"]
-            oos = " · fuera de muestra " + ", ".join(parts)
+        if self.oos_metrics:
+            oos = " · fuera de muestra (procedimiento, reoptimizando por tramo) " + metrics_text(self.oos_metrics)
+        if self.adopted_metrics:
+            fold = int(_finite(self.adopted_metrics.get("fold")) or 0)
+            oos += (f" · con estos parámetros (tramo T{fold})" if fold else " · con estos parámetros") + " " + \
+                metrics_text(self.adopted_metrics)
         units = "unidades por defecto" if self.units is None else f"{self.units:g} u"
         state = "" if self.enabled else " [PAUSADA]"
         rep = f" · informe {self.report_id}" if self.report_id else ""
         return (f"{self.coin} {self.interval} · {self.strategy} ({format_params(self.params)}) · {units}"
                 f"{oos}{rep}{state}")
+
+
+def metrics_text(m: dict[str, Any]) -> str:
+    """``+3.1 %, PF 1.42, DD 2.0 %, 25 ops`` (tolerante con valores raros)."""
+    pf = _finite(m.get("profit_factor"))
+    parts = [f"{_finite(m.get('total_return_pct')) or 0.0:+.1f} %",
+             "PF ∞" if pf is not None and pf >= 999 else f"PF {pf or 0.0:.2f}",
+             f"DD {_finite(m.get('max_drawdown_pct')) or 0.0:.1f} %", f"{int(_finite(m.get('n_trades')) or 0)} ops"]
+    return ", ".join(parts)
 
 
 def validate_entry(entry: PlaybookEntry, settings: Optional[Settings] = None) -> PlaybookEntry:
@@ -284,7 +299,8 @@ def entry_from_report(report: Any, strategy: Optional[str] = None, *, units: Opt
     clk = clock if clock is not None else RealClock()
     return PlaybookEntry(coin=report.coin, interval=report.interval, strategy=ev.strategy, params=dict(ev.params),
                          units=units, adopted_ts=float(clk.now()), report_id=report.id,
-                         oos_metrics=dict(ev.oos_metrics), enabled=True)
+                         oos_metrics=dict(ev.oos_metrics), enabled=True,
+                         adopted_metrics=dict(getattr(ev, "adopted_oos", {}) or {}))
 
 
-__all__ = ["PLAYBOOK_FILE", "PlaybookEntry", "Playbook", "entry_from_report", "validate_entry"]
+__all__ = ["PLAYBOOK_FILE", "PlaybookEntry", "Playbook", "entry_from_report", "metrics_text", "validate_entry"]

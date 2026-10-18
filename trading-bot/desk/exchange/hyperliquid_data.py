@@ -106,6 +106,16 @@ class HyperliquidMarketData(MarketData):
         return cls(clock, testnet=testnet, session=session,
                    moondev_api_key=settings.moondev_api_key or "", **kwargs)
 
+    def background_copy(self) -> "HyperliquidMarketData":
+        """Otro adaptador con la misma configuración y su propia sesión HTTP (y cachés), para descargas largas en
+        otro hilo (backtests) sin compartir la sesión del bucle de la mesa. Con una sesión inyectada que no es
+        ``requests.Session`` (tests) se reutiliza esa."""
+        session = requests.Session() if isinstance(self.session, requests.Session) else self.session
+        return type(self)(self.clock, testnet=self.testnet, session=session, moondev_api_key=self.moondev_api_key,
+                          timeout=self.timeout, retries=self.retries, backoff_base=self.backoff_base,
+                          backoff_max=self.backoff_max, meta_ttl=self.meta_ttl, book_ttl=self.book_ttl,
+                          liq_ttl=self.liq_ttl, info_url=self.info_url, moondev_url=self.moondev_url)
+
     # ------------------------------------------------------------------ HTTP
     def _retry_delay(self, attempt: int, retry_after: Optional[float]) -> float:
         if retry_after is not None:

@@ -13,20 +13,31 @@ medido **fuera de muestra**, en velas que el optimizador no vio al elegir:
   de mejor ``bt_objective`` *con un mínimo de operaciones* (una combinación con 2 operaciones ganadoras
   no es información, es suerte).
 - La curva fuera de muestra encadena los tramos de validación (cada uno empieza con el capital con el que
-  acabó el anterior). Sus métricas son las que se enseñan y las que aprueban o rechazan:
-  PF >= ``bt_min_profit_factor``, retorno > 0, operaciones >= ``bt_min_trades``, drawdown <=
-  ``bt_max_drawdown_pct`` y **ventaja significativa** (abajo). ``reasons`` explica cada rechazo. Ranking por
-  ``bt_objective`` fuera de muestra.
+  acabó el anterior) **con los frenos del riesgo en vivo** (``backtest.LiveBrakes``: halt por drawdown
+  ``max_drawdown_pct``, halt diario ``daily_loss_limit_pct``, cooldown por racha de pérdidas). Sus métricas son
+  las que se enseñan y las que aprueban o rechazan: PF >= ``bt_min_profit_factor``, retorno > 0, operaciones >=
+  ``bt_min_trades``, drawdown <= ``bt_max_drawdown_pct`` y < ``max_drawdown_pct`` (y sin halt por drawdown: en
+  vivo la mesa se habría detenido) y **ventaja significativa** (abajo). ``reasons`` explica cada rechazo.
+  Ranking por ``bt_objective`` fuera de muestra.
+- Capital: el de la cuenta si quien pide el backtest lo sabe (``start_equity``: la mesa pasa el equity actual);
+  si no, ``paper_start_equity``. El tamaño va en USD fijos (unidades), así que los % dependen del capital.
 - Significación: con 20-30 operaciones una estrategia sin ventaja saca PF >= 1.15 casi la mitad de las
-  veces, y comparando 5 estrategias casi siempre "gana" alguna. Medido con las 5 estrategias sobre paseos
-  aleatorios de 3000 velas (ruido puro): sólo con los cuatro filtros, 17 de 24 gráficas tenían "ganadora";
-  con la significación, 0 de 40 (y las tendencias reales siguen aprobando). Por eso además se exige que el R medio
+  veces, y comparando 5 estrategias casi siempre "gana" alguna. Por eso además se exige que el R medio
   por operación fuera de muestra sea mayor que cero con t de Student >= el cuantil ``1 - alfa/m``
-  (``alfa`` = ``SIGNIFICANCE_ALPHA``, ``m`` = estrategias comparadas en el informe: corrección de
-  Bonferroni). Con pocas operaciones sólo pasa una ventaja grande; es lo honesto.
+  (``alfa`` = ``SIGNIFICANCE_ALPHA``, ``m`` = estrategias que se pueden probar en una gráfica: todas las de
+  ``STRATEGIES`` aunque se pida una sola, corrección de Bonferroni; pedirlas de una en una no baja el listón).
+  Con pocas operaciones sólo pasa una ventaja grande; es lo honesto. Tasa de falsos positivos por diseño: hasta
+  ``alfa`` (5 %) de las gráficas de ruido puro con "ganadora"; medido sobre 120 paseos aleatorios de 3000 velas,
+  4 (3 %). Repetir backtests de la misma gráfica (otros días, otra estrategia) hasta que uno apruebe vuelve a
+  subirla: la mesa pide "forzar" para activar si un informe reciente de la gráfica no la aprobó.
 - Parámetros propuestos para adoptar = los mejores del **último** entrenamiento (su validación es el
-  último tramo). ``is_metrics`` son los de esos parámetros en su propio entrenamiento: optimistas por
-  construcción, sólo para comparar.
+  último tramo). La curva encadenada valida el *procedimiento* (reoptimizar en cada tramo), no esos
+  parámetros fijos: por eso además deben ganar en su propio tramo (retorno > 0 y PF >= el mínimo), y el
+  playbook guarda las dos cosas. ``is_metrics`` son los de esos parámetros en su propio entrenamiento:
+  optimistas por construcción, sólo para comparar.
+- Estrategias con zonas de liquidez (``uses_zones``): sin zonas reales grabadas, el backtest usa zonas
+  aproximadas (pivotes) y en vivo operan con el libro y las liquidaciones: lo validado no es lo que se opera.
+  Salen "no validables" (no aprueban; sólo se activan con "forzar").
 
 Sin fuga de datos: las señales son causales (la fila ``i`` sólo usa velas ``<= i``), así que se calculan
 una vez por combinación sobre toda la historia y cada entrenamiento simula sólo sus velas. Como red de
@@ -58,7 +69,7 @@ from typing import Any, Callable, Iterable, Optional, Union
 import numpy as np
 import pandas as pd
 
-from .backtest import BacktestResult, BTTrade, compute_metrics, run_backtest
+from .backtest import BacktestResult, BTTrade, LiveBrakes, compute_metrics, run_backtest
 from .clock import Clock, RealClock
 from .config import Settings
 from .exchange.base import CANDLE_COLUMNS
@@ -162,6 +173,9 @@ class StrategyEvaluation:
     - ``passed`` / ``reasons``: aprobada sólo si pasa todos los filtros fuera de muestra.
     - ``oos_result``: la curva fuera de muestra como ``BacktestResult`` (sólo en memoria: ``to_dict`` no la
       incluye; ``ReportStore.save(report, result)`` la guarda aparte).
+    - ``adopted_metrics``: los ``params`` propuestos *por sí solos* en su tramo de validación (el último), con
+      el capital inicial y los frenos del riesgo en vivo recién puestos; ``fold`` = ese tramo. Es la única
+      evidencia fuera de muestra de lo que se adopta (la curva encadenada mide el procedimiento).
     """
 
     strategy: str
@@ -176,17 +190,32 @@ class StrategyEvaluation:
     combos: int = 0                   # combinaciones probadas en cada entrenamiento
     error: str = ""                   # fallo de la evaluación (no de la estrategia en el mercado)
     oos_result: Optional[BacktestResult] = field(default=None, repr=False, compare=False)
+    adopted_metrics: dict[str, float] = field(default_factory=dict)
 
     @property
     def folds_positive(self) -> int:
         """Tramos fuera de muestra que acabaron en positivo."""
         return sum(1 for f in self.folds if f.oos_metrics.get("total_return_pct", 0.0) > 0)
 
+    @property
+    def adopted_oos(self) -> dict[str, float]:
+        """Fuera de muestra de los parámetros propuestos (``params``) en su propio tramo, el último
+        (``adopted_metrics``; en informes antiguos, la métrica de ese tramo dentro de la curva encadenada). La curva
+        encadenada (``oos_metrics``) mide el procedimiento, con otros parámetros en cada tramo."""
+        if self.adopted_metrics:
+            return dict(self.adopted_metrics)
+        if not self.folds:
+            return {}
+        out = dict(self.folds[-1].oos_metrics)
+        out["fold"] = self.folds[-1].fold
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return {"strategy": self.strategy, "params": dict(self.params), "is_metrics": dict(self.is_metrics),
                 "oos_metrics": dict(self.oos_metrics), "oos_trades": [t.to_dict() for t in self.oos_trades],
                 "folds": [f.to_dict() for f in self.folds], "score": self.score, "passed": self.passed,
-                "reasons": list(self.reasons), "combos": self.combos, "error": self.error}
+                "reasons": list(self.reasons), "combos": self.combos, "error": self.error,
+                "adopted_metrics": dict(self.adopted_metrics)}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StrategyEvaluation":
@@ -205,7 +234,8 @@ class StrategyEvaluation:
                    is_metrics=_metrics(d.get("is_metrics")), oos_metrics=_metrics(d.get("oos_metrics")),
                    oos_trades=trades, folds=folds, score=None if score is None else _f(score),
                    passed=bool(d.get("passed")), reasons=[str(r) for r in d.get("reasons") or [] if r],
-                   combos=int(_f(d.get("combos"))), error=str(d.get("error") or ""))
+                   combos=int(_f(d.get("combos"))), error=str(d.get("error") or ""),
+                   adopted_metrics=_metrics(d.get("adopted_metrics")))
 
 
 @dataclass
@@ -235,6 +265,7 @@ class OptimizationReport:
     end_ts: float = 0.0
     oos_start_ts: float = 0.0
     complete: bool = True
+    start_equity: float = 0.0         # capital supuesto (equity de la cuenta o ``paper_start_equity``)
 
     # ------------------------------------------------------------------ consultas
     def get(self, strategy: str) -> Optional[StrategyEvaluation]:
@@ -261,7 +292,7 @@ class OptimizationReport:
                 "evaluations": [e.to_dict() for e in self.evaluations], "winner": self.winner,
                 "notes": list(self.notes), "objective": self.objective, "folds": self.folds, "seed": self.seed,
                 "criteria": dict(self.criteria), "start_ts": self.start_ts, "end_ts": self.end_ts,
-                "oos_start_ts": self.oos_start_ts, "complete": self.complete}
+                "oos_start_ts": self.oos_start_ts, "complete": self.complete, "start_equity": self.start_equity}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "OptimizationReport":
@@ -282,7 +313,7 @@ class OptimizationReport:
                    seed=int(_f(d.get("seed"), 7)), criteria=dict(d.get("criteria") or {})
                    if isinstance(d.get("criteria"), dict) else {}, start_ts=_f(d.get("start_ts")),
                    end_ts=_f(d.get("end_ts")), oos_start_ts=_f(d.get("oos_start_ts")),
-                   complete=bool(d.get("complete", True)))
+                   complete=bool(d.get("complete", True)), start_equity=_f(d.get("start_equity")))
 
     # ------------------------------------------------------------------ texto
     def summary_text(self, max_rows: int = 10) -> str:
@@ -297,7 +328,12 @@ class OptimizationReport:
                          f"{crit.get('max_combos', '?')} combinaciones) y medidos en el tramo siguiente, "
                          f"que no vieron. Objetivo: {OBJECTIVE_LABELS.get(obj_key, obj_key)}.")
             if self.oos_start_ts:
-                lines.append(f"Fuera de muestra: {_day(self.oos_start_ts)} → {_day(self.end_ts)}.")
+                lines.append(f"Fuera de muestra: {_day(self.oos_start_ts)} → {_day(self.end_ts)}, con los frenos del "
+                             "riesgo en vivo (halt por drawdown y pérdida diaria, cooldown).")
+        if self.start_equity:
+            src = "equity de la cuenta" if crit.get("equity_source") == "account" else "paper_start_equity"
+            lines.append(f"Capital supuesto: {self.start_equity:,.0f} USD ({src}); el tamaño va en USD fijos, así "
+                         "que los % dependen de este capital.")
         if not self.complete:
             lines.append("INCOMPLETO: la optimización se detuvo antes de terminar.")
         if self.evaluations:
@@ -322,13 +358,19 @@ class OptimizationReport:
             lines.append(f"Ganadora: {win.strategy} (aprobada fuera de muestra; tramos en positivo "
                          f"{win.folds_positive}/{len(win.folds)})")
             lines.append(f"  Parámetros propuestos: {format_params(win.params)}")
+            ad = win.adopted_oos
+            if ad:
+                lines.append(f"  Con estos parámetros, en su tramo fuera de muestra (T{int(ad.get('fold', 0))}): "
+                             f"{_pct(ad.get('total_return_pct'))} %, PF {_pf(ad.get('profit_factor'))}, "
+                             f"{int(ad.get('n_trades', 0))} ops. La tabla (encadenada) mide el procedimiento: "
+                             "reoptimizar en cada tramo.")
             lines.append(f"  Para operarla en automático: activa {self.coin} {self.interval}")
         elif self.evaluations:
             lines.append("Sin ganadora: ninguna estrategia pasó los filtros fuera de muestra "
                          f"(PF >= {_f(crit.get('min_profit_factor')):.2f}, retorno > 0, "
                          f">= {int(_f(crit.get('min_trades')))} operaciones, DD <= "
-                         f"{_f(crit.get('max_drawdown_pct')):.0f} %, ventaja significativa). "
-                         "Mejor no operar esta gráfica en automático.")
+                         f"{_f(crit.get('max_drawdown_pct')):.0f} % y sin halt en vivo, ventaja significativa, "
+                         "parámetros adoptados en positivo en su tramo). Mejor no operar esta gráfica en automático.")
         else:
             lines.append("Sin evaluaciones.")
         rejected = [e for e in self.evaluations[:max_rows] if not e.passed and e.reasons]
@@ -513,6 +555,8 @@ class _Context:
     compared: int                      # estrategias comparadas (corrección de la significación)
     tick: Callable[[int, str], None]
     stop: Callable[[], bool]
+    equity0: float = 0.0               # capital supuesto (equity de la cuenta o paper_start_equity)
+    zones_approx: bool = True          # zonas aproximadas (historical_zones), no las vivas grabadas
 
 
 def _min_train_trades(settings: Settings, train_bars: int, oos_bars: int) -> int:
@@ -539,20 +583,24 @@ def _evaluate(cls: type[Strategy], combos: list[dict[str, Any]], ctx: _Context) 
         prints.append(_fingerprint(sig))
         row = []
         for k, (train_end, _, _) in enumerate(splits):
-            res = run_backtest(strat, bars.iloc[:train_end], s, coin=ctx.coin, meta=ctx.meta, signals=sig)
+            res = run_backtest(strat, bars.iloc[:train_end], s, coin=ctx.coin, meta=ctx.meta,
+                               start_equity=ctx.equity0, signals=sig)
             row.append(res.metrics)
             scores[ci, k] = res.metrics.get(ctx.objective, 0.0)
             trades[ci, k] = res.metrics.get("n_trades", 0)
         train_metrics.append(row)
         ctx.tick(n_folds, f"{cls.name}: combinación {ci + 1}/{len(strategies)}")
-    # 2) elección por tramo y validación en el bloque siguiente (capital encadenado)
+    # 2) elección por tramo y validación en el bloque siguiente (capital encadenado y frenos del riesgo en vivo,
+    #    cuyo estado -máximo de equity, halt, racha de pérdidas- pasa de un tramo al siguiente)
     oos_bars = sum(e - t for _, t, e in splits)
-    equity0 = float(s.paper_start_equity)
+    equity0 = float(ctx.equity0)
     eq = equity0
+    brakes = LiveBrakes.from_settings(s)
     folds: list[FoldResult] = []
     all_trades: list[BTTrade] = []
     curves: list[pd.Series] = []
     n_signals = n_skipped = 0
+    last_run: Optional[tuple[Strategy, pd.DataFrame, pd.DataFrame, int]] = None
     for k, (train_end, test_start, test_end) in enumerate(splits):
         if ctx.stop():
             raise _Stopped
@@ -566,7 +614,8 @@ def _evaluate(cls: type[Strategy], combos: list[dict[str, Any]], ctx: _Context) 
             raise _Leak(f"las señales de {cls.name} cambian al añadir velas posteriores (mira el futuro): "
                         "evaluación no válida")
         res = run_backtest(strat, sub, s, coin=ctx.coin, meta=ctx.meta, start_equity=eq, signals=sig,
-                           trade_from=test_start)
+                           trade_from=test_start, brakes=brakes)
+        last_run = (strat, sub, sig, test_start)
         if len(res.equity):
             eq = float(res.equity.iloc[-1])
         all_trades += res.trades
@@ -585,17 +634,30 @@ def _evaluate(cls: type[Strategy], combos: list[dict[str, Any]], ctx: _Context) 
     end_ts = folds[-1].test_end_ts
     oos = compute_metrics(all_trades, equity, equity0, ctx.interval, n_bars=oos_bars, end_ts=end_ts)
     oos["n_signals"], oos["n_skipped"] = n_signals, n_skipped
+    oos.update(brakes.metrics())
     oos["t_stat"] = edge_t_stat(all_trades)
     oos["t_min"] = required_t_stat(len(all_trades), ctx.compared)
     last = folds[-1]
+    # 3) lo que se adopta (los parámetros del último entrenamiento) por sí solo en su tramo: capital inicial y frenos
+    #    nuevos, sin arrastrar un halt o una racha de los tramos anteriores (que eran otros parámetros).
+    strat, sub, sig, test_start = last_run
+    alone = run_backtest(strat, sub, s, coin=ctx.coin, meta=ctx.meta, start_equity=equity0, signals=sig,
+                         trade_from=test_start, brakes=True)
+    adopted = dict(alone.metrics)
+    adopted["fold"] = last.fold
     score = float(oos.get(ctx.objective, 0.0))
-    reasons = approval_reasons(oos, s)
+    reasons = approval_reasons(oos, s) + adopted_reasons(adopted, s)
+    if cls.uses_zones and ctx.zones_approx:
+        reasons.append("no validable: en backtest las zonas de liquidez son aproximadas (pivotes, sin libro ni "
+                       "liquidaciones históricas) y en vivo vienen del libro y las liquidaciones, así que las señales "
+                       "medidas no son las que se operarían; sólo se activa con 'forzar'")
     result = BacktestResult(coin=ctx.coin, interval=ctx.interval, strategy=cls.name, params=dict(last.params),
                             start_ts=folds[0].test_start_ts, end_ts=end_ts, bars=oos_bars, trades=all_trades,
                             equity=equity, metrics=dict(oos))
     return StrategyEvaluation(strategy=cls.name, params=dict(last.params), is_metrics=dict(last.is_metrics),
                               oos_metrics=oos, oos_trades=all_trades, folds=folds, score=score,
-                              passed=not reasons, reasons=reasons, combos=len(strategies), oos_result=result)
+                              passed=not reasons, reasons=reasons, combos=len(strategies), oos_result=result,
+                              adopted_metrics=adopted)
 
 
 def edge_t_stat(trades: list[BTTrade]) -> float:
@@ -634,8 +696,16 @@ def approval_reasons(oos: dict[str, float], settings: Settings) -> list[str]:
         reasons.append(f"profit factor fuera de muestra {pf:.2f} < {settings.bt_min_profit_factor:.2f}")
     if not ret > 0:
         reasons.append(f"retorno fuera de muestra {ret:+.2f} % (debe ser > 0)")
-    if dd > settings.bt_max_drawdown_pct:
+    live_dd = float(settings.max_drawdown_pct)
+    if oos.get("halted"):
+        when = f" el {_day(float(oos.get('halt_ts') or 0.0))}" if oos.get("halt_ts") else ""
+        reasons.append(f"en vivo la mesa se habría detenido{when}: drawdown >= {live_dd:g} % (max_drawdown_pct: "
+                       "cierra todo y queda en halt hasta 'reset halt')")
+    elif dd > settings.bt_max_drawdown_pct:
         reasons.append(f"drawdown fuera de muestra {dd:.1f} % > {settings.bt_max_drawdown_pct:.1f} %")
+    elif live_dd > 0 and dd >= live_dd:
+        reasons.append(f"drawdown fuera de muestra {dd:.1f} % >= {live_dd:g} % (max_drawdown_pct: en vivo la mesa "
+                       "cerraría todo y se detendría)")
     if "t_stat" in oos and "t_min" in oos and n >= 2 and float(oos["t_stat"]) < float(oos["t_min"]):
         t = float(oos["t_stat"])
         shown = ("-∞" if t < 0 else "∞") if abs(t) >= T_CAP else f"{t:.2f}"
@@ -645,6 +715,33 @@ def approval_reasons(oos: dict[str, float], settings: Settings) -> list[str]:
         else:
             reasons.append(f"R medio por operación <= 0 fuera de muestra (t = {shown})")
     return reasons
+
+
+def adopted_reasons(adopted: Union[dict[str, Any], FoldResult, None], settings: Settings) -> list[str]:
+    """Motivo (en español) si los parámetros que se adoptarían (los del último entrenamiento) no ganan en su
+    propio tramo fuera de muestra (retorno > 0 y PF >= ``bt_min_profit_factor``) o, solos, harían saltar el halt
+    por drawdown. ``adopted`` = ``StrategyEvaluation.adopted_metrics`` (con ``fold``) o el ``FoldResult``.
+    [] si ganan o no hay datos."""
+    if adopted is None:
+        return []
+    if isinstance(adopted, FoldResult):
+        m, fold = adopted.oos_metrics, adopted.fold
+    else:
+        m, fold = adopted, int(_f(adopted.get("fold")))
+    if not m:
+        return []
+    ret, pf, n = float(m.get("total_return_pct", 0.0)), float(m.get("profit_factor", 0.0)), int(m.get("n_trades", 0))
+    where = f"T{fold}: " if fold else ""
+    out = []
+    if not (ret > 0 and pf >= settings.bt_min_profit_factor):
+        out.append(f"los parámetros que se adoptarían (los del último entrenamiento) no ganan en su propio tramo fuera "
+                   f"de muestra ({where}retorno {ret:+.2f} %, PF {_pf(pf)}, {n} ops; mínimo: retorno > 0 y PF >= "
+                   f"{settings.bt_min_profit_factor:.2f}); la curva encadenada valida el procedimiento (reoptimizar en "
+                   "cada tramo), no estos parámetros fijos")
+    elif m.get("halted"):
+        out.append(f"los parámetros que se adoptarían, solos en su tramo ({where.rstrip(': ') or 'el último'}), harían "
+                   f"saltar el halt por drawdown (max_drawdown_pct {float(settings.max_drawdown_pct):g} %)")
+    return out
 
 
 def _failed(name: str, reason: str, error: str = "") -> StrategyEvaluation:
@@ -661,7 +758,8 @@ def _rank_key(e: StrategyEvaluation) -> tuple:
 def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *,
              strategies: Optional[Iterable[Union[str, type[Strategy]]]] = None, meta: Optional[AssetMeta] = None,
              seed: int = 7, progress: Optional[ProgressFn] = None, should_stop: Optional[StopFn] = None,
-             clock: Optional[Clock] = None, zones: Optional[pd.DataFrame] = None) -> OptimizationReport:
+             clock: Optional[Clock] = None, zones: Optional[pd.DataFrame] = None,
+             start_equity: Optional[float] = None) -> OptimizationReport:
     """Walk-forward de cada estrategia sobre ``bars`` (velas **cerradas** de ``coin`` en ``interval``).
 
     - ``strategies``: nombres (o clases) a evaluar; None = todas las de ``STRATEGIES``. Cada una se
@@ -671,7 +769,9 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
     - ``should_stop()``: se consulta entre combinaciones; True -> se devuelve lo terminado
       (``complete=False``).
     - ``clock``: hora del informe (``created_ts``); sin él, la real. ``zones``: zonas por vela para
-      las estrategias de liquidez (sin ellas, ``liquidity.historical_zones`` una vez).
+      las estrategias de liquidez (sin ellas, ``liquidity.historical_zones`` una vez, y esas estrategias salen
+      "no validables": las zonas aproximadas no son las que operan en vivo).
+    - ``start_equity``: capital de la cuenta (la mesa pasa su equity); None o inválido = ``paper_start_equity``.
 
     Una estrategia que falla (error, historia corta, fuga de datos) sale rechazada con el motivo; nunca
     tumba la optimización. ``ValueError`` sólo por entradas inválidas (columnas, índice, nombres).
@@ -688,6 +788,12 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
         notes.append(f"objetivo {settings.bt_objective!r} desconocido: se usa {DEFAULT_OBJECTIVE}")
         obj_name = DEFAULT_OBJECTIVE
     objective = OBJECTIVES[obj_name]
+    equity0, source = float(settings.paper_start_equity), "paper_start_equity"
+    if start_equity is not None:
+        if isinstance(start_equity, (int, float)) and math.isfinite(start_equity) and start_equity > 0:
+            equity0, source = float(start_equity), "account"
+        else:
+            notes.append(f"capital {start_equity!r} no válido: se usa paper_start_equity ({equity0:,.0f} USD)")
     want = int(settings.bt_folds)
     if want < 1:
         notes.append(f"bt_folds={settings.bt_folds} no vale: se usa 1 tramo")
@@ -695,17 +801,22 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
     splits = walk_forward_splits(n, want)
     if splits and len(splits) < want:
         notes.append(f"historia corta ({n} velas): {len(splits)} tramos en vez de {want}")
+    # Bonferroni con todas las estrategias que se pueden probar en la gráfica, aunque se pida una sola: pedirlas de
+    # una en una (m=1) bajaría el listón y aprobaría ruido que el informe conjunto rechaza.
+    compared = max(len(classes), len(STRATEGIES))
     criteria = {"objective": obj_name, "folds": settings.bt_folds, "max_combos": settings.bt_max_combos,
                 "min_trades": settings.bt_min_trades, "min_profit_factor": settings.bt_min_profit_factor,
-                "max_drawdown_pct": settings.bt_max_drawdown_pct, "alpha": SIGNIFICANCE_ALPHA,
-                "compared": len(classes)}
+                "max_drawdown_pct": settings.bt_max_drawdown_pct, "live_max_drawdown_pct": settings.max_drawdown_pct,
+                "daily_loss_limit_pct": settings.daily_loss_limit_pct, "alpha": SIGNIFICANCE_ALPHA,
+                "compared": compared, "start_equity": equity0, "equity_source": source}
     start_ts = _ts(bars.index, 0) if n else 0.0
     end_ts = _ts(bars.index, n - 1) + step if n else 0.0
     report = OptimizationReport(
         id=_report_id(coin, interval, created, bars, seed, classes), coin=coin, interval=interval,
         days=round((end_ts - start_ts) / 86_400.0, 2), bars=n, created_ts=created, evaluations=[], winner=None,
         notes=notes, objective=obj_name, folds=len(splits), seed=int(seed), criteria=criteria,
-        start_ts=start_ts, end_ts=end_ts, oos_start_ts=_ts(bars.index, splits[0][1]) if splits else 0.0)
+        start_ts=start_ts, end_ts=end_ts, oos_start_ts=_ts(bars.index, splits[0][1]) if splits else 0.0,
+        start_equity=equity0)
     if not splits:
         need = 2 * MIN_SEGMENT_BARS
         reason = f"historia insuficiente: {n} velas (hacen falta al menos {need} para un tramo walk-forward)"
@@ -737,6 +848,7 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
             log.exception("optimize: fallo en should_stop (se sigue)")
             return False
 
+    zones_approx = zones is None
     if zones is None and any(c.uses_zones for c in classes):
         try:
             zones = historical_zones(bars, settings)
@@ -748,7 +860,7 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
         zones = zones.reindex(bars.index)
     ctx = _Context(coin=coin, interval=interval, bars=bars, settings=settings, meta=meta, zones=zones,
                    splits=splits, objective=objective, seed=int(seed), clock=clock, step=step,
-                   compared=len(classes), tick=tick, stop=stop)
+                   compared=compared, tick=tick, stop=stop, equity0=equity0, zones_approx=zones_approx)
     evaluations = []
     for cls in classes:
         try:
@@ -771,10 +883,10 @@ def optimize(coin: str, interval: str, bars: pd.DataFrame, settings: Settings, *
     report.evaluations = evaluations
     win = next((e for e in evaluations if e.passed), None)
     report.winner = win.strategy if win is not None else None
-    if any(c.uses_zones for c in classes):
+    if zones_approx and any(c.uses_zones for c in classes):
         names = ", ".join(c.name for c in classes if c.uses_zones)
         notes.append(f"{names}: en backtest las zonas de liquidez son aproximadas (pivotes, sin libro ni "
-                     "liquidaciones históricas); su resultado es sólo orientativo")
+                     "liquidaciones históricas); su resultado es sólo orientativo y no aprueba (no validable)")
     if report.complete and progress is not None and done[0] < total:
         tick(total - done[0], "optimización terminada")
     return report
@@ -870,14 +982,23 @@ class ReportStore:
 
     def latest(self, coin: str, interval: str) -> Optional[OptimizationReport]:
         """El informe más reciente de la gráfica (moneda + temporalidad) o None."""
-        best = None
+        reps = self.chart_reports(coin, interval)
+        return reps[0] if reps else None
+
+    def chart_reports(self, coin: str, interval: str, since_ts: Optional[float] = None) -> list[OptimizationReport]:
+        """Informes de la gráfica (el más reciente primero, por ``created_ts``), opcionalmente sólo los creados desde
+        ``since_ts``. Sirve para ver si la gráfica se probó varias veces (repetir backtests hasta que uno apruebe
+        sube la tasa de falsos positivos)."""
+        out = []
         for p in self._files(f"{_safe(coin)}_{_safe(interval)}_*.json"):
             rep = self._load(p)
             if rep is None or rep.coin != coin or rep.interval != interval:
                 continue
-            if best is None or rep.created_ts > best.created_ts:
-                best = rep
-        return best
+            if since_ts is not None and rep.created_ts < since_ts:
+                continue
+            out.append(rep)
+        out.sort(key=lambda r: r.created_ts, reverse=True)
+        return out
 
     def get(self, report_id: str) -> Optional[OptimizationReport]:
         p = self._find(report_id)
@@ -914,5 +1035,5 @@ class ReportStore:
 
 
 __all__ = ["OBJECTIVES", "DISCLAIMER", "FoldResult", "StrategyEvaluation", "OptimizationReport", "ReportStore",
-           "optimize", "param_combos", "walk_forward_splits", "approval_reasons", "edge_t_stat", "required_t_stat",
-           "format_params"]
+           "optimize", "param_combos", "walk_forward_splits", "approval_reasons", "adopted_reasons", "edge_t_stat",
+           "required_t_stat", "format_params"]

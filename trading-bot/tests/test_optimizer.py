@@ -73,7 +73,10 @@ def test_random_walk_has_no_approved_winner_and_significance_is_what_stops_luck(
     rep, *_ = noise
     assert rep.winner is None and rep.winner_evaluation is None
     assert all(not e.passed for e in rep.evaluations)
-    lucky = [e for e in rep.evaluations if len(e.reasons) == 1 and e.reasons[0].startswith("ventaja no significativa")]
+    # (liquidity_sweep además sale "no validable": sus zonas de backtest no son las que opera en vivo)
+    own = {e.strategy: [r for r in e.reasons if not r.startswith("no validable")] for e in rep.evaluations}
+    lucky = [e for e in rep.evaluations
+             if len(own[e.strategy]) == 1 and own[e.strategy][0].startswith("ventaja no significativa")]
     assert lucky, "debería haber una estrategia que sólo cae por significación"
     o = lucky[0].oos_metrics
     assert o["profit_factor"] >= 1.15 and o["total_return_pct"] > 0 and o["n_trades"] >= 20
@@ -82,7 +85,8 @@ def test_random_walk_has_no_approved_winner_and_significance_is_what_stops_luck(
 
 
 def test_overfitting_random_entries_shine_in_sample_and_are_rejected_out_of_sample(tmp_path):
-    s = new_settings(tmp_path)
+    # Sin los frenos del riesgo en vivo (que cortarían la curva): aquí se mide el sobreajuste, con muchas operaciones.
+    s = new_settings(tmp_path, max_drawdown_pct=90, daily_loss_limit_pct=50, max_consecutive_losses=0)
     for seed in (1, 2, 3):
         bars = make_candles(n=2400, interval="1h", vol_pct=0.5, seed=seed)
         rep = optimize("ETH", "1h", bars, s, strategies=[CoinFlip], clock=SimClock(T0))
@@ -212,9 +216,14 @@ def test_walk_forward_splits_are_anchored_contiguous_and_shrink_with_short_histo
 # --- aprobación y significación -----------------------------------------------------------
 
 def test_approval_reasons_explain_every_rejection(settings):
-    good = {"n_trades": 40, "profit_factor": 1.6, "total_return_pct": 5.0, "max_drawdown_pct": 8.0,
+    good = {"n_trades": 40, "profit_factor": 1.6, "total_return_pct": 5.0, "max_drawdown_pct": 4.0,
             "t_stat": 3.0, "t_min": 2.4}
     assert approval_reasons(good, settings) == []
+    # El límite de drawdown en vivo (max_drawdown_pct = 5 %: cierra todo y halt) manda sobre bt_max_drawdown_pct (25 %)
+    live = approval_reasons(dict(good, max_drawdown_pct=7.7), settings)
+    assert len(live) == 1 and "7.7 % >= 5 %" in live[0] and "max_drawdown_pct" in live[0]
+    halted = approval_reasons(dict(good, halted=1.0, halt_ts=1_767_225_600.0), settings)
+    assert len(halted) == 1 and "se habría detenido el 2026-01-01" in halted[0]
     bad = {"n_trades": 12, "profit_factor": 0.9, "total_return_pct": -1.0, "max_drawdown_pct": 31.0,
            "t_stat": 1.0, "t_min": 2.4}
     reasons = approval_reasons(bad, settings)

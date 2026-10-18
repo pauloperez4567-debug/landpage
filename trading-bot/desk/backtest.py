@@ -23,7 +23,15 @@ resultado fuera de muestra (``optimizer``). Estas reglas intentan no regalar nad
   liquidación llegaría antes que el SL), recortado por ``risk_per_trade_pct`` en el SL (con comisiones),
   ``max_notional_per_coin_usd``, exposición bruta y margen; tamaño redondeado hacia abajo y descartado
   bajo el notional mínimo. Sin ``meta`` no se redondean precios ni (casi) tamaños.
-- No se modelan funding, liquidaciones, el spread (sólo el deslizamiento), halts ni cooldowns del riesgo.
+- **Frenos del riesgo en vivo** (``brakes=``, lo que usa el optimizador fuera de muestra): ``LiveBrakes`` replica
+  ``RiskManager``: halt por drawdown desde el máximo (``max_drawdown_pct``: cierra la posición y no opera más),
+  halt por pérdida del día UTC (``daily_loss_limit_pct``: sin entradas hasta el día siguiente; cierra sólo con
+  ``flatten_on_daily_limit``) y cooldown tras ``max_consecutive_losses`` pérdidas seguidas. El equity se mira
+  dentro de la vela con el peor extremo (``low`` de un long, ``high`` de un short), como el riesgo en vivo, que
+  lo mira cada pocos segundos; el máximo de equity, con el cierre y el mejor extremo de cada vela (cuenta desde
+  la vela siguiente). Los límites salen de ``settings`` (cualquier perfil de riesgo). Aproximación: en vivo los
+  límites son de toda la cuenta (todas las gráficas a la vez), aquí sólo de esta estrategia.
+- No se modelan funding, liquidaciones ni el spread (sólo el deslizamiento).
 
 Rendimiento: 5000 velas con un juego de parámetros en < 100 ms (señales vectorizadas + un bucle
 simple sobre arrays). Para el walk-forward: ``signals=`` reutiliza señales ya calculadas y
@@ -50,7 +58,7 @@ from .strategy import Strategy
 
 log = logging.getLogger(__name__)
 
-EXIT_REASONS = ("sl", "tp", "end", "flip")
+EXIT_REASONS = ("sl", "tp", "end", "flip", "halt")
 METRIC_KEYS = ("total_return_pct", "cagr_pct", "sharpe", "sortino", "max_drawdown_pct", "calmar", "win_rate_pct",
                "profit_factor", "expectancy_r", "n_trades", "avg_trade_pct", "avg_bars_held", "exposure_pct",
                "best_trade_pct", "worst_trade_pct", "fees_usd")
@@ -74,7 +82,7 @@ class BTTrade:
     pnl_pct: float            # pnl / equity al entrar · 100 (impacto en la cuenta)
     r_multiple: float         # pnl / riesgo inicial (size · |entrada − SL|)
     fees: float               # USD
-    exit_reason: str          # "sl" | "tp" | "end" | "flip"
+    exit_reason: str          # "sl" | "tp" | "end" | "flip" | "halt" (cierre por el freno de drawdown)
     bars_held: int            # velas con la posición abierta (la de entrada y la de salida cuentan)
 
     def to_dict(self) -> dict[str, Any]:
@@ -240,12 +248,126 @@ def compute_metrics(trades: list[BTTrade], equity: pd.Series, start_equity: floa
     return clean
 
 
+# --- frenos del riesgo en vivo ------------------------------------------------------
+
+DAY_S = 86_400
+
+
+@dataclass
+class LiveBrakes:
+    """Los frenos de ``RiskManager`` dentro del backtest (ver el docstring del módulo). El estado se puede
+    encadenar entre varias llamadas a ``run_backtest`` (los tramos fuera de muestra del walk-forward): el máximo
+    de equity, el halt y la racha de pérdidas pasan de un tramo al siguiente, como en una cuenta real.
+
+    - ``halt_ts`` != 0: halt por drawdown (en vivo: cierra todo y sólo se levanta con 'reset halt'); desde ahí
+      no se opera.
+    - ``n_blocked``: señales que el riesgo en vivo habría bloqueado (halt diario, cooldown o halt por drawdown).
+    """
+
+    max_drawdown_pct: float = 0.0
+    daily_loss_limit_pct: float = 0.0
+    flatten_on_daily: bool = False
+    max_losses: int = 0
+    cooldown_s: float = 0.0
+    hwm: Optional[float] = None
+    day: int = -1                     # día UTC (segundos // 86400) de la última vela vista
+    day_start: Optional[float] = None
+    daily_halt_day: int = -1          # día con halt por pérdida diaria (sin entradas hasta el siguiente)
+    halt_ts: float = 0.0              # hora (vela) del halt por drawdown; 0 = sin halt
+    halt_detail: str = ""
+    losses: int = 0
+    cooldown_until: float = 0.0
+    n_blocked: int = 0
+    daily_halts: int = 0
+    cooldowns: int = 0
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "LiveBrakes":
+        s = settings
+        return cls(max_drawdown_pct=max(float(s.max_drawdown_pct), 0.0),
+                   daily_loss_limit_pct=max(float(s.daily_loss_limit_pct), 0.0),
+                   flatten_on_daily=bool(s.flatten_on_daily_limit), max_losses=max(int(s.max_consecutive_losses), 0),
+                   cooldown_s=max(float(s.loss_cooldown_minutes), 0.0) * 60.0)
+
+    @property
+    def halted(self) -> bool:
+        return self.halt_ts > 0
+
+    def metrics(self) -> dict[str, float]:
+        """Lo que se añade a las métricas del backtest (números, aptos para JSON)."""
+        return {"halted": 1.0 if self.halted else 0.0, "halt_ts": float(self.halt_ts), "n_blocked": self.n_blocked,
+                "daily_halts": self.daily_halts, "cooldowns": self.cooldowns}
+
+    # ------------------------------------------------------------------ umbrales de equity
+    def dd_floor(self) -> float:
+        """Equity con el que salta el halt por drawdown (-inf sin límite)."""
+        if self.max_drawdown_pct <= 0 or not self.hwm:
+            return -math.inf
+        return self.hwm * (1.0 - self.max_drawdown_pct / 100.0)
+
+    def day_floor(self) -> float:
+        """Equity con el que salta el halt por pérdida diaria hoy (-inf sin límite o si ya saltó)."""
+        if self.daily_loss_limit_pct <= 0 or not self.day_start or self.daily_halt_day == self.day:
+            return -math.inf
+        return self.day_start * (1.0 - self.daily_loss_limit_pct / 100.0)
+
+    def flatten_floor(self) -> float:
+        """Equity por debajo del cual el riesgo en vivo cerraría la posición."""
+        return max(self.dd_floor(), self.day_floor() if self.flatten_on_daily else -math.inf)
+
+    # ------------------------------------------------------------------ eventos
+    def new_bar(self, ts: float, equity: float) -> None:
+        """Al abrir cada vela: cambio de día UTC (referencia = equity en ese momento) y máximo inicial."""
+        day = int(ts // DAY_S)
+        if day != self.day:
+            self.day = day
+            self.day_start = equity
+        if self.hwm is None:
+            self.hwm = equity
+
+    def mark(self, equity: float) -> None:
+        """Equity marcado al cierre de la vela: nuevo máximo."""
+        if math.isfinite(equity) and (self.hwm is None or equity > self.hwm):
+            self.hwm = equity
+
+    def check(self, equity: float, ts: float) -> bool:
+        """Comprueba los halts con ``equity`` (peor caso dentro de la vela o tras una salida). True si salta el
+        halt por drawdown (hay que cerrar y no volver a operar)."""
+        if self.halted or not math.isfinite(equity):
+            return False
+        if equity <= self.dd_floor():
+            self.halt_ts = float(ts)
+            dd = (self.hwm - equity) / self.hwm * 100.0 if self.hwm else 0.0
+            self.halt_detail = f"drawdown {dd:.1f} % >= {self.max_drawdown_pct:g} % (max_drawdown_pct)"
+            return True
+        if equity <= self.day_floor():
+            self.daily_halt_day = self.day
+            self.daily_halts += 1
+        return False
+
+    def on_exit(self, pnl: float, ts: float) -> None:
+        """Racha de pérdidas -> cooldown (como ``RiskManager.record_trade_result``)."""
+        if pnl < 0:
+            self.losses += 1
+            if self.max_losses > 0 and self.losses >= self.max_losses:
+                self.cooldown_until = float(ts) + self.cooldown_s
+                self.losses = 0
+                self.cooldowns += 1
+        elif pnl > 0:
+            self.losses = 0
+
+    def blocks(self, ts: float) -> bool:
+        """True si el riesgo en vivo bloquearía una entrada automática decidida a la hora ``ts``."""
+        return self.halted or self.daily_halt_day == int(ts // DAY_S) or ts < self.cooldown_until
+
+
 # --- motor --------------------------------------------------------------------------
 
 def run_backtest(strategy: Strategy, bars: pd.DataFrame, settings: Settings, *, coin: str,
                  meta: Optional[AssetMeta] = None, start_equity: Optional[float] = None,
                  zones: Optional[pd.DataFrame] = None, signals: Optional[pd.DataFrame] = None,
-                 trade_from: Union[int, pd.Timestamp, None] = None, allow_flip: bool = False) -> BacktestResult:
+                 trade_from: Union[int, pd.Timestamp, None] = None, allow_flip: bool = False,
+                 brakes: Union[bool, LiveBrakes, None] = None) -> BacktestResult:
     """Backtest de ``strategy`` sobre ``bars`` (velas **cerradas**, índice = apertura UTC). Ver el docstring del módulo.
 
     - ``zones``: zonas por vela para las estrategias de liquidez; sin ellas se usan
@@ -256,6 +378,9 @@ def run_backtest(strategy: Strategy, bars: pd.DataFrame, settings: Settings, *, 
       calientan indicadores. La curva de capital y las métricas empiezan ahí.
     - ``allow_flip``: con True una señal contraria con posición abierta la cierra al open siguiente
       (``"flip"``) y abre la nueva. Por defecto False, como en vivo (con posición no se evalúa).
+    - ``brakes``: frenos del riesgo en vivo (``LiveBrakes``): True = nuevos con los límites de ``settings``; una
+      instancia = continuar su estado (tramos encadenados). None/False = sin frenos (entrenamiento). Con frenos,
+      ``metrics`` añade ``halted``, ``halt_ts``, ``n_blocked``, ``daily_halts`` y ``cooldowns``.
     """
     if bars is None or any(c not in bars.columns for c in CANDLE_COLUMNS):
         raise ValueError(f"velas sin columnas {CANDLE_COLUMNS}")
@@ -274,7 +399,9 @@ def run_backtest(strategy: Strategy, bars: pd.DataFrame, settings: Settings, *, 
     if len(signals) != n or (n and not signals.index.equals(bars.index)):
         raise ValueError("las señales no corresponden a estas velas")
 
-    sim = _Simulator(settings, meta, coin, equity0, step, allow_flip)
+    if brakes is True:
+        brakes = LiveBrakes.from_settings(settings)
+    sim = _Simulator(settings, meta, coin, equity0, step, allow_flip, brakes or None)
     trades, eq = sim.run(bars, signals, start)
     index = bars.index[start:]
     equity = pd.Series(eq, index=index, dtype=float)
@@ -284,6 +411,8 @@ def run_backtest(strategy: Strategy, bars: pd.DataFrame, settings: Settings, *, 
     metrics = compute_metrics(trades, equity, equity0, strategy.interval, n_bars=n - start, end_ts=end_ts)
     metrics["n_signals"] = sim.n_signals
     metrics["n_skipped"] = sim.n_skipped
+    if sim.brakes is not None:
+        metrics.update(sim.brakes.metrics())
     return BacktestResult(coin=coin, interval=strategy.interval, strategy=strategy.name, params=strategy.params(),
                           start_ts=start_ts, end_ts=end_ts, bars=n - start, trades=trades, equity=equity,
                           metrics=metrics)
@@ -302,8 +431,9 @@ class _Simulator:
     """Bucle vela a vela sobre arrays de numpy (estado mínimo: una posición y una orden pendiente)."""
 
     def __init__(self, settings: Settings, meta: Optional[AssetMeta], coin: str, equity: float, step: int,
-                 allow_flip: bool):
+                 allow_flip: bool, brakes: Optional[LiveBrakes] = None):
         self.s = settings
+        self.brakes = brakes
         self.meta = meta
         self.coin = coin
         self.cash = equity
@@ -335,8 +465,12 @@ class _Simulator:
         o_l, h_l, l_l, c_l, ts_l = o.tolist(), h.tolist(), l.tolist(), c.tolist(), ts.tolist()
         eq = np.empty(n - start, dtype=float)
         mark = math.nan
+        br = self.brakes
         for j in range(start, n):
             oj, hj, lj, cj = o_l[j], h_l[j], l_l[j], c_l[j]
+            if br is not None:                            # día UTC nuevo: referencia de la pérdida diaria
+                br.new_bar(ts_l[j], self._equity_at(oj if oj == oj else mark))
+                halts_before = (br.halt_ts, br.daily_halt_day)
             entered = 0                                   # 1 = a mercado en el open, 2 = límite en la vela
             # 1) órdenes que se activan en esta vela
             if self.pend is not None:
@@ -359,14 +493,32 @@ class _Simulator:
             pos = self.pos
             if pos is not None:
                 d, p_sl, p_tp = pos[0], pos[3], pos[4]
+                worst = lj if d > 0 else hj
+                p_halt = self._halt_px() if br is not None else math.nan
+                halt_open = p_halt == p_halt and ((oj <= p_halt) if d > 0 else (oj >= p_halt))
+                halt_in = p_halt == p_halt and ((worst <= p_halt) if d > 0 else (worst >= p_halt))
+                sl_in = (lj <= p_sl) if d > 0 else (hj >= p_sl)
                 if entered == 0 and ((oj <= p_sl) if d > 0 else (oj >= p_sl)):
                     self._exit(j, oj, "sl", ts_l[j])     # hueco a través del SL: al open (peor)
+                elif entered == 0 and halt_open:
+                    self._exit(j, oj, "halt", ts_l[j])   # hueco a través del freno de drawdown: al open
                 elif entered == 0 and ((oj >= p_tp) if d > 0 else (oj <= p_tp)):
                     self._exit(j, p_tp, "tp", ts_l[j])   # hueco a través del TP: al TP, sin regalo
-                elif (lj <= p_sl) if d > 0 else (hj >= p_sl):
+                elif halt_in and (not sl_in or ((p_halt >= p_sl) if d > 0 else (p_halt <= p_sl))):
+                    self._exit(j, p_halt, "halt", ts_l[j])   # el freno llega antes que el SL: cierre a mercado
+                elif sl_in:
                     self._exit(j, p_sl, "sl", ts_l[j])   # SL primero aunque la vela toque también el TP
                 elif entered != 2 and ((hj >= p_tp) if d > 0 else (lj <= p_tp)):
                     self._exit(j, p_tp, "tp", ts_l[j])
+            if br is not None:
+                # Halts con el peor equity de la vela (o el que quedó tras salir). Un halt cancela la entrada pendiente.
+                pos = self.pos
+                worst_eq = self._equity_at((lj if pos[0] > 0 else hj) if pos is not None else math.nan)
+                if br.check(worst_eq, ts_l[j]) and self.pos is not None:
+                    self._exit(j, lj if self.pos[0] > 0 else hj, "halt", ts_l[j])
+                if (br.halt_ts, br.daily_halt_day) != halts_before and self.pend is not None:
+                    self.pend = None
+                    br.n_blocked += 1
             # 3) capital marcado a mercado al cierre (último cierre válido); en la última vela se cierra todo
             if cj == cj:
                 mark = cj
@@ -374,17 +526,39 @@ class _Simulator:
                 self._exit(j, mark, "end", ts_l[j])
             pos = self.pos
             eq[j - start] = self.cash + (pos[0] * (mark - pos[2]) * pos[1] if pos is not None else 0.0)
+            if br is not None:
+                if pos is not None and entered == 0:      # en vivo el máximo se mira cada pocos segundos: el mejor
+                    br.mark(self._equity_at(hj if pos[0] > 0 else lj))   # extremo de la vela (cuenta desde la siguiente)
+                br.mark(float(eq[j - start]))
             # 4) señal al cierre de la vela -> orden para la siguiente
             d = dirs[j]
             if d == 0 or j == n - 1 or self.pend is not None or self.cash <= 0:
                 continue
             if self.pos is not None and not (self.allow_flip and self.pos[0] != d):
                 continue
+            if br is not None and br.blocks(ts_l[j] + self.step):
+                br.n_blocked += 1                         # halt diario, cooldown o halt por drawdown en vivo
+                continue
             self.n_signals += 1
             self.flip_pending = self.pos is not None
             expiry = ts_l[j] + self.step + self.ttl       # colocada al cierre de la vela j
             self.pend = (d, limit[j], epx[j], sl[j], tp[j], expiry)
         return self.trades, eq
+
+    def _equity_at(self, px: float) -> float:
+        """Equity con la posición marcada a ``px`` (sin posición o sin precio: el efectivo)."""
+        pos = self.pos
+        if pos is None or not px == px:
+            return self.cash
+        return self.cash + pos[0] * (px - pos[2]) * pos[1]
+
+    def _halt_px(self) -> float:
+        """Precio al que el equity de la posición abierta toca el freno que cierra todo (NaN si no hay)."""
+        floor = self.brakes.flatten_floor()
+        d, size, entry = self.pos[0], self.pos[1], self.pos[2]
+        if not math.isfinite(floor) or size <= 0:
+            return math.nan
+        return entry + (floor - self.cash) / (d * size)
 
     def _enter(self, j: int, d: int, fill: float, ref: float, p_sl: float, p_tp: float, fee_rate: float,
                ts: float) -> bool:
@@ -421,3 +595,5 @@ class _Simulator:
             r_multiple=pnl / risk if risk > 0 else 0.0, fees=entry_fee + fee, exit_reason=reason,
             bars_held=held if held is not None else j - entry_i + 1))
         self.pos = None
+        if self.brakes is not None:                       # la salida ocurre dentro de la vela: cuenta al cierre
+            self.brakes.on_exit(pnl, ts + self.step)

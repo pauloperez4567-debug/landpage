@@ -76,7 +76,7 @@ from .config import TUNABLE, Settings
 from .engine import PENDING, ClosedTrade, ExecutionEngine, fmt_px, fmt_size, fmt_usd
 from .exchange.base import Broker, BrokerError, MarketData, MarketDataError, round_price
 from .exchange.intervals import interval_seconds
-from .jobs import BacktestJob, BacktestOutcome, BacktestWorker, fetch_bars
+from .jobs import BacktestJob, BacktestOutcome, BacktestWorker, bars_for, fetch_bars
 from .journal import Journal
 from .liquidity import LiquidityScanner
 from .models import (AccountState, Command, CommandAction, EntryMode, OrderStatus, RiskDecision, Side, Signal,
@@ -216,6 +216,7 @@ class TradingDesk:
             settings, self.reports, clock, threaded=not self.sim_clock)
         self.telegram = telegram if telegram is not None else self._build_telegram(http_session)
         self.signals_log: deque[dict[str, Any]] = deque(maxlen=SIGNALS_KEPT)
+        self._bt_market: Optional[MarketData] = None
         self._cmd_source = ""
         self._snapshot_dirty = False
         self._last_snapshot_ts = -math.inf
@@ -275,6 +276,8 @@ class TradingDesk:
             except (TypeError, ValueError):
                 continue
         self.cmd_seq = int(state.get("cmd_seq") or 0)
+        # Estrategias por defecto apagadas con 'desactiva COIN tf' ("MONEDA|estrategia@tf"), persistentes.
+        self.defaults_off: set[str] = {str(x) for x in state.get("defaults_off") or [] if isinstance(x, str)}
         # DESK_AUTO=false / --no-auto siempre arrancan en OFF; si no, se respeta el último "auto on/off".
         self.auto_enabled = bool(settings.auto_enabled) and bool(state.get("auto_enabled", True))
         self.param_overrides: dict[str, float] = {}
@@ -292,6 +295,10 @@ class TradingDesk:
         if restored:
             log.warning("parámetros cambiados por comando restaurados del estado: %s", ", ".join(restored))
         self.restored_params = restored
+        if settings.is_live and self.auto_enabled and self._default_slots():
+            self.notices.append("ATENCIÓN: en LIVE la operativa automática incluye estrategias por defecto SIN VALIDAR "
+                                "(DESK_AUTO_DEFAULT_STRATEGIES=true). Para operar sólo lo aprobado fuera de muestra: "
+                                "DESK_AUTO_DEFAULT_STRATEGIES=false y 'backtest' + 'activa' por gráfica.")
 
     def _build_telegram(self, session: Any) -> Any:
         """``TelegramBot`` si hay ``TELEGRAM_BOT_TOKEN`` (se arranca en ``run_forever``). Sin chats autorizados
@@ -756,26 +763,41 @@ class TradingDesk:
         chart = f"{coin} {interval}"
         if self.backtests.busy_with(coin, interval, strategy):
             return f"Ya hay un backtest de {chart} en marcha o en cola: espera al aviso de que terminó."
-        try:
-            bars, notes = fetch_bars(self.market, coin, interval, days, self.clock)
-        except (KeyError, ValueError) as e:      # temporalidad que esta fuente de datos no sirve, etc.
-            return f"No se lanzó el backtest de {chart}: sin velas ({e})."
-        n = 0 if bars is None else len(bars)
-        if n < BT_MIN_BARS:
-            return (f"{chart}: sólo hay {n} velas cerradas y el walk-forward necesita al menos {BT_MIN_BARS} (tramos "
-                    "de entrenamiento y de validación). Prueba con más días o una temporalidad menor.")
+        equity, eq_note = self._backtest_equity()
+        bars, notes, fetch = None, [], None
+        if self.backtests.threaded:
+            # La descarga (hasta 5000 velas; con la API lenta, decenas de segundos) la hace el hilo del trabajo: aquí
+            # se tiene el lock de la mesa y el bucle 24/7 (fills, kill...) esperaría. Un fallo de datos llega en el aviso.
+            src = self._backtest_market()
+            fetch = lambda: fetch_bars(src, coin, interval, days, self.clock)  # noqa: E731
+            n_text = f"~{bars_for(days, interval)[0]} velas"
+        else:
+            # Reloj simulado: sin hilos ni bucle en tiempo real; las velas se fijan ya (determinista).
+            try:
+                bars, notes = fetch_bars(self.market, coin, interval, days, self.clock)
+            except (KeyError, ValueError) as e:      # temporalidad que esta fuente de datos no sirve, etc.
+                return f"No se lanzó el backtest de {chart}: sin velas ({e})."
+            n = 0 if bars is None else len(bars)
+            if n < BT_MIN_BARS:
+                return (f"{chart}: sólo hay {n} velas cerradas y el walk-forward necesita al menos {BT_MIN_BARS} "
+                        "(tramos de entrenamiento y de validación). Prueba con más días o una temporalidad menor.")
+            n_text = f"{n} velas"
         job = BacktestJob(id=cmd.id or self._next_id(), coin=coin, interval=interval, days=days, strategy=strategy,
                           bars=bars, meta=meta, requested_ts=self.clock.now(), cmd_id=cmd.id, notes=notes,
-                          source=self._cmd_source, settings=replace(self.settings))
+                          source=self._cmd_source, settings=replace(self.settings), start_equity=equity, fetch=fetch)
         try:
             ahead = self.backtests.submit(job)
         except ValueError as e:
             return f"No se lanzó el backtest de {chart}: {e}."
         self.journal.event("backtest_requested", id=job.id, coin=coin, interval=interval, days=days,
-                           strategy=strategy, bars=n, source=self._cmd_source)
+                           strategy=strategy, bars=None if bars is None else len(bars), source=self._cmd_source,
+                           start_equity=equity)
         what = strategy or f"{len(STRATEGIES)} estrategias"
         queue = f" (en cola: {ahead} por delante)" if ahead else ""
-        lines = [f"Backtest {chart} ({days:g} días, {n} velas, {what}) en marcha{queue}..."]
+        lines = [f"Backtest {chart} ({days:g} días, {n_text}, {what}) en marcha{queue}..."]
+        cap = f"{equity:,.0f} USD (equity de la cuenta)" if equity else \
+            f"{self.settings.paper_start_equity:,.0f} USD (paper_start_equity)"
+        lines.append(f"Capital supuesto: {cap}; fuera de muestra con los frenos del riesgo en vivo." + eq_note)
         if notes:
             lines.append("Notas: " + "; ".join(notes))
         if self.backtests.threaded:
@@ -785,6 +807,33 @@ class TradingDesk:
             lines.append("Reloj simulado: se ejecuta en este mismo ciclo (determinista) y luego llega el aviso.")
         lines.append("Decide con las métricas FUERA de muestra: un backtest no garantiza resultados futuros.")
         return "\n".join(lines)
+
+    def _backtest_equity(self) -> tuple[Optional[float], str]:
+        """Capital del backtest: el equity de la cuenta (el tamaño va en USD fijos, así que los % y el filtro de
+        drawdown sólo significan algo con el capital real). La lectura del último ciclo; sin ella, una nueva."""
+        acct = self._account
+        if acct is None:
+            try:
+                acct = self.broker.account()
+            except (MarketDataError, BrokerError) as e:
+                log.warning("backtest sin equity de la cuenta (%s): se usa paper_start_equity", e)
+                return None, f" (Sin lectura de la cuenta: {e}.)"
+        eq = acct.equity
+        if isinstance(eq, (int, float)) and math.isfinite(eq) and eq > 0:
+            return float(eq), ""
+        return None, ""
+
+    def _backtest_market(self) -> MarketData:
+        """Fuente de velas para los backtests con hilo: una copia con su propia sesión HTTP si el adaptador la ofrece
+        (``background_copy``); si no, el mismo."""
+        if self._bt_market is None:
+            copy = getattr(self.market, "background_copy", None)
+            try:
+                self._bt_market = copy() if callable(copy) else self.market
+            except Exception as e:  # noqa: BLE001 - sin copia se usa el adaptador de la mesa
+                log.warning("backtests: sin copia del adaptador de datos (%s); se comparte", e)
+                self._bt_market = self.market
+        return self._bt_market
 
     def _on_backtest_done(self, out: BacktestOutcome) -> None:
         """Aviso con el resultado de un backtest (o su fallo) y comprobación del playbook de esa gráfica."""
@@ -810,14 +859,25 @@ class TradingDesk:
 
     def _check_playbook_after(self, rep: OptimizationReport) -> None:
         """Si la gráfica está en el playbook y su estrategia ya no aprueba en el informe nuevo: aviso (no se desactiva
-        sola: decide el operador)."""
+        sola: decide el operador). Lo mismo si el informe rechaza una estrategia por defecto que opera esa gráfica
+        (sin validar, por ``auto_default_strategies``)."""
+        chart = f"{rep.coin} {rep.interval}"
+        for slot in self._default_slots(rep.coin, rep.interval):
+            dev = rep.get(slot.strategy.name)
+            if dev is None or dev.passed:
+                continue
+            why = "; ".join(dev.reasons) or dev.error or "no aprobó"
+            self.notify(f"ESTRATEGIA POR DEFECTO RECHAZADA: {chart} opera {slot.strategy.name} en automático por defecto "
+                        f"(DESK_SYMBOLS + DESK_AUTO_DEFAULT_STRATEGIES, sin validar) y el backtest (informe {rep.id}) NO "
+                        f"la aprueba fuera de muestra: {why}. Sigue operando: 'desactiva {chart}' la para en esta "
+                        "gráfica (o DESK_AUTO_DEFAULT_STRATEGIES=false para operar sólo lo aprobado).", logging.WARNING,
+                        kind="playbook", coin=rep.coin)
         entry = self.playbook.get(rep.coin, rep.interval)
         if entry is None:
             return
         ev = rep.get(entry.strategy)
         if ev is None:
             return
-        chart = f"{rep.coin} {rep.interval}"
         if ev.error or not ev.passed:
             why = "; ".join(ev.reasons) or ev.error or "no aprobó"
             self.notify(f"PLAYBOOK DEGRADADO: {chart} opera {entry.strategy} en automático, pero en el backtest nuevo "
@@ -853,6 +913,14 @@ class TradingDesk:
                 text += (f" Si aun así quieres operarla (NO recomendado: lo que no aprueba fuera de muestra es "
                          f"probablemente ruido): 'activa {chart} [estrategia] forzar'.")
             return text
+        rejected = self._recent_rejections(report, entry.strategy)
+        if not cmd.force:
+            if rejected:
+                return (f"No se activó {chart}: {entry.strategy} aprobó en el informe {report.id}, pero en los últimos "
+                        f"{REPORT_STALE_DAYS:g} días la misma gráfica la rechazó en {len(rejected)} informe(s) "
+                        f"({', '.join(r.id for r in rejected[:5])}). Repetir backtests (otros días, otra estrategia) "
+                        "hasta que uno apruebe convierte el ruido en 'ganadoras'. Si aun así quieres operarla: "
+                        f"'activa {chart} {entry.strategy} forzar'.")
         try:
             old = self.playbook.adopt(entry, self.settings)
         except ValueError as e:
@@ -863,7 +931,8 @@ class TradingDesk:
         passed = bool(ev is not None and ev.passed)
         self._snapshot_dirty = True
         self.journal.event("playbook_adopt", coin=entry.coin, interval=entry.interval, strategy=entry.strategy,
-                           params=entry.params, report=report.id, forced=not passed)
+                           params=entry.params, report=report.id, forced=not passed or bool(rejected),
+                           recent_rejections=[r.id for r in rejected])
         units = f"{entry.units:g} u" if entry.units is not None else f"{self.settings.auto_units:g} u (DESK_AUTO_UNITS)"
         lines = []
         if not passed:
@@ -872,13 +941,22 @@ class TradingDesk:
             lines.append(f"ATENCIÓN — FORZADO{pick}: {entry.strategy} NO aprobó fuera de muestra ({why}). Lo más "
                          "probable es que no tenga ventaja real: usa pocas unidades, vigílala y "
                          f"'desactiva {chart}' para pararla.")
+        elif rejected:
+            lines.append(f"ATENCIÓN — FORZADO: en los últimos {REPORT_STALE_DAYS:g} días la gráfica rechazó "
+                         f"{entry.strategy} en {len(rejected)} informe(s) ({', '.join(r.id for r in rejected[:5])}); "
+                         "una aprobación entre varios intentos puede ser suerte.")
         lines.append(f"{chart} en automático con {entry.strategy} ({format_params(entry.params)}), {units} por "
                      f"operación. Señales 'auto:{entry.strategy}@{interval}' con las mismas protecciones de riesgo "
                      "(SL obligatorio, límites de pérdida diaria y drawdown).")
         if entry.oos_metrics:
             age = (self.clock.now() - report.created_ts) / 86_400.0 if report.created_ts else 0.0
-            lines.append(f"Fuera de muestra (informe {report.id}): {_fmt_metrics(entry.oos_metrics)}. Orientativo, "
-                         "no una promesa.")
+            text = f"Fuera de muestra (informe {report.id}), procedimiento reoptimizando por tramo: " \
+                   f"{_fmt_metrics(entry.oos_metrics)}"
+            if entry.adopted_metrics:
+                fold = entry.adopted_metrics.get("fold")
+                where = f" (tramo T{int(fold)})" if isinstance(fold, (int, float)) and fold else ""
+                text += f"; con estos parámetros fijos, en su tramo{where}: {_fmt_metrics(entry.adopted_metrics)}"
+            lines.append(text + ". Orientativo, no una promesa.")
             if age > REPORT_STALE_DAYS:
                 lines.append(f"El informe tiene {age:.0f} días: considera repetir 'backtest {chart}'.")
         if old is not None:
@@ -895,6 +973,25 @@ class TradingDesk:
             lines.append("Modo paper: obsérvala unos días (panel, 'playbook', 'estado') antes de pasarla a testnet.")
         return "\n".join(lines)
 
+    def _recent_rejections(self, report: OptimizationReport, strategy: str) -> list[OptimizationReport]:
+        """Otros informes de la misma gráfica de los últimos ``REPORT_STALE_DAYS`` días que evaluaron ``strategy`` y
+        la rechazaron fuera de muestra (sin contar las evaluaciones que fallaron por error)."""
+        since = report.created_ts - REPORT_STALE_DAYS * 86_400.0 if report.created_ts else None
+        out = []
+        try:
+            reps = self.reports.chart_reports(report.coin, report.interval, since_ts=since)
+        except Exception as e:  # noqa: BLE001 - sin historial no se bloquea la activación
+            log.warning("activa: no se pudo leer el historial de informes de %s %s: %s", report.coin,
+                        report.interval, e)
+            return []
+        for r in reps:
+            if r.id == report.id:
+                continue
+            ev = r.get(strategy)
+            if ev is not None and not ev.passed and not ev.error:
+                out.append(r)
+        return out
+
     def _cmd_deactivate(self, cmd: Command) -> str:
         coin, interval = cmd.coin, cmd.interval
         if not coin:
@@ -906,23 +1003,36 @@ class TradingDesk:
             n = self.playbook.remove(coin, interval)
         except OSError as e:
             return f"No se pudo guardar el playbook ({e}): {chart} sigue activa."
-        if not n:
-            return f"{chart} no está en el playbook. 'playbook' para ver las gráficas activas."
+        # Estrategias por defecto de esa gráfica: también fuera (persistente, en desk.json).
+        defaults = self._default_slots(coin, interval)
+        for slot in defaults:
+            self.defaults_off.add(f"{slot.coin.upper()}|{slot.label}")
+        if not n and not defaults:
+            return f"{chart} no está en el playbook ni tiene estrategias por defecto activas. 'playbook' para ver lo activo."
         self._snapshot_dirty = True
-        self.journal.event("playbook_remove", coin=coin, interval=interval, removed=n)
-        text = (f"Fuera del automático: {', '.join(f'{e.coin} {e.interval} ({e.strategy})' for e in gone)}. Las "
-                f"posiciones abiertas siguen con su SL/TP (para salir: 'cierra {coin}').")
-        if self.settings.auto_default_strategies and self.strategies and coin.upper() in self.settings.symbols:
-            text += (f" Ojo: {coin} sigue en DESK_SYMBOLS con las estrategias por defecto "
-                     "(DESK_AUTO_DEFAULT_STRATEGIES=false para no usarlas).")
+        if defaults:
+            self._save_desk_state()
+        self.journal.event("playbook_remove", coin=coin, interval=interval, removed=n,
+                           defaults_off=[f"{s.coin} {s.label}" for s in defaults])
+        parts = [f"{e.coin} {e.interval} ({e.strategy})" for e in gone]
+        parts += [f"{s.coin} {s.label} (por defecto)" for s in defaults]
+        text = (f"Fuera del automático: {', '.join(parts)}. Las posiciones abiertas siguen con su SL/TP (para salir: "
+                f"'cierra {coin}').")
+        if defaults:
+            text += (" Las estrategias por defecto quedan desactivadas en esa gráfica también tras reiniciar; para operar "
+                     f"una con validación: 'backtest {coin} <tf> <estrategia>' y 'activa {coin} <tf> <estrategia>'.")
         return text
 
     def _cmd_playbook(self, cmd: Command) -> str:
         lines = [self.playbook.summary_text()]
         if self.settings.auto_default_strategies and self.strategies:
             names = ", ".join(f"{s.name}@{s.interval}" for s in self.strategies)
-            lines.append(f"Estrategias por defecto: {names} sobre {', '.join(self.settings.symbols)} "
-                         "(DESK_AUTO_DEFAULT_STRATEGIES=false para operar sólo el playbook).")
+            lines.append(f"Estrategias por defecto (sin validar): {names} sobre {', '.join(self.settings.symbols)}, "
+                         "sólo en monedas sin gráficas en el playbook (DESK_AUTO_DEFAULT_STRATEGIES=false para operar "
+                         "sólo el playbook).")
+            if self.defaults_off:
+                off = ", ".join(k.replace("|", " ") for k in sorted(self.defaults_off))
+                lines.append(f"Desactivadas con 'desactiva': {off}.")
         else:
             lines.append("Sin estrategias por defecto: sólo opera el playbook.")
         state = "ON" if self.auto_enabled else "OFF ('auto on' para que opere)"
@@ -1419,22 +1529,37 @@ class TradingDesk:
 
     def auto_slots(self) -> list[AutoSlot]:
         """Lo que evalúa la operativa automática: las entradas activas del playbook (cada una con su temporalidad,
-        parámetros y unidades) y, si ``auto_default_strategies``, las estrategias por defecto sobre ``symbols`` (salvo
-        la misma estrategia y temporalidad que el playbook ya cubre en esa moneda). El playbook va primero."""
+        parámetros y unidades) y, si ``auto_default_strategies``, las estrategias por defecto sobre ``symbols``, sólo
+        en monedas sin entradas activas en el playbook (una estrategia adoptada no compite por la moneda con otras sin
+        validar: su secuencia de operaciones se parece a la de su backtest) y salvo las desactivadas con 'desactiva
+        COIN tf' (``defaults_off``)."""
         slots: list[AutoSlot] = []
-        taken: set[tuple[str, str]] = set()
+        taken: set[str] = set()
         for entry, strat in self.playbook.strategies(self.settings, self.clock):
             units = entry.units if entry.units is not None else self.settings.auto_units
-            slot = AutoSlot(entry.coin, strat, float(units), "playbook")
-            slots.append(slot)
-            taken.add((entry.coin.upper(), slot.label))
-        if self.settings.auto_default_strategies:
-            for coin in self.settings.symbols:
-                for strat in self.strategies:
-                    slot = AutoSlot(coin, strat, float(self.settings.auto_units), "defecto")
-                    if (coin.upper(), slot.label) not in taken:
-                        slots.append(slot)
+            slots.append(AutoSlot(entry.coin, strat, float(units), "playbook"))
+            taken.add(entry.coin.upper())
+        for slot in self._default_slots():
+            if slot.coin.upper() not in taken:
+                slots.append(slot)
         return slots
+
+    def _default_slots(self, coin: Optional[str] = None, interval: Optional[str] = None) -> list[AutoSlot]:
+        """Estrategias por defecto activas (``auto_default_strategies``, sin las de ``defaults_off``), opcionalmente
+        de una moneda y temporalidad. No mira el playbook."""
+        if not self.settings.auto_default_strategies:
+            return []
+        out = []
+        for c in self.settings.symbols:
+            if coin is not None and c.upper() != coin.upper():
+                continue
+            for strat in self.strategies:
+                if interval is not None and strat.interval != interval:
+                    continue
+                slot = AutoSlot(c, strat, float(self.settings.auto_units), "defecto")
+                if f"{c.upper()}|{slot.label}" not in self.defaults_off:
+                    out.append(slot)
+        return out
 
     def _stage_strategies(self) -> None:
         now = self.clock.now()
@@ -1830,6 +1955,7 @@ class TradingDesk:
             "param_overrides": dict(self.param_overrides),
             "day_stats": dict(self.day_stats),
             "bar_seen": {f"{c}|{st}": bar for (c, st), bar in sorted(self._bar_seen.items())},
+            "defaults_off": sorted(self.defaults_off),
         }
         cursor = getattr(self.broker, "fills_cursor_ts", None)
         if isinstance(cursor, (int, float)):

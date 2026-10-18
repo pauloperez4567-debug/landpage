@@ -3,9 +3,11 @@
 Un backtest walk-forward de las 5 estrategias tarda segundos (más con 5000 velas): si corriera dentro del ciclo,
 la mesa dejaría de vigilar posiciones, alarmas y comandos mientras tanto. Por eso:
 
-- ``fetch_bars`` pide las velas al ``MarketData`` (lo hace quien recibe el comando: así un error de datos o una
-  moneda desconocida se contestan al momento) y se queda con las **cerradas**. Velas = días · velas por día,
-  con tope ``MAX_BARS`` (5000, lo que da Hyperliquid como mucho): si se recorta se dice.
+- ``fetch_bars`` pide las velas al ``MarketData`` y se queda con las **cerradas**. Velas = días · velas por día,
+  con tope ``MAX_BARS`` (5000, lo que da Hyperliquid como mucho): si se recorta se dice. Con hilo, la descarga
+  la hace el propio trabajo (``BacktestJob.fetch``): con una API lenta puede tardar decenas de segundos y no debe
+  bloquear el bucle de la mesa (que espera el mismo lock que los comandos de Telegram). Quien recibe el comando
+  sólo valida lo barato (moneda, temporalidad) y un fallo de datos llega en el aviso del resultado.
 - ``BacktestWorker`` ejecuta los trabajos de uno en uno, en orden de llegada, en un hilo propio (cola con tope
   ``MAX_QUEUE``). Los resultados se recogen con ``poll()`` desde el bucle de la mesa (que es quien avisa): el
   hilo nunca toca la mesa. ``stop()`` (al apagar) cancela lo pendiente y pide parar al que corre
@@ -36,14 +38,16 @@ import pandas as pd
 
 from .clock import Clock
 from .config import Settings
+from .exchange.base import MarketDataError
 from .exchange.intervals import interval_seconds
 from .models import AssetMeta
-from .optimizer import OptimizationReport, ReportStore, optimize
+from .optimizer import MIN_SEGMENT_BARS, OptimizationReport, ReportStore, optimize
 from .strategy import closed_candles
 
 log = logging.getLogger(__name__)
 
 MAX_BARS = 5000          # velas que da Hyperliquid como mucho en una petición (incluida la vela en curso)
+MIN_BARS = 2 * MIN_SEGMENT_BARS   # un tramo de entrenamiento y uno de validación como mínimo
 MAX_QUEUE = 4            # trabajos en espera (además del que corre)
 STOP_JOIN_S = 5.0
 
@@ -77,20 +81,23 @@ def fetch_bars(market: Any, coin: str, interval: str, days: float, clock: Clock)
 
 @dataclass
 class BacktestJob:
-    """Un backtest pedido: la gráfica, sus velas cerradas ya descargadas y quién lo pidió."""
+    """Un backtest pedido: la gráfica, sus velas cerradas (ya descargadas, o ``fetch`` para descargarlas en el hilo
+    del trabajo) y quién lo pidió. ``start_equity`` = capital de la cuenta al pedirlo (None = ``paper_start_equity``)."""
 
     id: str
     coin: str
     interval: str
     days: float                            # días pedidos
     strategy: Optional[str]                # None = todas
-    bars: pd.DataFrame
+    bars: Optional[pd.DataFrame]
     meta: Optional[AssetMeta] = None
     requested_ts: float = 0.0
     cmd_id: str = ""
     notes: list[str] = field(default_factory=list)
     source: str = ""                       # quién lo pidió ("consola", "telegram", "inbox"...)
     settings: Optional[Settings] = None    # copia de la configuración al pedirlo (None = la del trabajador)
+    start_equity: Optional[float] = None   # equity de la cuenta al pedirlo
+    fetch: Optional[Callable[[], tuple[pd.DataFrame, list[str]]]] = field(default=None, repr=False)
 
     @property
     def chart(self) -> tuple[str, str]:
@@ -99,6 +106,10 @@ class BacktestJob:
     def label(self) -> str:
         what = f", {self.strategy}" if self.strategy else ""
         return f"{self.coin} {self.interval} ({self.days:g} días{what})"
+
+
+class JobDataError(Exception):
+    """Sin velas suficientes para el backtest: el texto va tal cual al usuario."""
 
 
 @dataclass
@@ -123,13 +134,28 @@ class BacktestOutcome:
 def run_job(job: BacktestJob, settings: Settings, store: ReportStore, clock: Clock, *,
             should_stop: Optional[Callable[[], bool]] = None,
             progress: Optional[Callable[[int, int, str], Any]] = None, render: bool = True) -> BacktestOutcome:
-    """Optimiza la gráfica, guarda el informe y pinta HTML/PNG. Lanza si ``optimize`` o el guardado fallan
-    (``BacktestWorker`` lo convierte en ``BacktestOutcome.error``)."""
+    """Descarga las velas si hace falta (``job.fetch``), optimiza la gráfica, guarda el informe y pinta HTML/PNG.
+    Lanza si la descarga, ``optimize`` o el guardado fallan (``BacktestWorker`` lo convierte en
+    ``BacktestOutcome.error``); ``JobDataError`` con un texto para el usuario si no hay velas suficientes."""
     t0 = time.monotonic()
     settings = job.settings if job.settings is not None else settings
+    if job.bars is None and job.fetch is not None:
+        try:
+            job.bars, notes = job.fetch()
+        except (KeyError, ValueError) as e:        # temporalidad que esta fuente de datos no sirve, etc.
+            raise JobDataError(f"sin velas de {job.coin} {job.interval} ({e})") from e
+        except MarketDataError as e:               # API caída o lenta: se puede repetir
+            raise JobDataError(f"no se pudieron descargar las velas de {job.coin} {job.interval} ({e}); "
+                               "repítelo en un rato") from e
+        job.notes = list(notes) + [n for n in job.notes if n not in notes]
+    n = 0 if job.bars is None else len(job.bars)
+    if n < MIN_BARS:
+        raise JobDataError(f"{job.coin} {job.interval}: sólo hay {n} velas cerradas y el walk-forward necesita al "
+                           f"menos {MIN_BARS} (tramos de entrenamiento y de validación). Prueba con más días o una "
+                           "temporalidad menor.")
     report = optimize(job.coin, job.interval, job.bars, settings,
                       strategies=[job.strategy] if job.strategy else None, meta=job.meta,
-                      progress=progress, should_stop=should_stop, clock=clock)
+                      progress=progress, should_stop=should_stop, clock=clock, start_equity=job.start_equity)
     for note in job.notes:
         if note not in report.notes:
             report.notes.insert(0, note)
@@ -309,6 +335,9 @@ class BacktestWorker:
         try:
             out = self.runner(job, self.settings, self.store, self.clock, should_stop=self._stop.is_set,
                               progress=self._on_progress)
+        except JobDataError as e:
+            log.warning("backtest %s sin datos: %s", job.label(), e)
+            out = BacktestOutcome(job=job, error=str(e), elapsed_s=time.monotonic() - t0)
         except Exception as e:  # noqa: BLE001 - un backtest roto nunca tumba el hilo ni la mesa
             log.exception("backtest %s falló", job.label())
             out = BacktestOutcome(job=job, error=f"{type(e).__name__}: {e}", elapsed_s=time.monotonic() - t0)
@@ -324,4 +353,5 @@ class BacktestWorker:
             self._done.append(out)
 
 
-__all__ = ["MAX_BARS", "BacktestJob", "BacktestOutcome", "BacktestWorker", "bars_for", "fetch_bars", "run_job"]
+__all__ = ["MAX_BARS", "MIN_BARS", "BacktestJob", "BacktestOutcome", "BacktestWorker", "JobDataError", "bars_for",
+           "fetch_bars", "run_job"]

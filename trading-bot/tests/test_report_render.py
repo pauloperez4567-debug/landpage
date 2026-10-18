@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -100,7 +101,7 @@ def test_html_honesty_light_dark_and_tables(case):
     assert "hour_pattern (ganadora): fuera de muestra" in text and "✔ aprobada" in text and "✘ rechazada" in text
     for e in rep.evaluations:
         for reason in e.reasons:
-            assert reason.replace("<", "&lt;").replace(">", "&gt;") in text
+            assert html.escape(reason, quote=True) in text
     assert "Tramos walk-forward: hour_pattern" in text and "Parámetros elegidos con el entrenamiento: hour=7" in text
     assert "Operaciones fuera de muestra" in text
 
