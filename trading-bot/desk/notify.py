@@ -254,6 +254,11 @@ class _HttpChannel(Channel):
         self.session = session if session is not None else requests.Session()
         self.timeout = float(timeout)
         self._sleep = sleep if sleep is not None else time.sleep
+        self.label = ""          # identidad de la mesa ("PAPER", "LIVE mainnet", "SIM fast"...): prefijo "[...]"
+
+    def _text(self, n: Notification) -> str:
+        line = n.line()
+        return f"[{self.label}] {line}" if self.label else line
 
     def _post(self, url: str, what: str, **kwargs: Any) -> requests.Response:
         """POST con un reintento ante 429. Lanza ``ChannelError`` (sin secretos) si no hay respuesta 2xx."""
@@ -308,7 +313,7 @@ class TelegramChannel(_HttpChannel):
     def send(self, n: Notification) -> None:
         if not self._token or not self.chat_ids:
             raise ChannelError("Telegram sin token o sin chats configurados")
-        text = n.line()
+        text = self._text(n)
         silent = n.level == "info"
         errors = []
         for chat in self.chat_ids:
@@ -360,7 +365,7 @@ class WebhookChannel(_HttpChannel):
         if not self._url:
             raise ChannelError("webhook sin URL configurada")
         what = f"webhook {safe_url(self._url)}"
-        for chunk in split_message(n.line(), WEBHOOK_CHUNK):
+        for chunk in split_message(self._text(n), WEBHOOK_CHUNK):
             self._post(self._url, what, json={"content": chunk, "text": chunk})
 
 
@@ -469,14 +474,42 @@ class Notifier:
                 self._q.put_nowait((ch, n))
                 return
             except queue.Full:
-                try:  # se descarta el más antiguo: el aviso nuevo es el más relevante
-                    self._q.get_nowait()
-                    self._q.task_done()
-                except queue.Empty:
-                    continue
+                dropped = self._make_room(n)
                 self.dropped += 1
-                if self.dropped == 1 or self.dropped % 100 == 0:
+                if dropped is not None and dropped.level == "critical":
+                    log.error("avisos: cola llena de críticos (¿red caída?): se descarta el crítico más antiguo: %s",
+                              dropped.text[:120])
+                elif self.dropped == 1 or self.dropped % 100 == 0:
                     log.warning("avisos: cola llena, %d aviso(s) descartados (¿red caída?)", self.dropped)
+                if dropped is None:              # el nuevo es el menos importante: se descarta él
+                    if n.level == "critical":
+                        log.error("avisos: crítico descartado con la cola llena: %s", n.text[:120])
+                    return
+
+    def _make_room(self, n: Notification) -> Optional[Notification]:
+        """Cola llena: saca el aviso menos importante (el info más antiguo; si no hay, el warn más antiguo; un
+        crítico sólo para dejar sitio a otro crítico) y lo devuelve. None si el que sobra es el nuevo ``n``."""
+        q = self._q
+        with q.mutex:
+            items = q.queue
+            best_i, best_rank = None, None
+            for i, item in enumerate(items):
+                if item is _STOP:
+                    continue
+                r = level_rank(item[1].level)
+                if best_rank is None or r < best_rank:
+                    best_i, best_rank = i, r
+                    if r == 0:
+                        break
+            if best_i is None or best_rank > level_rank(n.level):
+                return None
+            victim = items[best_i][1]
+            del items[best_i]
+            q.unfinished_tasks -= 1
+            if q.unfinished_tasks <= 0:
+                q.all_tasks_done.notify_all()
+            q.not_full.notify()
+        return victim
 
     def _ensure_thread(self) -> None:
         with self._lock:
@@ -540,14 +573,18 @@ class Notifier:
 
 def build_notifier(settings: Any, out: Any = None, *, console: bool = True, clock: Optional[Clock] = None,
                    session: Optional[requests.Session] = None, file_path: Optional[Union[str, Path]] = None,
-                   threaded: bool = True) -> Notifier:
+                   threaded: bool = True, network: bool = True, label: str = "") -> Notifier:
     """``Notifier`` según la configuración: consola (si ``console``), fichero (si ``file_path``), Telegram si hay
-    ``telegram_bot_token`` y ``telegram_chat_ids``, webhook si hay ``webhook_url``."""
+    ``telegram_bot_token`` y ``telegram_chat_ids``, webhook si hay ``webhook_url``. ``network=False`` = sin canales
+    de red (una simulación no avisa al chat ni al webhook de la mesa real); ``label`` = identidad de la mesa, que
+    encabeza cada aviso de red (``[PAPER] ...``)."""
     channels: list[Channel] = []
     if console:
         channels.append(ConsoleChannel(out, bell=bool(getattr(settings, "alert_bell", True))))
     if file_path is not None:
         channels.append(FileChannel(file_path))
+    if not network:
+        return Notifier(channels, clock=clock, threaded=threaded)
     token = str(getattr(settings, "telegram_bot_token", "") or "").strip()
     chats = list(getattr(settings, "telegram_chat_ids", None) or [])
     if token and chats:
@@ -559,6 +596,9 @@ def build_notifier(settings: Any, out: Any = None, *, console: bool = True, cloc
     if url:
         channels.append(WebhookChannel(url, _setting_level(settings, "alert_min_level_webhook", "warn"),
                                        session=session))
+    for ch in channels:
+        if isinstance(ch, _HttpChannel):
+            ch.label = str(label or "")
     return Notifier(channels, clock=clock, threaded=threaded)
 
 

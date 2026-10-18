@@ -12,6 +12,7 @@ import pytest
 from conftest import FakeMarketData, make_candles
 from desk.alerts import ZONE_MAX_AGE_S, AlertManager, AlertRule, describe_rule
 from desk.indicators import rsi
+from desk.liquidity import LiquidityScanner
 from desk.models import Side, Zone
 
 STEP = 3600   # velas de 1h
@@ -325,9 +326,46 @@ def test_zone_fires_when_price_enters_previous_zone(mgr, market):
     assert mgr.evaluate(market, sc) == []           # primera vez: sólo mira dónde están las zonas
     market.set_price("BTC", 98.0)
     assert mgr.evaluate(market, sc) == []
-    market.set_price("BTC", 96.5)
+    market.set_price("BTC", 96.5)                    # dentro del tramo pero sin llegar a su centro (la entrada)
+    assert mgr.evaluate(market, sc) == []
+    market.set_price("BTC", 95.8)
     fired = mgr.evaluate(market, sc)
     assert len(fired) == 1 and "zona de liquidez LONG 95-97" in fired[0] and "$2,500,000.00" in fired[0]
+
+
+def test_zone_next_to_the_mid_does_not_fire_with_the_price_still(settings, clock, tmp_path):
+    """El tramo 0 LONG es [mid·(1-ancho), mid]: su borde superior ES el precio. Con el precio quieto no hay aviso;
+    al llegar al muro, sí."""
+    market = FakeMarketData(clock)
+    market.set_price("SOL", 150.0)
+    book = dict(bids=[(149.90, 4000.0), (148.0, 1000.0)], asks=[(150.10, 500.0)])
+    market.set_book("SOL", **book)
+    am = AlertManager(settings, clock, tmp_path, None)
+    am.add("SOL", {"kind": "zone", "side": "long", "repeat": True}, ref_px=150.0)
+    sc = LiquidityScanner(market, settings)
+    assert sc.zones("SOL")[Side.LONG].high == pytest.approx(150.0)
+    fired = []
+    for _ in range(13):
+        fired += am.evaluate(market, sc)
+        clock.advance(30)
+        market.set_price("SOL", 150.0)
+        market.set_book("SOL", **book)
+    assert fired == []
+    market.set_price("SOL", 149.90)
+    market.set_book("SOL", bids=[(149.85, 10.0), (148.0, 1000.0)], asks=[(149.95, 500.0)])
+    fired = am.evaluate(market, sc)
+    assert len(fired) == 1 and "LONG" in fired[0]
+
+
+def test_hip3_coin_keeps_the_dex_prefix_and_fires(mgr, market):
+    """``xyz:GOLD`` no puede guardarse como ``XYZ:GOLD``: Hyperliquid no tiene libro con ese nombre."""
+    market.set_price("xyz:GOLD", 3000.0)
+    rule = mgr.add("xyz:gold", {"kind": "price_above", "level": 3100}, ref_px=3000.0)
+    assert rule.coin == "xyz:GOLD"
+    assert AlertRule.from_dict(dict(rule.to_dict(), coin="XYZ:GOLD")).coin == "xyz:GOLD"   # reglas ya guardadas
+    market.set_price("xyz:GOLD", 3150.0)
+    fired = mgr.evaluate(market)
+    assert len(fired) == 1 and "xyz:GOLD" in fired[0]
 
 
 def test_zone_side_filter_and_short_side(mgr, market):
@@ -337,7 +375,7 @@ def test_zone_side_filter_and_short_side(mgr, market):
     only_long = mgr.add("BTC", {"kind": "zone", "side": Side.LONG})
     both = mgr.add("BTC", {"kind": "zone"})
     mgr.evaluate(market, sc)
-    market.set_price("BTC", 104.5)
+    market.set_price("BTC", 105.2)
     fired = mgr.evaluate(market, sc)
     assert len(fired) == 1 and f"#{both.id}" in fired[0] and "SHORT" in fired[0]
     assert mgr.get(only_long.id) is not None

@@ -71,6 +71,10 @@ python -m desk run --data sim --fast --cycles 3000 --cmd "0:long HYPE" --cmd "20
   reciente que guardó la mesa, también tras un corte brusco); `--fresh` empieza de cero.
 - También puedes reproducir velas reales: `--data replay:datos/btc_15m.csv` (columnas
   `timestamp,open,high,low,close,volume`).
+- Una simulación (datos `sim`/`replay` o `--fast`) **no usa Telegram ni el webhook** aunque estén en `.env`: con el
+  mismo bot competiría con la mesa real por tus órdenes (un `kill` podría ejecutarlo la simulación) y mandaría
+  avisos simulados a tu chat. `DESK_TELEGRAM_IN_SIM=true` los activa a propósito; entonces cada aviso y respuesta
+  lleva delante la identidad de la mesa (`[SIM fast]`, `[PAPER]`, `[LIVE mainnet]`...).
 
 Al terminar imprime un resumen (`Sesión: 3000 ciclos | operaciones cerradas ... | PnL neto ...`) y deja
 todos los diarios en `state/fast/` (ver [Archivos y logs](#archivos-y-logs)).
@@ -255,11 +259,19 @@ mejor indicio, pero el mercado cambia. Que una gráfica no tenga ganadora es un 
 
 `backtest COIN [tf] [días] [estrategia]` (temporalidad por defecto `1h`; días, `DESK_BT_DEFAULT_DAYS` = 120):
 
-- La mesa descarga las velas **cerradas** al momento (si la moneda no existe o no hay datos, lo dice ya) y lanza
-  el cálculo en un hilo propio, uno a la vez y en cola: **el bucle sigue vigilando posiciones, alarmas y
-  comandos** mientras tanto. Responde `Backtest HYPE 1h (120 días, 2880 velas, 5 estrategias) en marcha...` y, al
-  terminar, avisa con el resumen, la ruta del informe HTML/PNG y, si hay ganadora aprobada, `activa HYPE 1h`.
-  Por Telegram llega además el PNG. Con `--fast` (reloj simulado) se ejecuta dentro del ciclo: determinista.
+- La mesa comprueba al momento lo barato (moneda, temporalidad) y lanza el trabajo en un hilo propio, uno a la vez
+  y en cola: la **descarga de las velas cerradas** (con la API lenta puede tardar decenas de segundos) y el cálculo
+  van en ese hilo, así que **el bucle sigue vigilando posiciones, alarmas y comandos** (también un `kill` por
+  Telegram) mientras tanto. Responde `Backtest HYPE 1h (120 días, ~2880 velas, 5 estrategias) en marcha...` y, al
+  terminar, avisa con el resumen, la ruta del informe HTML/PNG y, si hay ganadora aprobada, `activa HYPE 1h`; un
+  fallo de datos llega en ese aviso. Por Telegram llega además el PNG. Con `--fast` (reloj simulado) se ejecuta
+  dentro del ciclo: determinista.
+- **Capital supuesto = el equity de la cuenta** (sin cuenta, `DESK_PAPER_START_EQUITY`): el tamaño va en USD fijos
+  (unidades), así que el retorno y el drawdown en % sólo significan algo con tu capital real. El informe lo dice.
+- **Con los frenos del riesgo en vivo**: fuera de muestra el backtest aplica los mismos límites que la mesa, leídos
+  de tu configuración (`DESK_MAX_DRAWDOWN_PCT`: cierra y no opera más; `DESK_DAILY_LOSS_LIMIT_PCT`: sin entradas
+  hasta el día siguiente; cooldown tras `DESK_MAX_CONSECUTIVE_LOSSES`), con el equity mirado en el peor extremo de
+  cada vela. Cambia tu perfil de riesgo y el backtest lo modela igual.
 - Historia: días × velas por día, con tope de 5000 velas (lo que da Hyperliquid); si se recorta, se avisa.
 - Al apagar la mesa, los backtests en marcha o en cola se cancelan (no se guarda un informe a medias).
 
@@ -281,8 +293,15 @@ Rechazadas:
   con el pasado y se miden en el bloque siguiente, que no vieron; la curva fuera de muestra encadena esos
   bloques. Comisiones y deslizamiento incluidos; funding y liquidaciones no.
 - **✔ aprobada** sólo si fuera de muestra: PF ≥ `DESK_BT_MIN_PROFIT_FACTOR` (1,15), retorno > 0, ≥
-  `DESK_BT_MIN_TRADES` (20) operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` (25 %) y ventaja
-  estadísticamente significativa (`t`: R medio por operación, corregido por el número de estrategias comparadas).
+  `DESK_BT_MIN_TRADES` (20) operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` (25 %) **y por debajo de
+  `DESK_MAX_DRAWDOWN_PCT`** (sin halt: en vivo la mesa se habría detenido), ventaja estadísticamente significativa
+  (`t`: R medio por operación, corregido por todas las estrategias que se pueden probar en la gráfica, aunque pidas
+  una sola) y **los parámetros que se adoptarían ganan en su propio tramo**. La curva encadenada mide el
+  procedimiento (reoptimizar en cada tramo); lo que se activa son los parámetros del último entrenamiento, cuya
+  única prueba fuera de muestra es el último tramo: retorno > 0 y PF ≥ el mínimo también ahí.
+- `liquidity_sweep` sale **no validable**: en el backtest sus zonas son aproximadas (pivotes; no hay libro ni
+  liquidaciones históricas) y en vivo vienen del libro y las liquidaciones, así que lo medido no es lo que opera.
+  Sólo se activa con `forzar`.
   El ejemplo de arriba (datos simulados, un paseo aleatorio) no tiene ganadora aunque `rsi_reversion` ganara un
   8 %: con 41 operaciones eso puede ser suerte. Es exactamente lo que debe pasar sobre ruido.
 - `informes` lista los últimos (con su id y la mejor estrategia fuera de muestra).
@@ -293,11 +312,19 @@ Rechazadas:
   parámetros. `activa HYPE 1h ema_trend` elige otra estrategia del informe (si aprobó).
 - Si no aprobó fuera de muestra, **no se activa**. `activa HYPE 1h [estrategia] forzar` la activa igualmente con
   una advertencia explícita (NO recomendado: lo más probable es que no tenga ventaja real).
+- Tampoco sin `forzar` si **otro informe de los últimos 30 días** de la misma gráfica rechazó esa estrategia:
+  repetir backtests (otros días, otra estrategia) hasta que uno apruebe convierte el ruido en "ganadoras".
+- La respuesta (y `playbook`) enseña las dos cifras fuera de muestra: la del procedimiento (curva encadenada) y la
+  de los parámetros adoptados en su tramo.
 - Cada entrada del playbook opera **su** gráfica (temporalidad y parámetros), con `DESK_AUTO_UNITS` unidades,
   pasando por el mismo gestor de riesgo que todo lo demás. Las señales llevan el origen
   `auto:<estrategia>@<temporalidad>` (en `estado`, el panel y `trades.csv`).
 - Además del playbook, si `DESK_AUTO_DEFAULT_STRATEGIES=true` (por defecto) siguen las estrategias de
-  `DESK_STRATEGIES` sobre `DESK_SYMBOLS`; pon `false` para operar sólo lo activado.
+  `DESK_STRATEGIES` sobre `DESK_SYMBOLS` **sin validar**, sólo en monedas sin gráficas en el playbook (una
+  estrategia adoptada no compite por la moneda con otras: su secuencia de operaciones se parece a la de su
+  backtest). Pon `false` para operar sólo lo aprobado (en live el banner lo recuerda).
+- Si un backtest rechaza una estrategia por defecto que opera esa gráfica, la mesa avisa (`ESTRATEGIA POR DEFECTO
+  RECHAZADA`) y `desactiva SOL 1h` la apaga en esa gráfica (persistente, en `desk.json`).
 - `desactiva HYPE 1h` (o `desactiva HYPE`) la quita; las posiciones abiertas siguen con su SL/TP. `playbook`
   lista lo activo. Si un backtest nuevo de una gráfica activa ya no la aprueba, la mesa avisa
   (`PLAYBOOK DEGRADADO`) pero no la desactiva sola: decides tú.
@@ -310,7 +337,7 @@ Rechazadas:
 | `alerta SOL cruza 150` | Cruza el nivel en cualquier sentido |
 | `alerta HYPE rsi < 30 1h` · `alerta BTC rsi > 70 15m` | El RSI de velas **cerradas** de esa temporalidad cruza el nivel |
 | `alerta BTC cruce ema 20 50 1h alcista` · `alerta BTC golden cross 1d` | Cruce de medias |
-| `alerta SOL zona long` | El precio entra en la zona de liquidez |
+| `alerta SOL zona long` | El precio llega a la zona de liquidez (a su centro, la entrada; no basta con el borde pegado al precio) |
 | `alerta BTC volumen 3x 15m` | Volumen de la vela ≥ 3 veces la media |
 | `alerta HYPE mueve 3% 1h` · `alerta HYPE sube 5% 4h` | Movimiento de una vela |
 | `... siempre` · `... cada vez` | Repite (con pausa de `DESK_ALERT_COOLDOWN_SECONDS`); sin esto avisa una vez y se borra |
@@ -327,11 +354,13 @@ nivel mínimo de cada canal):
 | Nivel | Avisos |
 |---|---|
 | info | Mesa arrancada/detenida, ejecuciones y SL/TP colocados, cierres con su PnL, señales automáticas abiertas, backtest terminado |
-| warn (aviso) | Consumo de la pérdida diaria ≥ `DESK_DAILY_LOSS_WARN_FRAC` (80 %) del límite, drawdown al 80 % del máximo, fallos repetidos (3, 10, 50... ciclos seguidos), datos viejos de una moneda con posición, cooldown por racha de pérdidas, backtest fallido, playbook degradado |
-| critical | Halts (pérdida diaria, drawdown máximo) y cierres por riesgo; nunca se silencian |
+| warn (aviso) | Consumo de la pérdida diaria ≥ `DESK_DAILY_LOSS_WARN_FRAC` (80 %) del límite, drawdown al 80 % del máximo, fallos repetidos (3, 10, 50... ciclos seguidos), datos viejos de una moneda con posición, cooldown por racha de pérdidas, backtest fallido, playbook degradado o estrategia por defecto rechazada, TP rechazado (y desactivado tras 5 rechazos seguidos: la posición sigue con su SL), posición sin bracket adoptada |
+| critical | Halts (pérdida diaria, drawdown máximo) y cierres por riesgo (se avisa cuando cambia lo que pasa: cierres enviados, entradas que no se pueden cancelar), **posición sin SL** (`SL ... NO colocado/RECHAZADO`), cierre de seguridad por SL imposible, **liquidación**, ejecución fuera de una operación gestionada, cierre rechazado o que no se pudo enviar, otro proceso leyendo el bot de Telegram (409); nunca se silencian, suenan y llegan al webhook |
 
-Un aviso repetido no se reenvía antes de `DESK_ALERT_COOLDOWN_SECONDS`. Las ejecuciones que provoca un comando
-van en la respuesta a ese comando. La línea de estado periódica sólo sale por pantalla y `outbox.log`.
+Un aviso repetido no se reenvía antes de `DESK_ALERT_COOLDOWN_SECONDS` (un SL que no se puede colocar avisa una vez
+y luego cada 5 min, no en cada ciclo). Con la red lenta y la cola de envío llena se descartan primero los info,
+luego los avisos; nunca un crítico por otro de menos nivel. Las ejecuciones que provoca un comando van en la
+respuesta a ese comando. La línea de estado periódica sólo sale por pantalla y `outbox.log`.
 
 ### Telegram paso a paso
 
@@ -344,12 +373,20 @@ van en la respuesta a ese comando. La línea de estado periódica sólo sale por
    Para un grupo, añade el bot al grupo; su id es negativo (`-100...`).
 4. `TELEGRAM_CHAT_ID=123456789` en `.env` (varios separados por comas) y reinicia la mesa. El banner dice
    `canales: consola (>= info), telegram (>= info) | Telegram escuchando`.
+   **En un grupo** pon además `TELEGRAM_USER_IDS` con el id de usuario de cada persona que puede operar (el
+   `"from":{"id":...}` de `getUpdates`): sin él, en el grupo nadie da órdenes (si no, cualquier miembro podría
+   mandar un `kill` o un `long`). Con `TELEGRAM_USER_IDS` también se exige en chats privados.
 5. Escríbele igual que en la consola: `estado`, `long HYPE 2u zona`, `backtest HYPE 1h`, `alerta BTC > 100000`,
    `/estado`, `/cierra_todo` (el `_` es un espacio). `/help` da la ayuda.
 
-Seguridad: **sólo** los chats de `TELEGRAM_CHAT_ID` pueden dar órdenes (el resto se ignora sin responder y queda
-en el log); el token nunca se escribe en logs. Cada mensaje se ejecuta como mucho una vez (aunque la mesa se
-reinicie a mitad) y uno de hace más de 5 minutos no se ejecuta (se avisa para reenviarlo). Las órdenes
+Seguridad: **sólo** los chats de `TELEGRAM_CHAT_ID` (y, si lo pones, sólo las personas de `TELEGRAM_USER_IDS`)
+pueden dar órdenes; el resto se ignora sin responder y queda en el log. Nunca se aceptan mensajes en nombre de un
+canal, de un admin anónimo ni de otros bots, ni un `/comando@OtroBot` dirigido a otro bot del grupo. El token nunca
+se escribe en logs. Cada mensaje se ejecuta como mucho una vez: si Telegram no confirma que lo entregó, no se
+ejecuta hasta que lo confirma (si la mesa se reinicia antes, lo vuelve a recibir y lo ejecuta una sola vez), y uno
+de hace más de 5 minutos no se ejecuta (se avisa para reenviarlo). Cada respuesta y aviso lleva delante la mesa que
+lo manda (`[PAPER]`, `[LIVE mainnet]`...). Si otro proceso lee el mismo bot (otra mesa, una simulación con
+`DESK_TELEGRAM_IN_SIM=true`), Telegram responde 409 y la mesa avisa en crítico. Las órdenes
 interpretadas por IA piden `si`/`no`. `DESK_ALERT_MIN_LEVEL_TELEGRAM=warn` deja en el móvil sólo avisos y
 críticos (los resultados de backtest son "info").
 
@@ -374,8 +411,11 @@ posiciones, órdenes, consumo de límites, playbook, alarmas y últimas señales
 ## Cómo opera sola 24/7
 
 Con `DESK_AUTO=true` (por defecto) la mesa evalúa las gráficas del **playbook** (ver arriba) y sus estrategias
-por defecto sobre `DESK_SYMBOLS` cada `DESK_STRATEGY_SECONDS`, **una vez por vela cerrada** (nunca con la vela
-en curso):
+por defecto sobre `DESK_SYMBOLS` **en el primer ciclo tras el cierre de cada vela** (y además cada
+`DESK_STRATEGY_SECONDS`), **una vez por vela cerrada** (nunca con la vela en curso). Como en el backtest, que entra
+en el open de la vela siguiente: una señal que llega con la moneda ocupada (o con la mesa en pausa, halt, cooldown,
+auto OFF o en `DESK_MAX_OPEN_POSITIONS`) se pierde, y una vela que cerró hace más de ~2 minutos (reinicio, fallos de
+datos) no se opera tarde:
 
 - **`liquidity_sweep` (15 m)** — reversión tras un barrido de liquidez: la vela anterior perfora la zona de
   liquidez (bids/liquidaciones de longs bajo el precio) y la última cierra de vuelta por encima, con RSI(14)
@@ -404,10 +444,14 @@ resultado fuera de muestra.
   vieron. Lo que se enseña y lo que decide es esa curva **fuera de muestra**; lo de dentro de muestra sale al
   lado sólo para ver cuánto se infla.
 - **Aprobada** sólo si fuera de muestra: PF ≥ `DESK_BT_MIN_PROFIT_FACTOR`, retorno > 0, ≥ `DESK_BT_MIN_TRADES`
-  operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` **y ventaja estadísticamente significativa** (t del R medio
-  por operación, corregida por el número de estrategias comparadas). Ese último filtro no es decorativo: sobre
-  gráficas de ruido puro (paseos aleatorios), sólo con los otros cuatro 17 de 24 tenían "ganadora"; con él, 0 de 40.
-  Lo normal es que muchas gráficas no tengan ganadora: es la respuesta honesta.
+  operaciones, drawdown ≤ `DESK_BT_MAX_DRAWDOWN_PCT` y sin el halt de `DESK_MAX_DRAWDOWN_PCT` (la curva se simula con
+  los frenos del riesgo en vivo), parámetros adoptados en positivo en su propio tramo **y ventaja estadísticamente
+  significativa** (t del R medio por operación, corregida por todas las estrategias que se pueden probar en la
+  gráfica). Ese filtro no es decorativo: sobre gráficas de ruido puro (paseos aleatorios), sólo con los cuatro
+  primeros 17 de 24 tenían "ganadora". Con todos, 3 de 120 (2,5 %; por diseño, hasta un 5 %): un informe aprobado
+  todavía puede ser suerte, y repetir backtests de la misma gráfica hasta que uno apruebe sube esa cifra (por eso
+  `activa` pide `forzar` si un informe reciente la rechazó). Lo normal es que muchas gráficas no tengan ganadora: es
+  la respuesta honesta.
 - Una estrategia que mira el futuro se detecta (sus señales pasadas cambian al añadir velas) y se invalida.
 - Informes en `state/reports/` (`ReportStore`), con resumen en texto, HTML autocontenido (precio con entradas y
   salidas, capital, drawdown, claro/oscuro) y PNG (`desk/report_render.py`). Las gráficas adoptadas quedan en

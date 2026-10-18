@@ -380,14 +380,14 @@ def tg_update(uid, text, chat=CHAT):
 
 
 def test_telegram_command_is_executed_and_answered_and_backtest_png_is_sent(tmp_path):
-    settings = fast_settings(tmp_path, telegram_bot_token=TOKEN, telegram_chat_ids=[str(CHAT)])
+    settings = fast_settings(tmp_path, telegram_bot_token=TOKEN, telegram_chat_ids=[str(CHAT)], telegram_in_sim=True)
     http = FakeHttp([[tg_update(1, "/estado"), tg_update(2, "long SOL", chat=999)],
                      [tg_update(3, "backtest SOL 1h 40d")]])
     desk, market, clock, out = sim_desk(settings, http_session=http)
     assert desk.telegram is not None and "telegram (>= info)" in desk.notifier.describe()
     assert desk.telegram.poll_once() == 2
     [answer] = http.sent()
-    assert answer["json"]["chat_id"] == str(CHAT) and answer["json"]["text"].startswith("Estado de la mesa")
+    assert answer["json"]["chat_id"] == str(CHAT) and answer["json"]["text"].startswith("[SIM fast] Estado de la mesa")
     assert desk.broker.account().positions == {}               # el chat no autorizado se ignora
     assert desk.telegram.ignored == 1 and '"source": "telegram"' in (
         settings.state_path / "events.jsonl").read_text(encoding="utf-8")
@@ -406,7 +406,7 @@ def test_telegram_command_is_executed_and_answered_and_backtest_png_is_sent(tmp_
 
 def test_telegram_submit_is_thread_safe_with_the_running_loop(tmp_path):
     """El bot llama a ``submit`` desde su hilo mientras el bucle cicla: el lock de la mesa los serializa."""
-    settings = fast_settings(tmp_path, telegram_bot_token=TOKEN, telegram_chat_ids=[str(CHAT)])
+    settings = fast_settings(tmp_path, telegram_bot_token=TOKEN, telegram_chat_ids=[str(CHAT)], telegram_in_sim=True)
     http = FakeHttp([[tg_update(i, "estado")] for i in range(1, 21)])
     desk, market, clock, out = sim_desk(settings, http_session=http)
     errors: list[BaseException] = []
@@ -424,7 +424,7 @@ def test_telegram_submit_is_thread_safe_with_the_running_loop(tmp_path):
         assert desk.run_cycle() is True
     t.join(10)
     assert not errors and len(http.sent()) == 20
-    assert all(c["json"]["text"].startswith("Estado de la mesa") for c in http.sent())
+    assert all(c["json"]["text"].startswith("[SIM fast] Estado de la mesa") for c in http.sent())
 
 
 # --------------------------------------------------------------------------- status.json ampliado
@@ -579,3 +579,310 @@ def test_cli_backtest_offline_with_sim_and_csv(tmp_path, capsys, monkeypatch):
     assert not list((state / "reports").glob("BTC_1h_*.html"))
     assert main(["backtest", "--data", "sim", "--coin", "SOL", "--interval", "7h", "--state-dir", str(state),
                  "--env-file", env]) == 2
+
+
+# --------------------------------------------------------------------------- revisión: validez y seguridad de avisos
+import logging  # noqa: E402
+
+from conftest import FakeMarketData  # noqa: E402
+from desk.desk import desk_identity  # noqa: E402
+from desk.exchange.base import BrokerError  # noqa: E402
+from desk.models import OrderKind  # noqa: E402
+from desk.notify import Channel, Notifier  # noqa: E402
+from desk.optimizer import OptimizationReport, StrategyEvaluation  # noqa: E402
+
+
+class Rec(Channel):
+    """Canal que guarda lo que recibe (como Telegram o el webhook, sin red)."""
+
+    def __init__(self, name, min_level):
+        super().__init__(min_level)
+        self.name = name
+        self.got: list[tuple[str, str]] = []
+
+    def send(self, n):
+        self.got.append((n.level, n.text))
+
+
+def recorded_desk(settings, clock=None, market=None, **kw):
+    clock = clock or SimClock(T0)
+    tg, wh = Rec("telegram", "info"), Rec("webhook", "warn")
+    notifier = Notifier([tg, wh], clock=clock, threaded=False)
+    if market is None:
+        desk, market, clock, out = sim_desk(settings, clock, notifier=notifier, **kw)
+    else:
+        broker = PaperBroker(market, settings, clock, settings.state_path / "pb.json")
+        desk = TradingDesk(settings, market, broker, clock, out=Out(), notifier=notifier, strategies=[], **kw)
+    return desk, market, clock, tg, wh
+
+
+def fake_report(rid, coin, interval, created_ts, verdicts):
+    base = load_settings(env={}, dotenv_path=None, llm_enabled=False)
+    evs = [StrategyEvaluation(strategy=name, params=create_strategy(name, base, interval=interval).params(),
+                              is_metrics={}, oos_metrics={"total_return_pct": 3.0,
+                              "profit_factor": 1.5, "max_drawdown_pct": 2.0, "n_trades": 30}, oos_trades=[], folds=[],
+                              score=1.0, passed=ok, reasons=[] if ok else ["profit factor fuera de muestra 0.90 < 1.15"])
+           for name, ok in verdicts.items()]
+    win = next((e.strategy for e in evs if e.passed), None)
+    return OptimizationReport(id=rid, coin=coin, interval=interval, days=40, bars=960, created_ts=created_ts,
+                              evaluations=evs, winner=win)
+
+
+def test_adopt_requires_force_if_a_recent_report_of_the_chart_rejected_the_strategy(tmp_path):
+    """Repetir backtests de la gráfica hasta que uno apruebe sube la tasa de falsos positivos: 'activa' exige
+    'forzar' si en los últimos 30 días otro informe de la misma gráfica rechazó esa estrategia."""
+    settings = fast_settings(tmp_path)
+    desk, *_ = sim_desk(settings)
+    desk.reports.save(fake_report("aaaa0001", "SOL", "1h", T0 - 5 * 86_400, {"ema_trend": False}))
+    desk.reports.save(fake_report("aaaa0002", "SOL", "1h", T0 - 3_600, {"ema_trend": True}))
+    reply = desk.submit("activa SOL 1h")
+    assert reply.startswith("No se activó SOL 1h") and "aaaa0001" in reply and "forzar" in reply
+    assert desk.playbook.entries() == []
+    reply = desk.submit("activa SOL 1h ema_trend forzar")
+    assert "ATENCIÓN — FORZADO" in reply and "aaaa0001" in reply and desk.playbook.get("SOL", "1h") is not None
+    # Un rechazo de hace más de 30 días ya no cuenta.
+    desk.reports.save(fake_report("bbbb0001", "BTC", "1h", T0 - 45 * 86_400, {"ema_trend": False}))
+    desk.reports.save(fake_report("bbbb0002", "BTC", "1h", T0 - 3_600, {"ema_trend": True}))
+    reply = desk.submit("activa BTC 1h")
+    assert reply.startswith("BTC 1h en automático con ema_trend") and "FORZADO" not in reply
+
+
+def test_backtest_rejecting_a_default_strategy_warns_and_desactiva_turns_it_off(tmp_path):
+    settings = fast_settings(tmp_path, auto_default_strategies=True, symbols=["SOL"])
+    clock = SimClock(T0)
+    seen = []
+
+    def runner(job, *a, **kw):
+        seen.append(job.start_equity)
+        return BacktestOutcome(job=job, report=fake_report("cccc0001", "SOL", "1h", clock.now(),
+                                                           {"squeeze_breakout": False}))
+
+    worker = BacktestWorker(settings, ReportStore(settings.state_path), clock, threaded=False, runner=runner)
+    desk, market, clock, out = sim_desk(settings, clock, backtests=worker)
+    assert ("SOL", "squeeze_breakout@1h") in [(s.coin, s.label) for s in desk.auto_slots()]
+    reply = desk.submit("backtest SOL 1h 40d squeeze_breakout")
+    assert "Capital supuesto: 10,000 USD (equity de la cuenta)" in reply
+    desk.run_cycle()
+    assert seen == [10_000.0]                                  # el capital de la cuenta llega al trabajo
+    assert "ESTRATEGIA POR DEFECTO RECHAZADA: SOL 1h opera squeeze_breakout" in out.text
+    assert any(r["kind"] == "playbook" and r["level"] == "warn" for r in alert_records(settings))
+    reply = desk.submit("desactiva SOL 1h")
+    assert "SOL squeeze_breakout@1h (por defecto)" in reply
+    assert [s.label for s in desk.auto_slots()] == ["liquidity_sweep@15m"]
+    again, *_ = sim_desk(settings, clock)                      # persistente (desk.json)
+    assert [s.label for s in again.auto_slots()] == ["liquidity_sweep@15m"]
+    assert "Desactivadas con 'desactiva': SOL squeeze_breakout@1h" in again.submit("playbook")
+
+
+def test_playbook_coin_does_not_also_run_unvalidated_default_strategies(tmp_path):
+    settings = fast_settings(tmp_path, auto_default_strategies=True, symbols=["SOL", "BTC"])
+    desk, *_ = sim_desk(settings)
+    desk.reports.save(fake_report("dddd0001", "SOL", "4h", T0 - 60, {"ema_trend": True}))
+    assert desk.submit("activa SOL 4h").startswith("SOL 4h en automático")
+    slots = [(s.coin, s.label, s.source) for s in desk.auto_slots()]
+    assert [x for x in slots if x[0] == "SOL"] == [("SOL", "ema_trend@4h", "playbook")]
+    assert {x[2] for x in slots if x[0] == "BTC"} == {"defecto"}
+
+
+def test_backtest_download_runs_in_the_worker_thread_not_under_the_desk_lock(tmp_path):
+    settings = fast_settings(tmp_path)
+    gate, called = threading.Event(), threading.Event()
+
+    class SlowCandles(SimMarketData):
+        def candles(self, coin, interval, limit):
+            if limit > 500:
+                called.set()
+                gate.wait(10)
+            return super().candles(coin, interval, limit)
+
+    clock = SimClock(T0)
+    market = SlowCandles(clock)
+    worker = BacktestWorker(settings, ReportStore(settings.state_path), clock, threaded=True)
+    out = Out()
+    desk = TradingDesk(settings, market, PaperBroker(market, settings, clock, settings.state_path / "pb.json"), clock,
+                       out=out, strategies=[], backtests=worker)
+    try:
+        t = time.perf_counter()
+        reply = desk.submit("backtest SOL 1h 40d")
+        assert time.perf_counter() - t < 2.0 and "~960 velas" in reply
+        assert called.wait(5)                                  # el hilo del trabajo está descargando...
+        t = time.perf_counter()
+        assert desk.run_cycle() is True                        # ... y el bucle no espera
+        assert time.perf_counter() - t < 2.0
+        gate.set()
+        deadline = time.monotonic() + 60
+        while "Backtest SOL 1h" not in out.text and "FUERA de muestra" not in out.text and time.monotonic() < deadline:
+            time.sleep(0.05)
+            desk.run_cycle()
+        assert desk.reports.latest("SOL", "1h") is not None
+    finally:
+        gate.set()
+        desk.backtests.stop(5)
+
+
+def test_simulation_does_not_use_the_real_telegram_bot_or_webhook(tmp_path):
+    class AnyHttp:
+        def __init__(self):
+            self.urls = []
+
+        def post(self, url, **kw):
+            self.urls.append(url)
+            return _Resp({"ok": True, "result": []})
+
+    http = AnyHttp()
+    settings = fast_settings(tmp_path, data_source="sim", telegram_bot_token=TOKEN, telegram_chat_ids=[str(CHAT)],
+                             webhook_url="https://discord.com/api/webhooks/1/secreto")
+    desk, *_ = sim_desk(settings, http_session=http)
+    assert desk.telegram is None and desk.notifier.describe() == "consola (>= info)"
+    assert any("DESACTIVADOS" in n for n in desk.notices) and "DESACTIVADOS" in desk.banner()
+    desk.notify("HALT de prueba", logging.CRITICAL)
+    desk.notifier.flush(2)
+    assert http.urls == []
+    # Pedido a propósito: sí, y cada aviso dice de qué mesa viene.
+    opt_in = fast_settings(tmp_path / "b", data_source="sim", telegram_bot_token=TOKEN,
+                           telegram_chat_ids=[str(CHAT)], telegram_in_sim=True)
+    http2 = FakeHttp()
+    desk2, *_ = sim_desk(opt_in, http_session=http2)
+    assert desk2.telegram is not None and desk2.telegram.label == "SIM fast"
+    desk2.notify("aviso de prueba", logging.WARNING)
+    assert desk2.notifier.flush(5)
+    from desk.notify import LEVEL_LABELS
+    assert [c["json"]["text"] for c in http2.sent()] == [f"[SIM fast] {LEVEL_LABELS['warn']}aviso de prueba"]
+
+
+def test_desk_identity_labels():
+    from dataclasses import replace
+    s = load_settings(env={}, dotenv_path=None, llm_enabled=False)
+    assert desk_identity(s) == "PAPER" and desk_identity(s, sim_clock=True) == "SIM fast"
+    assert desk_identity(replace(s, data_source="sim")) == "SIM"
+    assert desk_identity(replace(s, mode="live")) == "LIVE testnet"
+    assert desk_identity(replace(s, mode="live", hl_mainnet=True)) == "LIVE mainnet"
+
+
+def test_repeated_telegram_409_is_a_critical_notice(tmp_path):
+    class StubBot:
+        running, handled, ignored, errors, last_error, conflicts = True, 0, 0, 3, "getUpdates: HTTP 409 Conflict", 3
+        label = ""
+
+        def start(self):
+            return True
+
+        def stop(self, timeout=0):
+            return None
+
+    settings = fast_settings(tmp_path)
+    desk, market, clock, tg, wh = recorded_desk(settings, telegram=StubBot())
+    for _ in range(5):
+        clock.advance(10)
+        desk.run_cycle()
+    crit = [t for lv, t in wh.got if lv == "critical" and "OTRO PROCESO" in t]
+    assert len(crit) == 1                                     # anti-spam: uno por alert_cooldown_seconds
+
+
+def test_unprotected_position_and_safety_close_are_critical_even_when_muted(tmp_path):
+    settings = fast_settings(tmp_path)
+    desk, market, clock, tg, wh = recorded_desk(settings)
+    orig = desk.broker.place_order
+
+    def place(coin, is_buy, size, kind, **kw):
+        if kind is OrderKind.STOP:
+            raise BrokerError("timeout colocando el stop (simulado)")
+        return orig(coin, is_buy, size, kind, **kw)
+
+    desk.broker.place_order = place
+    desk.run_cycle()
+    assert "silenciados" in desk.submit("silencio")
+    desk.submit("long SOL a mercado")
+    for _ in range(12):
+        clock.advance(10)
+        desk.run_cycle()
+    for ch in (tg, wh):
+        unprotected = [lv for lv, t in ch.got if "NO colocado" in t]
+        assert unprotected == ["critical"]                     # suena, llega al webhook y sólo una vez (anti-spam)
+        assert [lv for lv, t in ch.got if "por seguridad" in t] == ["critical"]
+    assert "SOL" not in desk.broker.account().positions
+
+
+def test_liquidation_is_critical(tmp_path):
+    settings = fast_settings(tmp_path, leverage=10, daily_loss_limit_pct=50, max_drawdown_pct=90)
+    clock = SimClock(T0)
+    market = FakeMarketData(clock)
+    desk, market, clock, tg, wh = recorded_desk(settings, clock, market)
+    orig = desk.broker.place_order
+    desk.broker.place_order = lambda c, ib, sz, k, **kw: ((_ for _ in ()).throw(BrokerError("timeout"))
+                                                          if k is OrderKind.STOP else orig(c, ib, sz, k, **kw))
+    desk.run_cycle()
+    desk.submit("silencio")
+    desk.submit("long SOL a mercado")
+    pos = desk.broker.account().positions["SOL"]
+    clock.advance(10)
+    market.set_price("SOL", pos.liq_px * 0.99)
+    desk.run_cycle()
+    assert [lv for lv, t in wh.got if "LIQUIDACIÓN" in t] == ["critical"]
+
+
+def test_kill_with_an_entry_that_cannot_be_cancelled_does_not_flood_the_channels(tmp_path):
+    settings = fast_settings(tmp_path, loop_seconds=5)
+    desk, market, clock, tg, wh = recorded_desk(settings)
+    desk.run_cycle()
+    mid = market.mid("SOL")
+    assert "límite" in desk.submit(f"long SOL a {mid * 0.95:.2f}")
+    desk.broker.cancel = lambda coin, oid: (_ for _ in ()).throw(BrokerError("cancel: 502 (simulado)"))
+    desk.submit("kill")
+    tg.got.clear()
+    for _ in range(60):
+        clock.advance(5)
+        desk.run_cycle()
+    crit = [t for lv, t in tg.got if lv == "critical"]
+    assert len(crit) == 1 and "SIN PODER CANCELAR" in crit[0] and "paper-" in crit[0]
+    assert "0 posición" not in crit[0]
+
+
+def test_persistently_rejected_take_profit_is_reported_once_and_then_disabled(tmp_path):
+    from desk.engine import MAX_TP_FAILURES
+    settings = fast_settings(tmp_path, loop_seconds=5)
+    desk, market, clock, tg, wh = recorded_desk(settings)
+    orig = desk.broker.place_order
+
+    def place(coin, is_buy, size, kind, **kw):
+        if kind is OrderKind.TAKE_PROFIT:
+            kw["trigger_px"] = -1.0                            # el exchange lo rechaza siempre
+        return orig(coin, is_buy, size, kind, **kw)
+
+    desk.broker.place_order = place
+    desk.run_cycle()
+    desk.submit("long SOL a mercado")
+    for _ in range(120):
+        clock.advance(5)
+        desk.run_cycle()
+    rejected = [(lv, t) for lv, t in tg.got if "TP" in t and "RECHAZADO" in t]
+    assert 1 <= len(rejected) <= 2 and all(lv == "warn" for lv, _ in rejected)
+    assert any("TP desactivado" in t for _, t in rejected)
+    br = desk.engine.brackets["SOL"]
+    assert br.tp is None and br.sl is not None and "SOL" in desk.broker.account().positions
+    assert sum(1 for line in (settings.state_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+               if '"protect_rejected"' in line and '"tp"' in line) == MAX_TP_FAILURES
+
+
+def test_deferred_download_errors_come_back_in_the_outcome(tmp_path):
+    """Con hilo, la descarga la hace el trabajo: un fallo de datos (API caída, pocas velas) llega en el aviso del
+    resultado con un texto para el usuario y el hilo sigue vivo."""
+    from desk.exchange.base import MarketDataError
+    from desk.jobs import BacktestJob
+    settings = fast_settings(tmp_path)
+    clock = SimClock(T0)
+    worker = BacktestWorker(settings, ReportStore(settings.state_path), clock, threaded=False)
+
+    def down():
+        raise MarketDataError("candleSnapshot: HTTP 502")
+
+    def short():
+        return trend_bars(1, n=40), []
+
+    for i, fetch in enumerate((down, short)):
+        worker.submit(BacktestJob(id=f"j{i}", coin="SOL", interval="1h", days=40, strategy=None, bars=None,
+                                  fetch=fetch))
+    outs = worker.poll()
+    assert [o.ok for o in outs] == [False, False]
+    assert "no se pudieron descargar las velas de SOL 1h" in outs[0].error and "502" in outs[0].error
+    assert "sólo hay 40 velas cerradas" in outs[1].error

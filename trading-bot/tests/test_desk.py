@@ -473,6 +473,10 @@ def test_auto_respects_pause_and_auto_off(settings, market, clock):
     assert "ACTIVADA" in desk.submit("auto on")
     clock.advance(60)
     desk.run_cycle()
+    # La señal de la vela que cerró con el automático parado se pierde (como en el backtest): no se opera tarde.
+    assert desk.broker.account().positions == {} and stub.calls == []
+    clock.set((clock.now() // 900 + 1) * 900 + 10)        # cierre de la vela siguiente
+    desk.run_cycle()
     assert "SOL" in desk.broker.account().positions
 
 
@@ -498,7 +502,7 @@ def test_data_errors_do_not_kill_the_loop(settings, market, clock):
         clock.advance(60)
     assert desk.broker.account().positions == {}
     market.fail_next = 0
-    clock.advance(15 * 60)
+    clock.set((clock.now() // 900 + 1) * 900 + 10)        # primer ciclo tras el cierre de la vela siguiente
     desk.run_cycle()
     assert "SOL" in desk.broker.account().positions        # se recupera solo
 
@@ -922,6 +926,74 @@ def test_restart_within_the_same_bar_does_not_repeat_the_signal(settings, market
     clock.advance(15 * 60)                             # vela nueva: se vuelve a evaluar
     desk2.run_cycle()
     assert stub2.calls == ["SOL"]
+
+
+def test_signal_while_the_coin_is_busy_is_dropped_not_executed_late(settings, market, clock):
+    """Como en el backtest: la señal de una vela que cierra con la moneda ocupada se pierde. Si la posición sale a
+    mitad de la vela siguiente, no se abre tarde con esa señal vieja (ni con SL/TP calculados desde ese momento)."""
+    settings.symbols = ["SOL"]
+    stub = StubStrategy(settings, clock, plan={"SOL": LONG})
+    desk = make_desk(settings, market, clock, strategies=[stub], auto=True)
+    t0 = clock.now()                                       # apertura de una vela de 15m
+    desk.run_cycle()
+    assert desk.engine.brackets["SOL"].origin == "auto:stub@15m" and stub.calls == ["SOL"]
+    clock.set(t0 + 900 + 30)                               # cierra la vela siguiente con SOL ocupado
+    desk.run_cycle()
+    assert stub.calls == ["SOL"] and desk._bar_seen[("SOL", "stub@15m")] == t0 + 900
+    clock.set(t0 + 900 + 300)
+    desk.submit("cierra SOL")                              # sale a mitad de vela
+    desk.run_cycle()
+    clock.set(t0 + 900 + 400)
+    desk.run_cycle()
+    assert stub.calls == ["SOL"] and "SOL" not in desk.broker.account().positions
+    clock.set(t0 + 1800 + 10)                              # vela nueva: se evalúa y abre al cierre
+    desk.run_cycle()
+    assert stub.calls == ["SOL", "SOL"] and "SOL" in desk.broker.account().positions
+
+
+def test_max_positions_and_halts_also_mark_the_bar_as_seen(settings, market, clock):
+    settings.symbols = ["BTC", "SOL"]
+    settings.max_open_positions = 1
+    stub = StubStrategy(settings, clock, plan={"BTC": LONG, "SOL": LONG})
+    desk = make_desk(settings, market, clock, strategies=[stub], auto=True)
+    desk.run_cycle()
+    opened = [c for c in ("BTC", "SOL") if c in desk.broker.account().positions]
+    other = "SOL" if opened == ["BTC"] else "BTC"
+    assert len(opened) == 1 and desk._bar_seen[(other, "stub@15m")] == clock.now() // 900 * 900
+    desk.submit(f"cierra {opened[0]}")
+    clock.advance(120)
+    desk.run_cycle()
+    assert other not in desk.broker.account().positions   # su señal de esa vela no se ejecuta tarde
+
+
+def test_a_bar_that_closed_long_ago_is_not_traded_after_a_restart(settings, market, clock):
+    settings.symbols = ["SOL"]
+    stub = StubStrategy(settings, clock, plan={"SOL": LONG})
+    clock.advance(10 * 60)                                 # la mesa arranca 10 min después del cierre de la vela
+    desk = make_desk(settings, market, clock, strategies=[stub], auto=True)
+    desk.run_cycle()
+    assert stub.calls == [] and desk.broker.account().positions == {}
+    clock.set(clock.now() // 900 * 900 + 900 + 5)          # 5 s tras el cierre siguiente: sí
+    desk.run_cycle()
+    assert stub.calls == ["SOL"] and "SOL" in desk.broker.account().positions
+
+
+def test_strategies_stage_runs_right_after_each_candle_close(settings, market, clock):
+    """Con ``strategy_seconds`` largo la etapa igualmente corre en el primer ciclo tras el cierre de una vela de las
+    gráficas en automático (la entrada sale al cierre, como en el backtest)."""
+    settings.symbols = ["ETH"]
+    settings.strategy_seconds = 3600
+    stub = StubStrategy(settings, clock, plan={})
+    desk = make_desk(settings, market, clock, strategies=[stub], auto=True)
+    clock.advance(5)
+    desk.run_cycle()
+    assert stub.calls == ["ETH"]
+    clock.advance(600)
+    desk.run_cycle()                                       # misma vela, < strategy_seconds: no corre
+    assert stub.calls == ["ETH"]
+    clock.set(clock.now() // 900 * 900 + 900 + 3)          # 3 s tras el cierre
+    desk.run_cycle()
+    assert stub.calls == ["ETH", "ETH"]
 
 
 def test_health_reports_exchange_outage_and_heartbeat_only_on_healthy_cycles(settings, market, clock):

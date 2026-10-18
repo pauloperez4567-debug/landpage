@@ -1199,15 +1199,19 @@ def build_trades(snap: Snapshot) -> RenderableType:
 
 # La mesa marca lo grave en mayúsculas ("HALT por pérdida diaria", "Mesa DETENIDA", "ESTADO INCIERTO"...): se
 # distingue así de la línea de estado periódica, que siempre lleva "halt no" en minúsculas.
+# Mismo criterio que los niveles del motor (``engine.EngineMessage``): posición sin SL, cierre de seguridad,
+# liquidación, ejecución fuera de una operación y cierres que no salen son críticos.
 _CRITICAL_MARKS = ("HALT", "DETENIDA", "KILL", "SIN DATOS DE LA CUENTA", "INCIERTO", "NO colocado", "LIQUIDACIÓN",
-                   "Riesgo (")
+                   "Riesgo (", "por seguridad", "fuera de una operación gestionada", "cierre fue rechazado",
+                   "no se pudo enviar el cierre", "no se completó tras", "SIN PODER CANCELAR", "SIN CERRAR")
+_SL_REJECTED = re.compile(r"\bSL \S+ RECHAZADO")
 _WARN_MARKS = ("atención", "rechaz", "no se pudo", "no se envió", "fallo", "error", "cooldown", "aviso")
 TEXT_STYLES = {"info": "", "warn": "yellow", "critical": "bold red"}
 
 
 def notice_level(text: str) -> str:
     """Nivel de un aviso de la mesa (``outbox.log`` no lo guarda): "critical", "warn" o "info" por su texto."""
-    if any(m in text for m in _CRITICAL_MARKS):
+    if any(m in text for m in _CRITICAL_MARKS) or _SL_REJECTED.search(text):
         return "critical"
     low = text.lower()
     return "warn" if any(w in low for w in _WARN_MARKS) else "info"

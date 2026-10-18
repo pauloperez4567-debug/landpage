@@ -170,6 +170,41 @@ def test_full_queue_drops_oldest(debug_logs):
     n.close()
 
 
+def test_full_queue_never_drops_a_critical_under_info_notices(debug_logs):
+    """Con la red colgada la cola se llena: se descarta el info más antiguo, después el warn; un crítico sólo deja
+    sitio a otro crítico (y si sobra el nuevo info, se descarta él)."""
+    gate = Gate()
+    n = Notifier([gate], queue_size=3)
+    n.send("en vuelo")
+    assert gate.started.wait(2)
+    n.send("HALT por drawdown", "critical")
+    n.send("aviso", "warn")
+    for i in range(20):
+        n.send(f"info {i}")
+    assert n.dropped == 19
+    n.send("otro HALT", "critical")                 # saca el info que queda
+    n.send("tercer HALT", "critical")               # ya no hay info: saca el warn
+    gate.release.set()
+    assert n.flush(5)
+    assert gate.got == ["en vuelo", "HALT por drawdown", "otro HALT", "tercer HALT"] and n.dropped == 21
+    n.close()
+
+
+def test_full_queue_of_criticals_logs_an_error(debug_logs):
+    gate = Gate()
+    n = Notifier([gate], queue_size=1)
+    n.send("en vuelo")
+    assert gate.started.wait(2)
+    n.send("HALT 1", "critical")
+    n.send("info que sobra")                       # el nuevo es el menos importante: se descarta él
+    n.send("HALT 2", "critical")                   # crítico por crítico: el más antiguo, con error en el log
+    gate.release.set()
+    assert n.flush(5)
+    assert gate.got == ["en vuelo", "HALT 2"] and n.dropped == 2
+    assert "cola llena de críticos" in debug_logs.text
+    n.close()
+
+
 def test_worker_survives_channel_errors_and_close_stops_thread():
     class Flaky(Recorder):
         def send(self, n):

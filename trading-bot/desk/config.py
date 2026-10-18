@@ -131,7 +131,13 @@ class Settings:
     alert_min_level_webhook: str = "warn"
     telegram_bot_token: str = field(default="", repr=False)
     telegram_chat_ids: list[str] = field(default_factory=list)
+    # Quién puede dar órdenes por Telegram (ids de usuario). Obligatorio si algún chat autorizado es un grupo (id
+    # negativo): en un grupo, sin esta lista, nadie puede dar órdenes. En chats privados, si se da, también se exige.
+    telegram_user_ids: list[str] = field(default_factory=list)
     webhook_url: str = field(default="", repr=False)
+    # Una simulación (datos sim/replay o --fast) no usa Telegram ni el webhook salvo que se pida: con el .env de la
+    # mesa real competiría por las órdenes del bot y mandaría avisos simulados al chat real.
+    telegram_in_sim: bool = False
 
     # ------------------------------------------------------------------------
     @property
@@ -251,7 +257,9 @@ _ENV_MAP: dict[str, str] = {
     "DESK_ALERT_MIN_LEVEL_WEBHOOK": "alert_min_level_webhook",
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "TELEGRAM_CHAT_ID": "telegram_chat_ids",
+    "TELEGRAM_USER_IDS": "telegram_user_ids",
     "DESK_WEBHOOK_URL": "webhook_url",
+    "DESK_TELEGRAM_IN_SIM": "telegram_in_sim",
 }
 
 

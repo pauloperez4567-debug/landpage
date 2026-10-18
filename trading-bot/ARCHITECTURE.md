@@ -46,6 +46,9 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 - `last_update_ts(coin)` = hora del último libro **según el exchange** (`time` del l2Book, nunca posterior a la
   petición); sin libro, la de la última petición. Un nodo que sirve un libro congelado no pasa por dato fresco.
 - Inyectable `session` para tests (los tests NO usan red: mockear la sesión).
+- `background_copy()`: otro adaptador con la misma configuración y su propia `requests.Session` (descargas largas de
+  los backtests en otro hilo sin compartir la sesión del bucle; con una sesión inyectada que no es `requests.Session`
+  se reutiliza).
 
 ### `desk/exchange/sim.py` — mercados offline
 - `SimMarketData(MarketData)`: paseo aleatorio determinista (semilla) por moneda, avanza con el `Clock`
@@ -210,6 +213,12 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
   sobre una entrada pendiente sólo cambia el nivel), `cancel(coin|None) -> int` (sólo órdenes de entrada
   confirmadas: los SL/TP de posiciones abiertas se mantienen), `reference_px(coin)`, `is_unconfirmed(coin)`.
 - Mensajes legibles para el operador en `messages` / `pop_messages()`. Formato: `fmt_px`, `fmt_usd`, `fmt_size`.
+  Cada mensaje es un `EngineMessage(str)` con `level` ("info"|"warn"|"critical") y `key` anti-spam opcional (por
+  moneda y tipo): críticos = SL no colocado/rechazado (`protect:<coin>:sl`), cierre de seguridad (`no_sl:<coin>`),
+  liquidación, ejecución fuera de una operación gestionada, cierre rechazado o no enviado (`close:<coin>`) y cierre
+  que no se completa; aviso = TP rechazado (`protect:<coin>:tp`), posición adoptada, entrada vista sin fill. Un TP
+  rechazado `MAX_TP_FAILURES` (5) veces seguidas se desactiva (`br.tp = None`, evento `tp_disabled`, aviso final con
+  clave propia); `set_take_profit` pone el contador a 0.
 
 ### `desk/journal.py` — `Journal`
 - `Journal(state_dir, clock=None)`: `event(kind, /, **data)` → `events.jsonl`; `fill(fill)` → `fills.csv`;
@@ -291,7 +300,8 @@ Contrato entre módulos. Cualquier cambio de interfaz se refleja aquí.
 
 Campos nuevos ya añadidos en `desk/models.py` (`CommandAction.BACKTEST/ADOPT/DEACTIVATE/PLAYBOOK/REPORTS/
 ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/alert/target_id`) y en
-`desk/config.py` (`bt_*`, `auto_default_strategies`, `alert_*`, `daily_loss_warn_frac`, `telegram_*`, `webhook_url`).
+`desk/config.py` (`bt_*`, `auto_default_strategies`, `alert_*`, `daily_loss_warn_frac`, `telegram_*`, `webhook_url`;
+después: `telegram_user_ids` (`TELEGRAM_USER_IDS`) y `telegram_in_sim` (`DESK_TELEGRAM_IN_SIM`)).
 
 ## `desk/commands.py` (comandos de la fase 2)
 - Gráfica = moneda + temporalidad de `exchange.intervals` (`15m`, `15 min`, `1 hora` -> `15m`/`1h`). Historia:
@@ -375,6 +385,13 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
     rechazaría); límite: sólo cuentan velas que terminan antes de la caducidad, ejecución al precio límite y en
     esa vela sólo cuenta el SL; hueco a través del TP -> al TP (sin regalo); salidas SL/TP/fin = taker + desliz.;
     lo abierto se cierra al cierre de la última vela (`"end"`). Sin funding, liquidaciones ni spread.
+  - `run_backtest(..., brakes=None)`: frenos del riesgo en vivo (`LiveBrakes`, leídos de `settings` con
+    `LiveBrakes.from_settings`: cualquier perfil de riesgo): halt por `max_drawdown_pct` (cierra a mercado —salida
+    `"halt"`— y no opera más), halt por `daily_loss_limit_pct` (sin entradas hasta el día UTC siguiente; cierra sólo con
+    `flatten_on_daily_limit`), cooldown tras `max_consecutive_losses` pérdidas (`loss_cooldown_minutes`). Equity mirado
+    con el peor extremo de cada vela (y el máximo con el cierre y el mejor extremo). `True` = frenos nuevos; una
+    instancia = estado encadenado entre llamadas (tramos fuera de muestra). Métricas extra: `halted`, `halt_ts`,
+    `n_blocked`, `daily_halts`, `cooldowns`. `EXIT_REASONS` añade `"halt"`.
   - `BTTrade.side` = "long"/"short"; `entry_ts`/`exit_ts` = apertura (s UNIX) de la vela donde ocurre;
     `pnl` neto; `pnl_pct` = pnl / equity al entrar · 100; `r_multiple` = pnl / (size·|entrada − SL|);
     `bars_held` cuenta la vela de entrada y la de salida. `to_dict()/from_dict()` en ambas clases.
@@ -412,18 +429,28 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   - Sin fuga: señales una vez por combinación sobre toda la historia (causales) y una simulación por tramo con sólo
     sus velas; en cada validación las señales de la elegida se recalculan con las velas hasta el final del tramo y se
     comparan con las del entrenamiento: si difieren, la estrategia mira el futuro y se invalida (`error`).
-  - Fuera de muestra: tramos de validación encadenados (cada uno empieza con el capital final del anterior);
-    `oos_metrics` = `compute_metrics` de esa curva + `n_signals`, `n_skipped`, `t_stat` (t de Student del R medio
-    por operación, `edge_t_stat`) y `t_min` (`required_t_stat(n, m)`: cuantil `1 - 0.05/m`, m = estrategias del
-    informe, Bonferroni). **Filtro extra de aprobación: `t_stat >= t_min`** ("ventaja no significativa ... puede ser
-    suerte"). Motivo: sobre paseos aleatorios de 3000 velas, sólo con los cuatro filtros 17 de 24 gráficas tenían
-    "ganadora"; con la significación, 0 de 40 (las tendencias reales siguen aprobando). `approval_reasons(oos, settings)`.
+  - Fuera de muestra: tramos de validación encadenados (cada uno empieza con el capital final del anterior) **con
+    los frenos del riesgo en vivo** (`LiveBrakes`, estado encadenado); `oos_metrics` = `compute_metrics` de esa curva +
+    `n_signals`, `n_skipped`, métricas de los frenos, `t_stat` (t de Student del R medio por operación,
+    `edge_t_stat`) y `t_min` (`required_t_stat(n, m)`: cuantil `1 - 0.05/m`, Bonferroni con m = `max(estrategias del
+    informe, len(STRATEGIES))`: pedir una sola no baja el listón). **Filtros extra de aprobación**: `t_stat >= t_min`
+    ("ventaja no significativa ... puede ser suerte"); drawdown < `max_drawdown_pct` y sin halt ("en vivo la mesa se
+    habría detenido"); y `adopted_reasons`: los parámetros propuestos, **solos en su tramo** (`adopted_metrics`: el
+    último, capital inicial y frenos nuevos), con retorno > 0, PF >= `bt_min_profit_factor` y sin halt (la curva
+    encadenada valida el procedimiento de reoptimizar, no esos parámetros fijos). Estrategias con `uses_zones` sin
+    `zones=` dadas: "no validable" (las zonas aproximadas no son las que operan en vivo). Tasa de falsos positivos
+    medida (ruido puro): ver el docstring de `optimizer`. `approval_reasons(oos, settings)`.
+  - `optimize(..., start_equity=None)`: capital de la simulación (la mesa pasa el equity de la cuenta; None o inválido
+    = `paper_start_equity`, con nota). `OptimizationReport.start_equity`; `criteria` añade `live_max_drawdown_pct`,
+    `daily_loss_limit_pct`, `start_equity`, `equity_source` ("account" | "paper_start_equity"). `summary_text` dice el
+    capital supuesto y, para la ganadora, sus parámetros en su tramo.
   - `StrategyEvaluation` añade `combos`, `error` (evaluación fallida: error, fuga, sin historia), la propiedad
     `folds_positive` y `oos_result: BacktestResult` (la curva fuera de muestra encadenada; sólo en memoria, no va en
     `to_dict`). `oos_trades = list[BTTrade]` (en JSON, lista de dicts); `folds = list[FoldResult]` con `fold,
     train_start_ts, train_end_ts, test_start_ts, test_end_ts` (s UNIX; fin = cierre de la última vela), `train_bars,
     test_bars, params, is_metrics, oos_metrics, combos, min_train_trades`. `is_metrics` = los parámetros propuestos
-    en el último entrenamiento. `score` = objetivo fuera de muestra (None si falló).
+    en el último entrenamiento. `score` = objetivo fuera de muestra (None si falló). `adopted_metrics` (en JSON) y la
+    propiedad `adopted_oos` (esas métricas o, en informes antiguos, las del último tramo).
   - `OptimizationReport.winner` = nombre (str) de la ganadora o None; `winner_evaluation`, `get(nombre)`, `best()`
     (ganadora o primera evaluable) y `result(strategy=None)` (su `oos_result`). Extras: `objective`, `folds` (int),
     `seed`, `criteria` (umbrales usados, `alpha`, `compared`), `start_ts`, `end_ts`, `oos_start_ts`, `complete`.
@@ -441,7 +468,8 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   - `ReportStore(state_dir, *, keep=200)`: fichero = `{"report": to_dict(), "result": BacktestResult.to_dict() | None}`
     (por defecto `result` = `report.result()`), escritura atómica (`Journal.save_json`); moneda/intervalo saneados
     en el nombre (`xyz:GOLD` -> `xyz-GOLD`); al guardar se borran los más antiguos por encima de `keep`. Extras:
-    `get_result(id) -> BacktestResult | None`, `path_for(report)`. Ficheros ilegibles se ignoran (log).
+    `get_result(id) -> BacktestResult | None`, `path_for(report)`, `chart_reports(coin, tf, since_ts=None)` (los de la
+    gráfica, el más reciente primero). Ficheros ilegibles se ignoran (log).
   - Rendimiento medido: 5 estrategias x 60 combinaciones x 4 tramos sobre 3000 velas de 1h = ~7.5 s en un proceso.
 
 ## `desk/playbook.py`
@@ -459,7 +487,9 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
     > 0) -> `ValueError` con el motivo; si no se puede guardar, `OSError` y nada cambia. Gráfica = (moneda sin
     distinguir mayúsculas, temporalidad) (`PlaybookEntry.key`). `units=None` = `settings.auto_units`.
   - Extras: `get(coin, interval)`, `set_enabled(coin, interval, enabled) -> bool` (pausar sin olvidar), `reload()`,
-    `summary_text()`, `PlaybookEntry.describe()`/`copy()`; `entries()` devuelve copias.
+    `summary_text()`, `PlaybookEntry.describe()`/`copy()`; `entries()` devuelve copias. `PlaybookEntry.adopted_metrics`
+    (= `StrategyEvaluation.adopted_oos`: los parámetros adoptados en su tramo, con `fold`) junto a `oos_metrics` (el
+    procedimiento, encadenado); `describe()` enseña los dos; `metrics_text(m)`.
   - `strategies(settings, clock)`: sólo entradas activas; nunca lanza (una entrada que ya no se puede instanciar se
     salta con aviso en el log); reutiliza la instancia mientras la entrada no cambie (conserva "una señal por vela").
   - `entry_from_report(report, strategy=None, *, units=None, clock=None, allow_rejected=False) -> PlaybookEntry`:
@@ -510,7 +540,9 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
 - Semántica: **cruces, no estados** (`price_above 100` creada con el precio en 105 no dispara hasta que baje a <= 100
   y vuelva a superarlo; `immediate: True` = dispara también si ya se cumple). Precio = mid cada ciclo; indicadores sobre
   velas cerradas, una vez por vela y sólo con velas que cierran después de crear la alarma; las velas se piden sólo
-  cuando puede haber cerrado una nueva. `zone`: el precio entra en la zona vista en el ciclo anterior. Una vez
+  cuando puede haber cerrado una nueva. `zone`: el precio llega al **centro** (la entrada) de la zona vista en el ciclo
+  anterior (el borde del tramo 0 es el mid de entonces: con el borde dispararía sin moverse). Monedas con
+  `norm_coin` (HIP-3 conserva el prefijo del dex en minúsculas: `xyz:GOLD`, también al cargar). Una vez
   (`repeat=False`) = dispara y se elimina.
 
 ## `desk/notify.py`
@@ -522,8 +554,11 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
 - Niveles: "info" < "warn" < "critical".
 - Implementado (extensiones compatibles): `Notifier(channels, *, clock=None, threaded=True, queue_size=500)` con
   `flush(timeout) -> bool`, `close()`, `describe()`, contadores `sent`/`failed`/`dropped` y `last_error` (sin secretos);
-  cola llena -> se descarta el aviso más antiguo. `build_notifier(settings, out=None, *, console=True, clock=None,
-  session=None, file_path=None)` monta los canales según `telegram_*`, `webhook_url` y `alert_min_level_*`.
+  cola llena -> se descarta el info más antiguo, luego el warn; un critical sólo deja sitio a otro critical (si el
+  sobrante es el nuevo, se descarta él; un critical descartado va al log como error). `build_notifier(settings,
+  out=None, *, console=True, clock=None, session=None, file_path=None, threaded=True, network=True, label="")` monta
+  los canales según `telegram_*`, `webhook_url` y `alert_min_level_*`; `network=False` = sin canales de red; `label`
+  = identidad de la mesa delante de cada aviso de red (`[PAPER] ...`).
   Telegram: texto plano, troceo a 4000 caracteres (`split_message`), "info" sin sonido, `sendPhoto` multipart (si la
   foto falla el texto llega igual), un reintento ante 429. Webhook troceado a 1900 (límite de Discord). Errores pasan
   por `redact`: nunca se registran el token ni la ruta del webhook (`safe_url` = sólo el host).
@@ -537,8 +572,13 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   `clock` no se ejecutan y se avisa al chat; `None` lo desactiva, p. ej. con un `SimClock`), `api_base`. `poll_once()
   -> int` (un `getUpdates` + tratamiento, nunca lanza), `reply(chat_id, text, reply_to=None) -> bool`,
   `translate_command(text)` (`/cierra_todo@Bot` -> "cierra todo"). Offset en memoria **confirmado a Telegram antes de
-  ejecutar** (como mucho una vez: un reinicio no repite un "long"); ediciones y mensajes no de texto no se ejecutan.
-  Backoff 1, 2, 4... 60 s (respeta `retry_after`; 401/404 -> 300 s); `start()` devuelve False sin token.
+  ejecutar** (como mucho una vez: un reinicio no repite un "long"); si la confirmación falla el lote queda pendiente y
+  se ejecuta tras el siguiente `getUpdates` correcto (que lo confirma). Ediciones y mensajes no de texto no se
+  ejecutan. Backoff 1, 2, 4... 60 s (respeta `retry_after`; 401/404 -> 300 s); `start()` devuelve False sin token.
+  Extras: `user_ids` (autorización por `from.id`; obligatoria en grupos —id negativo—: sin ella nadie da órdenes;
+  `group_without_users()`), nunca `sender_chat`/admin anónimo/bots (`ANONYMOUS_SENDERS`); `getMe` -> `username` y
+  `command_target(text)`: un `/cmd@OtroBot` se ignora (sin nombre conocido, también); `label` delante de cada
+  respuesta; `conflicts` = 409 seguidos.
 
 ## `desk/tui.py` y `desk/console.py`
 - `python -m desk dashboard`: panel `rich.live` de sólo lectura sobre los archivos de estado (`status.json`,
@@ -569,6 +609,8 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
     guarda al cambiar). JSON a medio escribir -> última lectura buena + aviso; de los diarios sólo líneas completas.
     Informe = el más reciente legible de `reports/*.json` (`OptimizationReport.to_dict()` solo o en `{"report",
     "result"}`); sólo métricas fuera de muestra. La línea de estado periódica (`is_status_line`) no sale en avisos.
+    `notice_level(text)` (outbox.log no guarda el nivel) usa el mismo criterio que los niveles del motor: posición sin
+    SL, cierre de seguridad, liquidación, ejecución fuera de una operación y cierres que no salen son críticos.
   - Consola: `DeskConsole(state_dir, *, clock, console, timeout, input_fn, use_readline, follow, poll_s, warnings)`,
     `run_console(state_dir, *, timeout, warnings, clock, console)`; ids `[con-xxxxxxxx]`; `completions(prior, text,
     coins, intervals)` (verbos ES/EN, monedas de `status.json` y del playbook, temporalidades de `INTERVAL_SECONDS`);
@@ -595,27 +637,44 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   Telegram, webhook). Nivel: `logging.WARNING` → "warn", `>= ERROR` → "critical". Con `key` un aviso repetido dentro de
   `alert_cooldown_seconds` se omite del todo (también del outbox); silenciado (`mute`) se omite en los canales pero no
   en el outbox. `push=False` (línea de estado periódica, "SIN DATOS DE LA CUENTA"): sólo log, outbox y pantalla.
-  Avisos: arranque/parada (`start`/`stop`, info), mensajes del motor en el ciclo (`exec`/`trade`: ejecuciones, SL/TP,
-  cierres con PnL), señales automáticas abiertas (`signal`), halts y cierres por riesgo (`halt`, critical), consumo de
+  Avisos: arranque/parada (`start`/`stop`, info), mensajes del motor en el ciclo (`exec`/`trade`, con el `level` y la
+  `key` de `EngineMessage`: posición sin SL, cierre de seguridad o liquidación son critical aunque haya `mute`),
+  señales automáticas abiertas (`signal`), halts y cierres por riesgo (`halt`, critical; el flatten repetido sólo avisa
+  cuando cambian los cierres enviados o las entradas que no se pueden cancelar, con `key=flatten:<motivo>`), consumo de
   la pérdida diaria >= `daily_loss_warn_frac` y del drawdown >= 80 % (`risk`, warn, una vez por cruce con histéresis de
   10 puntos), racha de fallos 3/10/50/100... (`errors`, warn) y recuperación, datos viejos (`data`, warn, clave por
-  moneda), backtest terminado (`backtest`, info, con el PNG) o fallido (warn), playbook degradado (`playbook`, warn).
+  moneda), backtest terminado (`backtest`, info, con el PNG) o fallido (warn), playbook degradado o estrategia por
+  defecto rechazada (`playbook`, warn), 409 sostenido de Telegram (`telegram`, critical, `TELEGRAM_CONFLICT_WARN`).
   Lo que ejecuta un comando va en su respuesta, no se empuja a los canales.
+- Identidad (`desk_identity(settings, sim_clock)`: `LIVE mainnet|testnet`, `PAPER`, `SIM`, `SIM fast`) como `label` de
+  los canales de red y del bot. Simulación (reloj simulado o datos sim/replay): sin `TelegramBot` ni canales de red
+  salvo `telegram_in_sim` (`network_alerts`); con token/webhook en `.env` se avisa en el banner.
 - Comandos: `BACKTEST` (moneda conocida; temporalidad por defecto la de la estrategia pedida o `1h`; días por defecto
-  `bt_default_days`; velas con `jobs.fetch_bars` al momento; < `2·MIN_SEGMENT_BARS` velas → no se lanza; trabajo con
-  copia de `Settings`) → "Backtest HYPE 1h (120 días, 2880 velas, 5 estrategias) en marcha..." y al terminar aviso con
-  `summary_text`, rutas HTML/PNG/JSON y, si hay ganadora, "activa COIN tf". `ADOPT` = `ReportStore.latest(coin, tf)` →
-  `entry_from_report(report, strategy, allow_rejected=force)` → `Playbook.adopt`; sin ganadora y con `forzar` se toma
-  `report.best()`; lo forzado empieza por "ATENCIÓN — FORZADO". `DEACTIVATE` = `Playbook.remove`. `PLAYBOOK`,
+  `bt_default_days`; trabajo con copia de `Settings` y `start_equity` = equity de la cuenta). Con hilo, las velas las
+  descarga el trabajo (`BacktestJob.fetch` con `market.background_copy()` si existe: sesión HTTP propia), fuera del
+  lock de la mesa; con reloj simulado, `jobs.fetch_bars` al momento (< `2·MIN_SEGMENT_BARS` velas → no se lanza) →
+  "Backtest HYPE 1h (120 días, ~2880 velas, 5 estrategias) en marcha..." + capital supuesto; al terminar aviso con
+  `summary_text`, rutas HTML/PNG/JSON y, si hay ganadora, "activa COIN tf" (un fallo de datos llega en ese aviso).
+  `ADOPT` = `ReportStore.latest(coin, tf)` → `entry_from_report(report, strategy, allow_rejected=force)` → sin `forzar`,
+  se rechaza si otro informe de la gráfica de los últimos `REPORT_STALE_DAYS` rechazó esa estrategia
+  (`ReportStore.chart_reports`) → `Playbook.adopt`; sin ganadora y con `forzar` se toma `report.best()`; lo forzado
+  empieza por "ATENCIÓN — FORZADO". La respuesta da las métricas del procedimiento y las de los parámetros adoptados.
+  `DEACTIVATE` = `Playbook.remove` + apaga las estrategias por defecto de esa gráfica (`defaults_off` en `desk.json`,
+  claves `MONEDA|estrategia@tf`). `PLAYBOOK`,
   `REPORTS` (incluye el trabajo en marcha), `ALERT_ADD` (`alerts.add(coin, spec, ref_px=mid)`; el aviso de "punto de
   miles" también vale para el nivel), `ALERT_LIST`, `ALERT_DEL` (`target_id` None = todas), `MUTE`, `UNMUTE`. Sin
   confirmación por IA (además de estado/ayuda/pausa/auto off): `BACKTEST`, `PLAYBOOK`, `REPORTS`, `ALERT_LIST`, `MUTE`.
 - Operativa automática: `auto_slots()` = entradas activas del playbook (su temporalidad, parámetros y `units` o
-  `auto_units`) y, si `auto_default_strategies`, las estrategias por defecto sobre `symbols` (salvo la misma
-  estrategia@temporalidad que el playbook ya cubre en esa moneda). Por moneda, el playbook primero. Origen de las
-  señales `auto:<estrategia>@<tf>` (antes `auto:<estrategia>`; `risk.is_auto` sólo mira el prefijo). "Una evaluación
-  por vela" con clave `(moneda, estrategia@tf)` en `bar_seen`. Una estrategia que lanza no frena a las demás: se
-  reintenta en la vela siguiente y la etapa queda marcada como fallida en ese ciclo.
+  `auto_units`) y, si `auto_default_strategies`, las estrategias por defecto sobre `symbols` sólo en monedas **sin**
+  entradas activas del playbook y salvo `defaults_off`. Origen de las señales `auto:<estrategia>@<tf>` (`risk.is_auto`
+  sólo mira el prefijo). "Una evaluación por vela" con clave `(moneda, estrategia@tf)` en `bar_seen`. Una estrategia
+  que lanza no frena a las demás: se reintenta en la vela siguiente y la etapa queda marcada como fallida.
+- Paridad con el backtest: la etapa corre cada `strategy_seconds` **y** en el primer ciclo tras el cierre de una vela
+  de cualquier ranura. Lo que no se puede operar al cierre (auto OFF, pausa, halt, cooldown, moneda ocupada,
+  `max_open_positions`) se marca visto en `bar_seen` (`_skip_slots`): esa señal se pierde, nunca se ejecuta tarde. Una
+  vela que cerró hace más de `min(max(SIGNAL_MAX_LATE_S=120, 3·loop_seconds), media vela)` no se evalúa.
+- Si un informe nuevo rechaza una estrategia por defecto que opera esa gráfica → aviso "ESTRATEGIA POR DEFECTO
+  RECHAZADA" (warn). En live con estrategias por defecto activas, aviso en el banner.
 - `status.json` = `{ts, time, line, report}` + `account_ok, mode, data, network, equity, available, day_pnl,
   day_pnl_pct, drawdown_pct, auto, paused, cooldown, halt, symbols, risk{daily_loss_pct, daily_loss_limit_pct,
   daily_loss_used_pct, drawdown_pct, max_drawdown_pct, drawdown_used_pct, daily_loss_warn_frac}, positions[{coin, side,
@@ -630,7 +689,9 @@ ALERT_ADD/ALERT_LIST/ALERT_DEL/MUTE/UNMUTE`; `Command.interval/strategy/days/ale
   notifier (entrega lo pendiente).
 - `desk/jobs.py`: `bars_for(days, tf) -> (n, recortado)` (tope `MAX_BARS - 1` = 4999 cerradas), `fetch_bars(market,
   coin, tf, days, clock) -> (velas cerradas, notas)`, `BacktestJob(id, coin, interval, days, strategy, bars, meta,
-  requested_ts, cmd_id, notes, source, settings)`, `BacktestOutcome(job, report, report_path, html_path, png_path, png,
+  requested_ts, cmd_id, notes, source, settings, start_equity=None, fetch=None)` (`bars=None` + `fetch()` = descarga en
+  el hilo del trabajo; `JobDataError` con texto para el usuario si falla o hay < `MIN_BARS`), `BacktestOutcome(job,
+  report, report_path, html_path, png_path, png,
   error, canceled, elapsed_s)`, `run_job(job, settings, store, clock, *, should_stop, progress, render=True)`
   (`optimize` → `ReportStore.save` → `.html`/`.png` junto al JSON; un fallo al pintar no pierde el informe; se podan
   los HTML/PNG huérfanos) y `BacktestWorker(settings, store, clock, *, threaded=True, max_queue=4, runner=run_job)`:

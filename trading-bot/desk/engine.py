@@ -62,6 +62,25 @@ CLOSING = "closing"     # cierre a mercado enviado
 
 MAX_SL_FAILURES = 3     # SL rechazado N veces seguidas -> cierre de seguridad
 MAX_SL_ERRORS = 10      # SL sin poder colocarse por fallos de conexión N veces seguidas -> cierre de seguridad
+MAX_TP_FAILURES = 5     # TP rechazado N veces seguidas -> se deja de reintentar (la posición sigue con su SL)
+
+# Niveles de los mensajes del motor (los de los avisos: ``notify``/``alerts``).
+INFO, WARN, CRITICAL = "info", "warn", "critical"
+
+
+class EngineMessage(str):
+    """Mensaje del motor para el operador: un ``str`` normal con su nivel de aviso (``level``: "info" | "warn" |
+    "critical") y una clave anti-spam opcional (``key``, por moneda y tipo). Los críticos (posición sin SL, cierre
+    de seguridad, liquidación, ejecución fuera de una operación, cierre que no sale) no se silencian y suenan."""
+
+    level: str
+    key: Optional[str]
+
+    def __new__(cls, text: str, level: str = INFO, key: Optional[str] = None) -> "EngineMessage":
+        obj = super().__new__(cls, text)
+        obj.level = level
+        obj.key = key
+        return obj
 PLACE_GRACE_S = 5.0     # una orden recién colocada puede tardar en verse en open_orders (live)
 MISSING_CHECKS = 2      # reconciliaciones seguidas antes de dar por perdida una entrada / posición
 CLOSE_SLIPPAGE = 0.05   # cierre a mercado: límite 5 % peor que la referencia (como market_close del SDK)
@@ -215,6 +234,7 @@ class ExecutionEngine:
         self.journal = journal
         self.brackets: dict[str, Bracket] = {}
         self.messages: list[str] = []
+        self._protect_failed: set[str] = set()            # "sl"/"tp" que falló en el último _protect
         self._retry_cancel: list[tuple[str, str]] = []     # (moneda, id) de cancelaciones fallidas
         self._metas: dict[str, AssetMeta] = {}
         self._reject_seq = 0
@@ -232,9 +252,24 @@ class ExecutionEngine:
         out, self.messages = self.messages, []
         return out
 
-    def _say(self, text: str) -> None:
-        self.messages.append(text)       # la mesa los muestra y los registra (logger desk.notice)
+    def _say(self, text: str, level: str = INFO, key: Optional[str] = None) -> None:
+        self.messages.append(EngineMessage(text, level, key))   # la mesa los muestra y los avisa con su nivel
         log.debug("%s", text)
+
+    def _say_protect(self, coin: str, done: list[str], suffix: str = "") -> None:
+        """Lo que hizo ``_protect``: crítico si el SL no quedó colocado (posición sin stop), aviso si fue el TP;
+        con clave por moneda y tipo (un fallo que se repite cada ciclo no inunda los canales)."""
+        if not done:
+            return
+        if "sl" in self._protect_failed:
+            level, key = CRITICAL, f"protect:{coin}:sl"
+        elif "tp_off" in self._protect_failed:          # aviso final: no lo tapa el anti-spam de los rechazos
+            level, key = WARN, f"protect:{coin}:tp_off"
+        elif "tp" in self._protect_failed:
+            level, key = WARN, f"protect:{coin}:tp"
+        else:
+            level, key = INFO, None
+        self._say(f"{coin}: " + ", ".join(done) + suffix, level, key)
 
     def _event(self, event_kind: str, /, **data: Any) -> None:
         if self.journal is not None:
@@ -429,7 +464,7 @@ class ExecutionEngine:
                 what = "compra" if f.is_buy else "venta"
                 liq = " — LIQUIDACIÓN" if f.liquidation else ""
                 self._say(f"{f.coin}: ejecución fuera de una operación gestionada: {what} {fmt_size(f.size)} "
-                          f"@ {fmt_px(f.price)} ({f.tag or 'sin etiqueta'}){liq}")
+                          f"@ {fmt_px(f.price)} ({f.tag or 'sin etiqueta'}){liq}", CRITICAL)
                 self._event("fill_unmatched", fill=f.to_dict())
                 continue
             info = touched.setdefault(f.coin, {"entry": 0.0, "entry_cost": 0.0, "exit": 0.0, "assumed": 0.0})
@@ -452,7 +487,7 @@ class ExecutionEngine:
                     if br.canceling:
                         br.canceling = False
                         self._say(f"{f.coin}: la entrada se ejecutó antes de confirmarse su cancelación; se gestiona "
-                                  "con su SL/TP")
+                                  "con su SL/TP", WARN)
             else:                                    # reduce / cierra
                 br.position = max(br.position - f.size, 0.0)
                 br.exit_size += f.size
@@ -477,8 +512,7 @@ class ExecutionEngine:
                     closed.append(self._finish(br))
                 elif br.position >= lot / 2 and br.status in (OPEN, CLOSING):
                     done = self._protect(br)
-                    if done:
-                        self._say(f"{coin}: " + ", ".join(done) + f" (cubren {fmt_size(br.position)} {coin})")
+                    self._say_protect(coin, done, f" (cubren {fmt_size(br.position)} {coin})")
             except (BrokerError, MarketDataError) as e:   # una moneda nunca deja sin procesar a las demás
                 log.warning("%s: fallo procesando ejecuciones (%s); reconcile lo reintentará", coin, e)
                 self._event("fills_error", coin=coin, error=str(e))
@@ -557,7 +591,8 @@ class ExecutionEngine:
         tail = f". {'; '.join(notes)}" if notes else ""
         self._say(f"{coin} {br.side.value.upper()} cerrada por {label}: {fmt_size(br.filled)} @ {fmt_px(br.avg_entry)} "
                   f"→ {fmt_px(br.avg_exit)}; PnL neto {fmt_usd(pnl)} (bruto {fmt_usd(br.realized)}, "
-                  f"comisiones {fmt_usd(br.fees, sign=False)}){tail}")
+                  f"comisiones {fmt_usd(br.fees, sign=False)}){tail}",
+                  CRITICAL if reason in ("liquidation", "no_sl") else INFO)
         return trade
 
     # ------------------------------------------------------------------ protección (SL/TP)
@@ -579,6 +614,7 @@ class ExecutionEngine:
         lot = 10.0 ** -meta.sz_decimals
         now = self.clock.now()
         done: list[str] = []
+        self._protect_failed = set()
         for attr, kind, px in (("sl", OrderKind.STOP, br.sl), ("tp", OrderKind.TAKE_PROFIT, br.tp)):
             if px is None:
                 continue
@@ -598,15 +634,27 @@ class ExecutionEngine:
             except BrokerError as e:              # se reintenta en la próxima reconciliación
                 if attr == "sl":
                     br.sl_errors += 1
+                self._protect_failed.add(attr)
                 done.append(f"{label} {fmt_px(px)} NO colocado (fallo de conexión: {e}; se reintenta)")
                 self._event("protect_error", coin=coin, level=attr, px=px, error=str(e))
                 continue
             if attr == "sl":
                 br.sl_errors = 0
             if order.status is OrderStatus.REJECTED:
-                setattr(br, f"{attr}_failures", getattr(br, f"{attr}_failures") + 1)
-                done.append(f"{label} {fmt_px(px)} RECHAZADO ({order.reason})")
+                fails = getattr(br, f"{attr}_failures") + 1
+                setattr(br, f"{attr}_failures", fails)
+                self._protect_failed.add(attr)
                 self._event("protect_rejected", coin=coin, level=attr, px=px, reason=order.reason)
+                if attr == "tp" and fails >= MAX_TP_FAILURES:
+                    # Un TP que el exchange rechaza una y otra vez no se reintenta para siempre: la posición sigue
+                    # protegida por su SL (el SL rechazado sí acaba en cierre de seguridad).
+                    br.tp, br.tp_failures = None, 0
+                    self._protect_failed.add("tp_off")
+                    done.append(f"TP {fmt_px(px)} RECHAZADO ({order.reason}) {fails} veces seguidas: TP desactivado "
+                                f"(la posición sigue con su SL; 'tp {coin} <precio>' para ponerlo otra vez)")
+                    self._event("tp_disabled", coin=coin, px=px, failures=fails)
+                    continue
+                done.append(f"{label} {fmt_px(px)} RECHAZADO ({order.reason})")
                 continue
             setattr(br, f"{attr}_failures", 0)
             setattr(br, f"{attr}_order_id", order.id)
@@ -693,7 +741,7 @@ class ExecutionEngine:
                     br.entry_cost = size * pos.entry_px
                 br.opened_ts = br.opened_ts or pos.opened_ts or now
                 self._say(f"{coin}: la entrada aparece ejecutada en la cuenta ({fmt_size(size)} "
-                          f"@ {fmt_px(pos.entry_px)}); se protege")
+                          f"@ {fmt_px(pos.entry_px)}); se protege", WARN)
             elif entry_open and (br.canceling or (br.expires_ts is not None and now >= br.expires_ts)):
                 expired = not br.canceling
                 if self._cancel_quiet(coin, br.entry_order_id):
@@ -707,7 +755,7 @@ class ExecutionEngine:
                     # Sin confirmar (red, o se acaba de ejecutar): se conserva con su SL/TP por si se ejecuta.
                     br.canceling = True
                     self._say(f"{coin} {br.side.value.upper()}: entrada límite @ {fmt_px(br.entry_px)} caducada, pero "
-                              "su cancelación no se confirmó; se reintenta (si se ejecuta, se protege con su SL/TP)")
+                              "su cancelación no se confirmó; se reintenta (si se ejecuta, se protege con su SL/TP)", WARN)
                 return None
             elif not entry_open:
                 br.missing_checks += 1
@@ -744,14 +792,13 @@ class ExecutionEngine:
                 self._say(f"{coin}: resto de la entrada caducado y cancelado; se gestiona lo ejecutado "
                           f"({fmt_size(size)})")
         done = self._protect(br, open_ids)
-        if done:
-            self._say(f"{coin}: " + ", ".join(done))
+        self._say_protect(coin, done)
         if br.status == CLOSING:
             self._retry_close(br, account, now)
         elif br.sl is not None and (br.sl_failures >= MAX_SL_FAILURES or br.sl_errors >= MAX_SL_ERRORS):
             why = (f"se rechazó {br.sl_failures} veces seguidas" if br.sl_failures >= MAX_SL_FAILURES
                    else f"no se pudo colocar {br.sl_errors} veces seguidas (conexión)")
-            self._say(f"{coin}: el SL {why}; cierro la posición por seguridad")
+            self._say(f"{coin}: el SL {why}; cierro la posición por seguridad", CRITICAL, f"no_sl:{coin}")
             self.close(coin, reason="no_sl", account=account)
         return None
 
@@ -775,12 +822,12 @@ class ExecutionEngine:
         label = EXIT_LABELS.get(br.exit_reason, br.exit_reason or "cierre")
         if br.close_attempts < MAX_CLOSE_ATTEMPTS:
             self._say(f"{br.coin}: la posición sigue abierta tras el cierre ({label}); reintento "
-                      f"{br.close_attempts}/{MAX_CLOSE_ATTEMPTS - 1}")
+                      f"{br.close_attempts}/{MAX_CLOSE_ATTEMPTS - 1}", WARN)
             self.close(br.coin, br.exit_reason or "close", account=account)
         elif not br.close_warned:
             br.close_warned = True
             self._say(f"{br.coin}: ATENCIÓN: el cierre ({label}) no se completó tras {br.close_attempts} intentos; la "
-                      f"posición sigue abierta con su SL/TP. Revisa el exchange o repite 'cierra {br.coin}'.")
+                      f"posición sigue abierta con su SL/TP. Revisa el exchange o repite 'cierra {br.coin}'.", CRITICAL)
             self._event("close_gave_up", coin=br.coin, attempts=br.close_attempts, reason=br.exit_reason)
 
     def _default_sl(self, coin: str, side: Side, entry: float, mark: Optional[float],
@@ -826,11 +873,10 @@ class ExecutionEngine:
                     sl=br.sl, tp=br.tp, reused_sl=sl_o.id if sl_o else None)
         where = "existente" if sl_o is not None else f"por defecto ({self.settings.default_sl_pct:g}%)"
         self._say(f"{coin} {side.value.upper()} {fmt_size(size)} @ {fmt_px(pos.entry_px)}: posición sin bracket "
-                  f"adoptada (SL {where} {fmt_px(br.sl)}" + (f", TP {fmt_px(br.tp)}" if br.tp else "") + ")")
+                  f"adoptada (SL {where} {fmt_px(br.sl)}" + (f", TP {fmt_px(br.tp)}" if br.tp else "") + ")", WARN)
         if protect:
             done = self._protect(br, {o.id for o in open_orders})
-            if done:
-                self._say(f"{coin}: " + ", ".join(done))
+            self._say_protect(coin, done)
         return br
 
     # ------------------------------------------------------------------ cierres y cancelaciones
@@ -857,7 +903,7 @@ class ExecutionEngine:
             br.canceling = True
             self._event("entry_cancel_unconfirmed", coin=coin, order_id=br.entry_order_id, reason=reason)
             self._say(f"{coin}: la cancelación de la entrada pendiente no se confirmó; se reintenta (si se ejecuta, "
-                      "se protege con su SL/TP)")
+                      "se protege con su SL/TP)", WARN, f"cancel:{coin}")
         return False
 
     def cancel(self, coin: Optional[str] = None) -> int:
@@ -920,7 +966,8 @@ class ExecutionEngine:
             self.save_state()                     # la intención de cerrar queda guardada: se reintenta
             raise
         if order.status is OrderStatus.REJECTED:
-            self._say(f"{coin}: el cierre fue rechazado por el broker: {order.reason}; se reintentará")
+            self._say(f"{coin}: el cierre fue rechazado por el broker: {order.reason}; se reintentará", CRITICAL,
+                      f"close:{coin}")
             self._event("close_rejected", coin=coin, reason=order.reason, attempt=br.close_attempts)
             self.save_state()
             return order
@@ -943,7 +990,7 @@ class ExecutionEngine:
             canceled = self._cancel_entries(None)
         except BrokerError as e:
             log.warning("close_all: no se pudieron cancelar las entradas (%s); se cierran las posiciones", e)
-            self._say(f"No se pudieron cancelar las entradas pendientes ({e}); se reintentará")
+            self._say(f"No se pudieron cancelar las entradas pendientes ({e}); se reintentará", WARN, "cancel_entries")
             canceled = set()
         for c in list(self.brackets):
             self._drop_pending(c, canceled, reason)
@@ -954,7 +1001,7 @@ class ExecutionEngine:
                 order = self.close(coin, reason, account=acct)
             except (BrokerError, MarketDataError, KeyError) as e:
                 self.close_failures[coin] = str(e)
-                self._say(f"{coin}: no se pudo enviar el cierre ({e}); se reintentará")
+                self._say(f"{coin}: no se pudo enviar el cierre ({e}); se reintentará", CRITICAL, f"close:{coin}")
                 self._event("close_failed", coin=coin, reason=reason, error=str(e))
                 continue
             if order is None:
@@ -1031,6 +1078,8 @@ class ExecutionEngine:
         old = getattr(br, attr)
         setattr(br, attr, px)
         setattr(br, f"{attr}_size", 0.0)           # fuerza colocar la orden nueva
+        if attr == "tp":
+            br.tp_failures = 0                     # un TP nuevo empieza de cero (tras desactivarse por rechazos)
         br.position = abs(pos.size)
         done = self._protect(br, {o.id for o in open_orders})
         self.save_state()

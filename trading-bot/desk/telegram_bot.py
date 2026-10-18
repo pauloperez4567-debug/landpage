@@ -3,19 +3,26 @@
 - Long polling de ``getUpdates`` (``timeout`` 25 s) en un hilo daemon; ``start()`` / ``stop()``.
 - Sólo se atienden mensajes de los chats de ``chat_ids``. El resto se ignora **sin responder** (no se confirma
   ni que el bot existe) y queda en el log con el id del chat, para poder autorizarlo si era legítimo.
+- Además, por persona: con ``user_ids`` sólo esos usuarios (``from.id``) dan órdenes, en cualquier chat. En un
+  grupo (id negativo) ``user_ids`` es obligatorio: sin él nadie da órdenes (cualquier miembro podría mandar un
+  "kill" o un "long"). Nunca se aceptan mensajes en nombre de un canal (``sender_chat``), de un admin anónimo
+  (``GroupAnonymousBot``) ni de otros bots.
 - ``/start`` y ``/help`` -> ayuda (presentación + la ayuda de la mesa). Un ``/comando`` se traduce a texto:
-  ``/estado`` -> "estado", ``/cierra_todo`` -> "cierra todo", ``/long HYPE`` -> "long HYPE" (el ``@NombreBot``
-  de los grupos se quita). Cada texto va a ``submit(text, source="telegram")`` y la respuesta vuelve al chat
-  (troceada si pasa de 4000 caracteres), como respuesta al mensaje original.
+  ``/estado`` -> "estado", ``/cierra_todo`` -> "cierra todo", ``/long HYPE`` -> "long HYPE". Un
+  ``/comando@OtroBot`` (dirigido a otro bot del grupo) se ignora: el nombre propio se pide con ``getMe``. Cada
+  texto va a ``submit(text, source="telegram")`` y la respuesta vuelve al chat (troceada si pasa de 4000
+  caracteres), como respuesta al mensaje original, con la identidad de la mesa delante si hay ``label``.
 - Como mucho una vez: el ``offset`` de updates vive en memoria y se *confirma* a Telegram (``getUpdates`` con el
-  offset nuevo) **antes** de ejecutar el lote. Si la mesa se cae a mitad de un "long HYPE", al volver Telegram
-  no lo reenvía: nunca se ejecuta dos veces.
+  offset nuevo) **antes** de ejecutar el lote. Si la confirmación falla, el lote NO se ejecuta: queda en memoria
+  y se ejecuta cuando un ``getUpdates`` posterior con ese offset responde bien (eso también lo confirma). Si la
+  mesa se cae antes, al volver Telegram lo reenvía y se ejecuta una sola vez (y sólo si no es antiguo).
 - Mensajes antiguos: uno con más de ``max_age_s`` (5 min por defecto) se descarta y se avisa al chat (p. ej.
   escrito mientras la mesa estaba caída o sin red: ejecutar tarde un "long" a otro precio es peor que pedir
   que se reenvíe). La edad se mide con el ``Clock`` inyectado: con un ``SimClock`` desfasado de la hora real
   conviene ``max_age_s=None``.
 - Errores (red, 5xx, 409 por otro proceso con el mismo bot, 429) -> espera exponencial 1, 2, 4... hasta 60 s
-  (respetando ``retry_after``); token inválido (401/404) -> 5 min. El bucle nunca muere.
+  (respetando ``retry_after``); token inválido (401/404) -> 5 min. El bucle nunca muere. ``conflicts`` cuenta
+  los 409 seguidos: la mesa avisa en crítico (otro proceso lee este bot: las órdenes pueden ir a otra mesa).
 - Nunca registra el token: los errores pasan por ``redact`` (las excepciones de ``requests`` llevan la URL).
 """
 
@@ -39,6 +46,8 @@ AUTH_BACKOFF_S = 300.0         # token inválido o revocado: no martillear la AP
 MAX_AGE_S = 300.0              # mensajes más antiguos no se ejecutan
 MIN_EMPTY_POLL_S = 1.0         # una respuesta vacía inmediata (proxy raro) no debe girar en vacío
 HELP_WORDS = frozenset({"start", "help"})
+# Remitentes que no son una persona identificable: admin anónimo de un grupo y mensajes de canal.
+ANONYMOUS_SENDERS = frozenset({"1087968824", "136817688", "777000"})
 
 BOT_HELP = (
     "Mesa de trading por Telegram.\n"
@@ -48,6 +57,17 @@ BOT_HELP = (
     "Las órdenes interpretadas por IA piden confirmación: responde 'si' o 'no'.\n"
     "Los mensajes de hace más de unos minutos no se ejecutan (reenvíalos)."
 )
+
+
+def command_target(text: str) -> Optional[str]:
+    """``/comando@Bot ...`` -> ``"Bot"`` (a quién va dirigido); None si no es un ``/comando`` o no nombra bot."""
+    text = str(text or "").strip()
+    if not text.startswith("/"):
+        return None
+    parts = text[1:].split(None, 1)
+    if not parts or "@" not in parts[0]:
+        return None
+    return parts[0].split("@", 1)[1].strip() or None
 
 
 def translate_command(text: str) -> str:
@@ -74,9 +94,13 @@ class TelegramBot:
     def __init__(self, token: str, chat_ids: Iterable[Any], submit: Callable[..., Any],
                  clock: Optional[Clock] = None, session: Optional[requests.Session] = None, *,
                  poll_timeout: int = POLL_TIMEOUT_S, max_age_s: Optional[float] = MAX_AGE_S,
-                 api_base: str = TELEGRAM_API):
+                 api_base: str = TELEGRAM_API, user_ids: Iterable[Any] = (), label: str = "",
+                 username: Optional[str] = None):
         self._token = str(token or "").strip()
         self.chat_ids: set[str] = {str(c).strip() for c in (chat_ids or []) if str(c).strip()}
+        self.user_ids: set[str] = {str(u).strip() for u in (user_ids or []) if str(u).strip()}
+        self.label = str(label or "")         # identidad de la mesa en las respuestas ("[PAPER] ...")
+        self.username: Optional[str] = str(username).lstrip("@") if username else None   # de getMe
         self.submit = submit
         self.clock: Clock = clock if clock is not None else RealClock()
         self.session = session if session is not None else requests.Session()
@@ -89,7 +113,9 @@ class TelegramBot:
         self.last_error = ""
         self.last_ok_ts: Optional[float] = None
         self.handled = 0                      # mensajes atendidos
-        self.ignored = 0                      # mensajes de chats no autorizados
+        self.ignored = 0                      # mensajes de chats o personas no autorizados
+        self.conflicts = 0                    # 409 seguidos (otro proceso con el mismo bot)
+        self._pending: list[dict[str, Any]] = []   # lote recibido cuya confirmación falló: aún no se ejecuta
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -108,6 +134,8 @@ class TelegramBot:
             return False
         if not self.chat_ids:
             log.warning("Telegram: sin TELEGRAM_CHAT_ID autorizados; todos los mensajes se ignorarán")
+        if self.group_without_users():
+            log.warning("Telegram: hay grupos autorizados sin TELEGRAM_USER_IDS: en ellos nadie puede dar órdenes")
         if self.running:
             return True
         self._stop.clear()
@@ -122,8 +150,13 @@ class TelegramBot:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(timeout, 0.0))
 
+    def group_without_users(self) -> bool:
+        """True si algún chat autorizado es un grupo (id negativo) y no hay ``user_ids``: ahí nadie da órdenes."""
+        return not self.user_ids and any(c.startswith("-") for c in self.chat_ids)
+
     def _run(self) -> None:
         log.info("Telegram: bot escuchando (%d chat(s) autorizados)", len(self.chat_ids))
+        self._fetch_username()
         while not self._stop.is_set():
             started = time.monotonic()
             n = -1
@@ -161,9 +194,24 @@ class TelegramBot:
         raise _ApiError(f"{method}: HTTP {status} {desc}".rstrip(), status,
                         float(retry_after) if isinstance(retry_after, (int, float)) else None)
 
+    def _fetch_username(self) -> Optional[str]:
+        """Nombre del bot (``getMe``), para ignorar los ``/comando@OtroBot``. None si no se pudo saber."""
+        if self.username:
+            return self.username
+        try:
+            me = self._api("getMe", {})
+        except Exception as e:  # noqa: BLE001 - sin nombre se sigue (los /comando@Bot esperan a saberlo)
+            log.warning("Telegram: getMe falló (%s): los /comando@Bot se ignoran hasta saber el nombre",
+                        redact(e, [self._token]))
+            return None
+        name = me.get("username") if isinstance(me, dict) else None
+        self.username = str(name).lstrip("@") if name else None
+        return self.username
+
     def _on_error(self, msg: str, status: int = 0, retry_after: Optional[float] = None) -> None:
         self.errors += 1
         self.last_error = msg
+        self.conflicts = self.conflicts + 1 if status == 409 else 0
         delay = min(2.0 ** (self.errors - 1), MAX_BACKOFF_S)
         if retry_after is not None:
             delay = max(delay, min(float(retry_after), MAX_BACKOFF_S * 5))
@@ -193,10 +241,13 @@ class TelegramBot:
             self._on_error(str(e), e.status, e.retry_after)
             return 0
         self.errors = 0
+        self.conflicts = 0
         self.backoff_s = 0.0
         self.last_ok_ts = self.clock.now()
         if self._stop.is_set():          # parada pedida durante la espera: no se ejecuta (ni confirma) nada
             return 0
+        # Este getUpdates (con el offset ya avanzado) confirma el lote pendiente: ahora sí se puede ejecutar.
+        ready, self._pending = self._pending, []
         batch = []
         for upd in result if isinstance(result, list) else []:
             uid = upd.get("update_id") if isinstance(upd, dict) else None
@@ -205,27 +256,36 @@ class TelegramBot:
             if self.offset is not None and uid < self.offset:     # ya tratado: nunca se repite
                 continue
             batch.append(upd)
-        if not batch:
+        if batch:
+            batch.sort(key=lambda u: u["update_id"])
+            self.offset = batch[-1]["update_id"] + 1
+            if self._confirm():
+                ready += batch
+            else:
+                # Sin confirmar no se ejecuta: tras un reinicio Telegram lo reenviaría (se ejecutaría dos veces).
+                self._pending = batch
+                self.backoff_s = max(self.backoff_s, 1.0)
+        if not ready:
             return 0
-        batch.sort(key=lambda u: u["update_id"])
-        self.offset = batch[-1]["update_id"] + 1
-        self._confirm()
-        for upd in batch:
+        for upd in ready:
             try:
                 self._handle(upd)
             except Exception as e:  # noqa: BLE001 - un mensaje raro no para el bot
                 log.error("Telegram: error tratando el update %s: %s", upd.get("update_id"),
                           redact(f"{type(e).__name__}: {e}", [self._token]))
-        return len(batch)
+        return len(ready)
 
-    def _confirm(self) -> None:
+    def _confirm(self) -> bool:
         """Confirma a Telegram los updates < ``offset`` antes de ejecutarlos (como mucho una vez). Lo que devuelva
-        esta llamada no se trata: llegará en el siguiente ``getUpdates``."""
+        esta llamada no se trata: llegará en el siguiente ``getUpdates``. False si no se pudo confirmar."""
         try:
             self._api("getUpdates", {"offset": self.offset, "timeout": 0, "limit": 1,
                                      "allowed_updates": ["message"]}, http_timeout=10.0)
         except _ApiError as e:
-            log.debug("Telegram: no se pudo confirmar el offset %s: %s", self.offset, e)
+            log.warning("Telegram: no se pudo confirmar el offset %s (%s): el lote se ejecutará cuando Telegram lo "
+                        "confirme", self.offset, e)
+            return False
+        return True
 
     def _handle(self, upd: dict[str, Any]) -> None:
         msg = upd.get("message")
@@ -233,12 +293,18 @@ class TelegramBot:
             return
         chat = msg.get("chat") if isinstance(msg.get("chat"), dict) else {}
         chat_id = str(chat.get("id", "")).strip()
+        sender = msg.get("from") if isinstance(msg.get("from"), dict) else {}
+        who = str(sender.get("username") or sender.get("first_name") or "?")[:40]
         if not chat_id or chat_id not in self.chat_ids:
             self.ignored += 1
-            sender = msg.get("from") if isinstance(msg.get("from"), dict) else {}
-            who = sender.get("username") or sender.get("first_name") or "?"
             log.warning("Telegram: mensaje de un chat no autorizado ignorado (chat %s, %s): %r", chat_id or "?",
-                        str(who)[:40], str(msg.get("text") or "")[:60])
+                        who, str(msg.get("text") or "")[:60])
+            return
+        why = self._unauthorized_sender(msg, chat_id, chat, sender)
+        if why:
+            self.ignored += 1
+            log.warning("Telegram: mensaje ignorado en el chat %s (%s, usuario %s): %s", chat_id, who,
+                        sender.get("id", "?"), why)
             return
         msg_id = msg.get("message_id")
         text = msg.get("text")
@@ -252,6 +318,12 @@ class TelegramBot:
                 log.warning("Telegram: mensaje de hace %.0f s ignorado por antiguo: %r", age, text[:80])
                 self.reply(chat_id, f"Mensaje de hace {age / 60:.0f} min NO ejecutado por antiguo: "
                                     f"«{text.strip()[:80]}». Reenvíalo si sigue vigente.", msg_id)
+                return
+        target = command_target(text)
+        if target is not None:
+            me = self._fetch_username()
+            if me is None or target.lower() != me.lower():
+                log.info("Telegram: /comando para otro bot (@%s) ignorado", target[:40])
                 return
         command = translate_command(text)
         self.handled += 1
@@ -268,6 +340,22 @@ class TelegramBot:
             answer = f"Error procesando el comando ({type(e).__name__}). Revisa el log de la mesa."
         self.reply(chat_id, str(answer) if answer not in (None, "") else "(sin respuesta)", msg_id)
 
+    def _unauthorized_sender(self, msg: dict[str, Any], chat_id: str, chat: dict[str, Any],
+                             sender: dict[str, Any]) -> str:
+        """Motivo para no aceptar órdenes de este remitente ("" = autorizado)."""
+        uid = str(sender.get("id", "")).strip()
+        if msg.get("sender_chat") is not None:
+            return "mensaje en nombre de un canal o de un admin anónimo (no se sabe quién es)"
+        if not uid or uid in ANONYMOUS_SENDERS or sender.get("is_bot"):
+            return "remitente anónimo o bot"
+        if self.user_ids:
+            return "" if uid in self.user_ids else "usuario no autorizado (TELEGRAM_USER_IDS)"
+        is_group = chat_id.startswith("-") or str(chat.get("type") or "") in ("group", "supergroup", "channel")
+        if is_group:
+            return ("grupo sin TELEGRAM_USER_IDS: en un grupo hay que decir qué personas pueden dar órdenes (si no, "
+                    "cualquier miembro podría)")
+        return ""
+
     def _help(self) -> str:
         try:
             desk_help = self.submit("ayuda", source="telegram")
@@ -279,7 +367,8 @@ class TelegramBot:
     def reply(self, chat_id: Any, text: str, reply_to: Optional[int] = None) -> bool:
         """Envía ``text`` al chat (troceado). True si todo se envió; los errores se registran y se tragan."""
         ok = True
-        for i, chunk in enumerate(split_message(str(text), TELEGRAM_CHUNK)):
+        text = f"[{self.label}] {text}" if self.label else str(text)
+        for i, chunk in enumerate(split_message(text, TELEGRAM_CHUNK)):
             payload: dict[str, Any] = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
             if i == 0 and isinstance(reply_to, int):
                 payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
@@ -292,4 +381,4 @@ class TelegramBot:
         return ok
 
 
-__all__ = ["TelegramBot", "translate_command", "BOT_HELP"]
+__all__ = ["TelegramBot", "translate_command", "command_target", "BOT_HELP", "ANONYMOUS_SENDERS"]

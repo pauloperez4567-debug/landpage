@@ -435,3 +435,112 @@ def test_zone_failure_or_bad_folds_setting_never_crash(tmp_path, monkeypatch):
     s.bt_folds = 0
     rep = optimize("BTC", "1h", bars, s, strategies=[HourPattern], clock=SimClock(T0))
     assert rep.folds == 1 and any("bt_folds" in n for n in rep.notes)
+
+
+# --- lo que se adopta, frenos en vivo, capital, Bonferroni y zonas (revisión de validez) -----------------------
+
+def regime_bars(n: int = 1500, flip_at: int = 1200, hour: int = 7, jump: float = 0.015, vol: float = 0.003,
+                seed: int = 3) -> pd.DataFrame:
+    """Como ``pattern_bars`` hasta ``flip_at``; desde ahí el patrón se invierte (la vela de la hora ``hour + 1``
+    cae): cambio de régimen justo en el último tramo de validación."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2026-03-01", periods=n, freq="1h", tz="UTC")
+    special = idx.hour.to_numpy() == (hour + 1) % 24
+    sign = np.where(np.arange(n) < flip_at, 1.0, -1.0)
+    rets = rng.normal(-jump / 23.0 * sign, vol, n)
+    rets[special] = jump * sign[special]
+    c = 100.0 * np.exp(np.cumsum(rets))
+    o = np.r_[100.0, c[:-1]]
+    h = np.maximum(o, c) * (1 + np.abs(rng.normal(0, 0.001, n)))
+    l = np.minimum(o, c) * (1 - np.abs(rng.normal(0, 0.001, n)))
+    return pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": 1_000.0}, index=idx)
+
+
+def test_adopted_parameters_must_win_in_their_own_out_of_sample_fold(tmp_path):
+    """La curva encadenada (3 tramos buenos y 1 malo) pasa todos los filtros, pero lo que se adoptaría -los
+    parámetros del último entrenamiento- pierde en su único tramo fuera de muestra: no se aprueba."""
+    s = new_settings(tmp_path)
+    rep = optimize("ETH", "1h", regime_bars(), s, strategies=[HourPattern], clock=SimClock(T0))
+    e = rep.get("hour_pattern")
+    assert approval_reasons(e.oos_metrics, s) == []            # el procedimiento, encadenado, sí "aprobaría"
+    assert not e.passed and rep.winner is None
+    assert len(e.reasons) == 1 and "parámetros que se adoptarían" in e.reasons[0] and "T4" in e.reasons[0]
+    ad = e.adopted_oos
+    assert ad["fold"] == 4 and ad["total_return_pct"] < 0 and ad["n_trades"] >= 10
+    assert e.params == e.folds[-1].params == {"hour": 7}
+    back = StrategyEvaluation.from_dict(json.loads(json.dumps(e.to_dict())))
+    assert back.adopted_metrics == pytest.approx(e.adopted_metrics)
+    from desk.playbook import PlaybookEntry, entry_from_report
+    entry = entry_from_report(rep, "hour_pattern", allow_rejected=True, clock=SimClock(T0))
+    assert entry.adopted_metrics["fold"] == 4 and entry.oos_metrics == e.oos_metrics
+    text = PlaybookEntry.from_dict(entry.to_dict()).describe()
+    assert "procedimiento" in text and "con estos parámetros (tramo T4) -" in text
+
+
+def test_adopted_reasons_unit(settings):
+    from desk.optimizer import adopted_reasons
+    assert adopted_reasons({"fold": 4, "total_return_pct": 2.0, "profit_factor": 1.5, "n_trades": 9}, settings) == []
+    [r] = adopted_reasons({"fold": 4, "total_return_pct": -0.04, "profit_factor": 0.99, "n_trades": 11}, settings)
+    assert "T4" in r and "-0.04 %" in r
+    [h] = adopted_reasons({"fold": 2, "total_return_pct": 5.0, "profit_factor": 2.0, "halted": 1.0}, settings)
+    assert "halt por drawdown" in h
+    assert adopted_reasons({}, settings) == [] and adopted_reasons(None, settings) == []
+
+
+def test_out_of_sample_curve_is_cut_by_the_live_drawdown_halt(tmp_path):
+    """Con max_drawdown_pct = 1 % la curva fuera de muestra se corta en el halt (como la mesa en vivo, que cierra
+    todo y no vuelve a operar sin 'reset halt') y no se aprueba, aunque el DD esté muy por debajo de
+    bt_max_drawdown_pct."""
+    loose = new_settings(tmp_path, max_drawdown_pct=50.0, daily_loss_limit_pct=50.0, max_consecutive_losses=0)
+    tight = new_settings(tmp_path, max_drawdown_pct=1.0, daily_loss_limit_pct=50.0, max_consecutive_losses=0)
+    bars = trend_bars(2, vol=0.014)
+    a = optimize("BTC", "1h", bars, loose, strategies=["donchian_breakout"], clock=SimClock(T0)).get("donchian_breakout")
+    b = optimize("BTC", "1h", bars, tight, strategies=["donchian_breakout"], clock=SimClock(T0)).get("donchian_breakout")
+    assert a.oos_metrics["halted"] == 0.0 and a.oos_metrics["n_trades"] > b.oos_metrics["n_trades"]
+    assert b.oos_metrics["halted"] == 1.0 and not b.passed
+    assert any("se habría detenido" in r for r in b.reasons)
+    halt_ts = b.oos_metrics["halt_ts"]
+    assert all(t.entry_ts <= halt_ts for t in b.oos_trades)
+    assert b.oos_metrics["max_drawdown_pct"] < tight.bt_max_drawdown_pct
+
+
+def test_account_equity_is_the_starting_capital(tmp_path):
+    s = new_settings(tmp_path)
+    bars = pattern_bars(n=1500)
+    base = optimize("ETH", "1h", bars, s, strategies=[HourPattern], clock=SimClock(T0))
+    small = optimize("ETH", "1h", bars, s, strategies=[HourPattern], clock=SimClock(T0), start_equity=2_000.0)
+    assert base.start_equity == s.paper_start_equity and base.criteria["equity_source"] == "paper_start_equity"
+    assert small.start_equity == 2_000.0 and small.criteria["equity_source"] == "account"
+    res = small.result()
+    assert res.equity.iloc[0] == pytest.approx(2_000.0, rel=0.05)
+    assert "Capital supuesto: 2,000 USD (equity de la cuenta)" in small.summary_text()
+    # Tamaño en USD fijos: con menos capital el mismo PnL pesa más en %.
+    assert small.get("hour_pattern").oos_metrics["total_return_pct"] > base.get("hour_pattern").oos_metrics[
+        "total_return_pct"]
+    bad = optimize("ETH", "1h", bars, s, strategies=[HourPattern], clock=SimClock(T0), start_equity=-5)
+    assert bad.start_equity == s.paper_start_equity and any("no válido" in n for n in bad.notes)
+    assert OptimizationReport.from_dict(small.to_dict()).start_equity == 2_000.0
+
+
+def test_significance_correction_counts_every_strategy_even_if_one_is_requested(tmp_path):
+    """Pedir una estrategia sola no baja el listón (m = todas las que se pueden probar en la gráfica)."""
+    s = new_settings(tmp_path, bt_max_combos=8)
+    bars = make_candles(n=1500, interval="1h", vol_pct=0.6, seed=11)
+    one = optimize("BTC", "1h", bars, s, strategies=["squeeze_breakout"], clock=SimClock(T0))
+    assert one.criteria["compared"] == len(STRATEGIES)
+    e = one.get("squeeze_breakout")
+    assert e.oos_metrics["t_min"] == pytest.approx(required_t_stat(int(e.oos_metrics["n_trades"]), len(STRATEGIES)))
+
+
+def test_liquidity_strategies_are_not_validable_with_approximate_zones(tmp_path):
+    from desk.liquidity import historical_zones
+    s = new_settings(tmp_path, bt_max_combos=2, bt_folds=2)
+    bars = make_candles(n=900, interval="15m", vol_pct=0.4, seed=5)
+    rep = optimize("SOL", "15m", bars, s, strategies=["liquidity_sweep"], clock=SimClock(T0))
+    e = rep.get("liquidity_sweep")
+    assert not e.passed and any(r.startswith("no validable") for r in e.reasons)
+    assert any("no aprueba (no validable)" in n for n in rep.notes)
+    # Con zonas grabadas de verdad (aquí, unas dadas) ya no es "no validable" por eso.
+    given = optimize("SOL", "15m", bars, s, strategies=["liquidity_sweep"], clock=SimClock(T0),
+                     zones=historical_zones(bars, s)).get("liquidity_sweep")
+    assert not any(r.startswith("no validable") for r in given.reasons)

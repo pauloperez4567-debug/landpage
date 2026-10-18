@@ -27,9 +27,10 @@ medido **fuera de muestra**, en velas que el optimizador no vio al elegir:
   (``alfa`` = ``SIGNIFICANCE_ALPHA``, ``m`` = estrategias que se pueden probar en una gráfica: todas las de
   ``STRATEGIES`` aunque se pida una sola, corrección de Bonferroni; pedirlas de una en una no baja el listón).
   Con pocas operaciones sólo pasa una ventaja grande; es lo honesto. Tasa de falsos positivos por diseño: hasta
-  ``alfa`` (5 %) de las gráficas de ruido puro con "ganadora"; medido sobre 120 paseos aleatorios de 3000 velas,
-  4 (3 %). Repetir backtests de la misma gráfica (otros días, otra estrategia) hasta que uno apruebe vuelve a
-  subirla: la mesa pide "forzar" para activar si un informe reciente de la gráfica no la aprobó.
+  ``alfa`` (5 %) de las gráficas de ruido puro con "ganadora". Medido con todos los filtros (frenos en vivo y
+  parámetros adoptados incluidos) sobre 120 paseos aleatorios de 3000 velas: 3 (2,5 %). No es cero: un informe
+  aprobado sigue pudiendo ser suerte. Repetir backtests de la misma gráfica (otros días, otra estrategia) hasta que
+  uno apruebe vuelve a subirla: la mesa pide "forzar" para activar si un informe reciente de la gráfica no la aprobó.
 - Parámetros propuestos para adoptar = los mejores del **último** entrenamiento (su validación es el
   último tramo). La curva encadenada valida el *procedimiento* (reoptimizar en cada tramo), no esos
   parámetros fijos: por eso además deben ganar en su propio tramo (retorno > 0 y PF >= el mínimo), y el

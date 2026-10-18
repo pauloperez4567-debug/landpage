@@ -9,7 +9,8 @@ import pytest
 import requests
 
 from desk.clock import SimClock
-from desk.telegram_bot import AUTH_BACKOFF_S, BOT_HELP, MAX_BACKOFF_S, TelegramBot, translate_command
+from desk.telegram_bot import (AUTH_BACKOFF_S, BOT_HELP, MAX_BACKOFF_S, TelegramBot, command_target,
+                               translate_command)
 
 TOKEN = "987654321:AAF-token_super_secreto-QWE"
 OWNER = 555
@@ -53,6 +54,8 @@ class FakeTelegram:
             if isinstance(item, FakeResponse):
                 return item
             return FakeResponse(200, {"ok": True, "result": item})
+        if method == "getMe":
+            return FakeResponse(200, {"ok": True, "result": {"id": 1, "is_bot": True, "username": "MesaBot"}})
         if method == "sendMessage":
             self.log.append(f"send {json['chat_id']}")
             if self.send_error is not None:
@@ -125,9 +128,71 @@ def test_authorized_text_goes_to_submit_and_reply_threads_the_message():
 
 
 def test_chat_ids_accept_ints_and_strings():
-    bot, _, desk = make_bot([[upd(1, chat=-100123), upd(2, chat=OWNER)]], chats=[-100123, f" {OWNER} "])
+    group = upd(1, chat=-100123)
+    group["message"]["from"] = {"id": OWNER}
+    bot, _, desk = make_bot([[group, upd(2, chat=OWNER)]], chats=[-100123, f" {OWNER} "], user_ids=[OWNER])
     bot.poll_once()
     assert len(desk.calls) == 2
+
+
+def group_msg(uid, text, user, chat=-1001234567890, **extra):
+    u = upd(uid, text, chat=chat, **extra)
+    u["message"]["chat"]["type"] = "supergroup"
+    u["message"]["from"] = {"id": user, "username": f"u{user}"}
+    return u
+
+
+def test_group_without_user_ids_accepts_orders_from_nobody(debug_logs):
+    bot, session, desk = make_bot([[group_msg(1, "kill", 42), group_msg(2, "estado", OWNER)]],
+                                  chats=["-1001234567890"])
+    assert bot.group_without_users()
+    bot.poll_once()
+    assert desk.calls == [] and session.sent() == [] and bot.ignored == 2
+    assert "TELEGRAM_USER_IDS" in debug_logs.text
+
+
+def test_group_with_user_ids_only_listed_people_give_orders():
+    anon = group_msg(4, "reset halt", 1087968824)                       # admin anónimo (GroupAnonymousBot)
+    channel = group_msg(5, "long BTC 10u a mercado", OWNER, sender_chat={"id": -100777, "type": "channel"})
+    bot, _, desk = make_bot([[group_msg(1, "kill", 666), group_msg(2, "estado", OWNER),
+                              group_msg(3, "long BTC 10u a mercado", 777), anon, channel]],
+                            chats=["-1001234567890"], user_ids=[str(OWNER)])
+    bot.poll_once()
+    assert desk.calls == [("estado", "telegram")] and bot.ignored == 4
+
+
+def test_user_ids_also_apply_to_private_chats():
+    bot, _, desk = make_bot([[upd(1, "estado")]], user_ids=["12345"])
+    bot.poll_once()
+    assert desk.calls == [] and bot.ignored == 1
+
+
+def test_commands_addressed_to_another_bot_are_ignored():
+    assert command_target("/cierra_todo@OtroBot") == "OtroBot" and command_target("/estado") is None
+    assert command_target("long HYPE") is None
+    bot, _, desk = make_bot([[upd(1, "/cierra_todo@OtroBot"), upd(2, "/estado@mesabot"), upd(3, "/pausa")]])
+    bot.poll_once()
+    assert [t for t, _ in desk.calls] == ["estado", "pausa"]
+
+
+def test_without_own_name_addressed_commands_are_not_executed():
+    class NoMe(FakeTelegram):
+        def post(self, url, json=None, timeout=None, **kw):
+            if url.endswith("/getMe"):
+                raise requests.ConnectionError("sin red")
+            return super().post(url, json=json, timeout=timeout, **kw)
+
+    session = NoMe([[upd(1, "/kill@MesaBot"), upd(2, "kill")]])
+    desk = Desk()
+    bot = TelegramBot(TOKEN, [OWNER], desk.submit, clock=SimClock(NOW), session=session)
+    bot.poll_once()
+    assert desk.calls == [("kill", "telegram")]
+
+
+def test_label_prefixes_replies():
+    bot, session, _ = make_bot([[upd(1, "estado")]], label="SIM fast")
+    bot.poll_once()
+    assert session.sent()[0]["text"] == "[SIM fast] OK: estado"
 
 
 # --------------------------------------------------------------------------- comandos
@@ -225,18 +290,65 @@ def test_out_of_order_and_malformed_updates():
     assert [t for t, _ in desk.calls] == ["a", "b"] and bot.offset == 10
 
 
-def test_confirm_failure_does_not_block_processing(debug_logs):
+def test_confirm_failure_defers_execution_until_telegram_confirms(debug_logs):
+    """Sin confirmar el offset no se ejecuta: tras un reinicio Telegram reenviaría el update (dos ejecuciones)."""
     class FailingConfirm(FakeTelegram):
+        fail = True
+
         def post(self, url, json=None, timeout=None, **kw):
-            if url.endswith("getUpdates") and json.get("timeout") == 0:
+            if url.endswith("getUpdates") and json.get("timeout") == 0 and self.fail:
                 raise requests.ConnectionError(f"url: /bot{TOKEN}/getUpdates")
             return super().post(url, json=json, timeout=timeout, **kw)
 
-    session = FailingConfirm([[upd(1, "estado")]])
+    session = FailingConfirm([[upd(1, "long HYPE a mercado")], requests.ConnectionError("red caída"), []])
     desk = Desk()
     bot = TelegramBot(TOKEN, [OWNER], desk.submit, clock=SimClock(NOW), session=session)
-    assert bot.poll_once() == 1 and desk.calls == [("estado", "telegram")]
+    assert bot.poll_once() == 0 and desk.calls == [] and bot.offset == 2 and bot.backoff_s >= 1
+    assert bot.poll_once() == 0 and desk.calls == []           # el getUpdates siguiente falla: sigue pendiente
+    session.fail = False
+    assert bot.poll_once() == 1                                # getUpdates(offset=2) bien = confirmado: se ejecuta
+    assert desk.calls == [("long HYPE a mercado", "telegram")]
+    assert bot.poll_once() == 0 and len(desk.calls) == 1        # una sola vez
     assert TOKEN not in debug_logs.text
+
+
+def test_restart_after_failed_confirmation_executes_once():
+    """Proceso 1: la confirmación falla y se cae antes del siguiente getUpdates. Proceso 2: Telegram lo reenvía y
+    se ejecuta una vez (en total, una)."""
+    class Server(FakeTelegram):
+        def __init__(self):
+            super().__init__()
+            self.queue = [upd(1, "long HYPE a mercado")]
+            self.fail_confirm = True
+
+        def post(self, url, json=None, timeout=None, **kw):
+            method = url.rsplit("/", 1)[-1]
+            if method == "getUpdates":
+                off = json.get("offset")
+                if json.get("timeout") == 0 and self.fail_confirm:
+                    raise requests.ConnectionError("corte")
+                if off is not None:
+                    self.queue = [u for u in self.queue if u["update_id"] >= off]
+                return FakeResponse(200, {"ok": True, "result": [] if json.get("limit") == 1 else list(self.queue)})
+            return super().post(url, json=json, timeout=timeout, **kw)
+
+    srv = Server()
+    calls = []
+    TelegramBot(TOKEN, [OWNER], lambda t, source: calls.append(t) or "ok", clock=SimClock(NOW), session=srv).poll_once()
+    assert calls == []                                          # proceso 1 cae sin ejecutar
+    srv.fail_confirm = False
+    TelegramBot(TOKEN, [OWNER], lambda t, source: calls.append(t) or "ok", clock=SimClock(NOW), session=srv).poll_once()
+    assert calls == ["long HYPE a mercado"]
+
+
+def test_conflict_409_is_counted_and_reset():
+    busy = FakeResponse(409, {"ok": False, "description": "Conflict: terminated by other getUpdates request"})
+    bot, _, _ = make_bot([busy, busy, busy, []])
+    for _ in range(3):
+        bot.poll_once()
+    assert bot.conflicts == 3
+    bot.poll_once()
+    assert bot.conflicts == 0
 
 
 # --------------------------------------------------------------------------- errores y backoff

@@ -415,3 +415,61 @@ def test_5000_bars_backtest_under_100ms(settings, name):
         run_backtest(strat, bars, settings, coin="BTC", meta=meta)
         best = min(best, time.perf_counter() - t0)
     assert best < 0.100, f"{name}: {best * 1000:.1f} ms"
+
+
+# --- frenos del riesgo en vivo (halt por drawdown, pérdida diaria, cooldown) leídos de settings ---------------
+
+LOSS = (100.0, 100.5, 94.0, 95.0)
+
+
+def test_drawdown_halt_closes_and_stops_trading_like_the_live_risk(bt_settings):
+    """Con ``max_drawdown_pct`` = 2 % la segunda pérdida cruza el límite a mitad de vela: se cierra ahí ("halt",
+    antes que el SL) y la señal siguiente no se opera. Sin frenos (entrenamiento) se opera todo."""
+    rows = [FLAT, LOSS, FLAT, LOSS, FLAT, (100.0, 101.0, 99.0, 100.0), FLAT]
+    plan = {0: LONG_MKT, 2: LONG_MKT, 4: LONG_MKT}
+    bt_settings.max_drawdown_pct, bt_settings.daily_loss_limit_pct, bt_settings.max_consecutive_losses = 2.0, 50.0, 0
+    free, _ = run(bt_settings, rows, plan)
+    assert [t.exit_reason for t in free.trades] == ["sl", "sl", "end"] and "halted" not in free.metrics
+    res, bars = run(bt_settings, rows, plan, brakes=True)
+    assert [t.exit_reason for t in res.trades] == ["sl", "halt"]
+    halt = res.trades[1]
+    assert 95.0 < halt.exit_px < 100.0                         # el freno salta antes que el SL (95)
+    assert res.metrics["halted"] == 1.0 and res.metrics["halt_ts"] == ts(bars, 3) and res.metrics["n_blocked"] == 1
+    assert res.metrics["max_drawdown_pct"] == pytest.approx(2.0, abs=0.1)
+    # El mismo backtest con los límites por defecto (DD 2.7 % < 5 %) no se detiene: los frenos salen de settings.
+    bt_settings.max_drawdown_pct = 5.0
+    res5, _ = run(bt_settings, rows, plan, brakes=True)
+    assert [t.exit_reason for t in res5.trades] == ["sl", "sl", "end"] and res5.metrics["halted"] == 0.0
+
+
+def test_daily_loss_limit_blocks_entries_until_the_next_utc_day(bt_settings):
+    rows = [FLAT, LOSS] + [FLAT] * 26 + [(100.0, 101.0, 99.0, 100.0)]
+    plan = {0: LONG_MKT, 2: LONG_MKT, 25: LONG_MKT}
+    bt_settings.max_drawdown_pct, bt_settings.daily_loss_limit_pct, bt_settings.max_consecutive_losses = 50.0, 1.0, 0
+    res, bars = run(bt_settings, rows, plan, brakes=True)
+    entries = [pd.Timestamp(t.entry_ts, unit="s", tz="UTC") for t in res.trades]
+    assert entries == [bars.index[1], bars.index[26]]          # la señal del mismo día se pierde; la del siguiente no
+    assert res.metrics["daily_halts"] == 1 and res.metrics["n_blocked"] == 1 and res.metrics["halted"] == 0.0
+
+
+def test_losing_streak_cooldown_blocks_automatic_entries(bt_settings):
+    rows = [FLAT, LOSS, FLAT, LOSS, FLAT, FLAT, FLAT, FLAT, FLAT, (100.0, 101.0, 99.0, 100.0), FLAT]
+    plan = {0: LONG_MKT, 2: LONG_MKT, 4: LONG_MKT, 8: LONG_MKT}
+    bt_settings.max_drawdown_pct, bt_settings.daily_loss_limit_pct = 50.0, 50.0
+    bt_settings.max_consecutive_losses, bt_settings.loss_cooldown_minutes = 2, 180
+    res, bars = run(bt_settings, rows, plan, brakes=True)
+    assert [t.entry_ts for t in res.trades] == [ts(bars, 1), ts(bars, 3), ts(bars, 9)]
+    assert res.metrics["cooldowns"] == 1 and res.metrics["n_blocked"] == 1
+
+
+def test_brakes_state_carries_over_between_chained_runs(bt_settings):
+    """Los tramos fuera de muestra encadenados comparten el estado de los frenos: tras un halt no se opera más."""
+    from desk.backtest import LiveBrakes
+    rows = [FLAT, LOSS, FLAT, LOSS, FLAT, (100.0, 101.0, 99.0, 100.0), FLAT, FLAT, FLAT]
+    bt_settings.max_drawdown_pct, bt_settings.daily_loss_limit_pct, bt_settings.max_consecutive_losses = 2.0, 50.0, 0
+    brakes = LiveBrakes.from_settings(bt_settings)
+    plan = {0: LONG_MKT, 2: LONG_MKT, 4: LONG_MKT, 6: LONG_MKT}
+    first, bars = run(bt_settings, rows, plan, brakes=brakes, trade_from=0)
+    assert brakes.halted and first.trades[-1].exit_reason == "halt"
+    later, _ = run(bt_settings, rows, plan, brakes=brakes, trade_from=5)
+    assert later.trades == [] and later.metrics["halted"] == 1.0

@@ -119,9 +119,13 @@ DD_WARN_FRAC = 0.8           # aviso al consumir el 80 % del drawdown máximo
 WARN_REARM_FRAC = 0.1        # histéresis: los avisos de consumo se rearman al bajar 10 puntos del umbral
 STALE_CHECK_S = 60.0         # cada cuánto se comprueba la frescura de los datos de las posiciones abiertas
 ERROR_STREAK_WARN = 3        # ciclos seguidos con fallos que disparan un aviso (y luego 10, 50, 100...)
+TELEGRAM_CONFLICT_WARN = 3   # 409 seguidos de getUpdates: otro proceso lee este bot (aviso crítico)
 BT_MIN_BARS = 2 * MIN_SEGMENT_BARS   # un tramo de entrenamiento y uno de validación como mínimo
 DEFAULT_BT_INTERVAL = "1h"   # temporalidad de "backtest COIN" sin temporalidad (ni estrategia)
 REPORT_STALE_DAYS = 30.0     # al activar un informe más antiguo se sugiere repetirlo
+# Una señal se ejecuta al cierre de su vela (el backtest entra en el open de la siguiente). Si la mesa la ve más tarde
+# (reinicio, fallos de datos, backoff) no se opera: como mucho max(SIGNAL_MAX_LATE_S, 3 ciclos), y media vela.
+SIGNAL_MAX_LATE_S = 120.0
 
 # Acciones de la IA que se ejecutan sin confirmar (no abren ni cierran nada, o sólo frenan). Un backtest sólo
 # lee velas y escribe un informe; silenciar avisos no toca dinero.
@@ -134,6 +138,9 @@ def _hhmm(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+_LOG_LEVELS = {"info": logging.INFO, "warn": logging.WARNING, "critical": logging.CRITICAL}
+
+
 def _alert_level(level: int) -> str:
     """Nivel de ``logging`` → nivel de aviso ("info" | "warn" | "critical")."""
     if level >= logging.ERROR:
@@ -141,6 +148,16 @@ def _alert_level(level: int) -> str:
     if level >= logging.WARNING:
         return "warn"
     return "info"
+
+
+def desk_identity(settings: Settings, sim_clock: bool = False) -> str:
+    """Identidad de la mesa para los avisos de red y las respuestas de Telegram: ``LIVE mainnet``, ``LIVE testnet``,
+    ``PAPER``, ``SIM`` / ``SIM fast`` (datos sim o replay; ``fast`` = reloj simulado)."""
+    if settings.is_live:
+        return f"LIVE {'mainnet' if settings.hl_mainnet else 'testnet'}"
+    if settings.data_source != "hyperliquid" or sim_clock:
+        return "SIM fast" if sim_clock else "SIM"
+    return "PAPER"
 
 
 def _strategy_key(name: Optional[str]) -> str:
@@ -204,10 +221,20 @@ class TradingDesk:
         self.strategies = strategies if strategies is not None else build_strategies(settings, clock)
         # --- fase 2: avisos, alarmas, playbook, informes, backtests y Telegram ---
         self.sim_clock = isinstance(clock, SimClock)
+        self.identity = desk_identity(settings, self.sim_clock)
+        # Una simulación (datos sim/replay o reloj simulado) no usa Telegram ni el webhook salvo DESK_TELEGRAM_IN_SIM:
+        # con el .env de la mesa real competiría por sus órdenes y mandaría avisos simulados al chat real.
+        simulated = self.sim_clock or settings.data_source != "hyperliquid"
+        self.network_alerts = not simulated or bool(settings.telegram_in_sim)
+        self.notices: list[str] = []              # avisos de arranque (se muestran con el banner)
+        if not self.network_alerts and (settings.telegram_bot_token or settings.webhook_url):
+            self.notices.append("Simulación: Telegram y el webhook quedan DESACTIVADOS (no compite con la mesa real "
+                                "por las órdenes del bot ni manda avisos simulados a su chat). DESK_TELEGRAM_IN_SIM="
+                                "true para usarlos aquí.")
         # La pantalla (``out``) es un canal más del Notifier: un aviso silenciado o repetido no se pinta.
         self.notifier = notifier if notifier is not None else build_notifier(
             settings, out=self._emit if out is not None else None, console=out is not None, clock=clock,
-            session=http_session)
+            session=http_session, network=self.network_alerts, label=self.identity)
         self._screen_via_notifier = any(isinstance(ch, ConsoleChannel) for ch in self.notifier.channels)
         self.alerts = alerts if alerts is not None else AlertManager(settings, clock, self.journal.dir, self.notifier)
         self.playbook = playbook if playbook is not None else Playbook(self.journal.dir, clock)
@@ -246,13 +273,13 @@ class TradingDesk:
         self.started_ts = clock.now()
         self.stage_ok_ts: dict[str, float] = {}    # última vez que cada etapa terminó bien (salud)
         self._close_failures_seen: dict[str, str] = {}
+        self._flatten_seen: tuple = ((), ())       # último (cierres enviados, entradas sin cancelar) avisado
         # Detección de depósitos / retiradas: cuenta de referencia y lo que las ejecuciones explican desde ella.
         self._flow_base: Optional[tuple[float, float, dict[str, float], float]] = None
         self._flow_pnl = 0.0
         self._flow_sizes: dict[str, float] = {}
 
         state = self.journal.load_json(STATE_NAME, None)
-        self.notices: list[str] = []              # avisos de arranque (se muestran con el banner)
         if not isinstance(state, dict):
             state = {}
             # Sin estado válido de la mesa (desk.json borrado o ilegible) el historial del inbox ya se ejecutó en
@@ -304,13 +331,18 @@ class TradingDesk:
         """``TelegramBot`` si hay ``TELEGRAM_BOT_TOKEN`` (se arranca en ``run_forever``). Sin chats autorizados
         arranca igual: ignora todo y registra el id de quien escribe (así se descubre el chat id)."""
         token = str(self.settings.telegram_bot_token or "").strip()
-        if not token:
+        if not token or not self.network_alerts:
             return None
         from .telegram_bot import MAX_AGE_S, TelegramBot
         chats = [str(c).strip() for c in self.settings.telegram_chat_ids or [] if str(c).strip()]
+        users = [str(u).strip() for u in self.settings.telegram_user_ids or [] if str(u).strip()]
         # Con reloj simulado la "edad" de un mensaje no tiene sentido: no se descartan por antiguos.
-        return TelegramBot(token, chats, self.submit, self.clock, session=session,
-                           max_age_s=None if self.sim_clock else MAX_AGE_S)
+        bot = TelegramBot(token, chats, self.submit, self.clock, session=session,
+                          max_age_s=None if self.sim_clock else MAX_AGE_S, user_ids=users, label=self.identity)
+        if bot.group_without_users():
+            self.notices.append("Telegram: hay un grupo autorizado (TELEGRAM_CHAT_ID negativo) sin TELEGRAM_USER_IDS: "
+                                "en él nadie puede dar órdenes. Añade los ids de usuario de quien opera.")
+        return bot
 
     # ================================================================== utilidades
     def _emit(self, text: str) -> None:
@@ -340,13 +372,19 @@ class TradingDesk:
             self._emit(text)
 
     def _flush_engine(self, target: Optional[list[str]] = None) -> None:
+        """Mensajes del motor: a ``target`` (respuesta de un comando) o como avisos con el nivel que les da el motor
+        (``EngineMessage.level``: posición sin SL, cierre de seguridad, liquidación... son críticos: no se silencian,
+        suenan y llegan al webhook) y su clave anti-spam por moneda y tipo."""
         for m in self.engine.pop_messages():
             if target is not None:
                 target.append(m)
-            else:
-                warn = m.split(":", 1)[-1].lstrip().startswith("ATENCIÓN") or "por seguridad" in m
-                self.notify(m, logging.WARNING if warn else logging.INFO,
-                            kind="trade" if " cerrada por " in m else "exec")
+                continue
+            level = getattr(m, "level", None)
+            if level is None:                    # texto suelto (motor inyectado): criterio por el texto
+                level = "warn" if (m.split(":", 1)[-1].lstrip().startswith("ATENCIÓN") or "por seguridad" in m) \
+                    else "info"
+            self.notify(str(m), _LOG_LEVELS.get(level, logging.INFO), kind="trade" if " cerrada por " in m else "exec",
+                        key=getattr(m, "key", None))
 
     def _next_id(self) -> str:
         self.cmd_seq += 1
@@ -1475,13 +1513,25 @@ class TradingDesk:
                 self.notify(f"{n} entrada(s) pendientes canceladas por el halt.", kind="halt")
         if EVENT_FLATTEN in events:
             reason = "kill" if self.risk.halt_reason == "kill" else "flatten"
-            had_pending = any(b.status == PENDING for b in self.engine.brackets.values())
+            pending_before = sorted(c for c, b in self.engine.brackets.items() if b.status == PENDING)
             orders = self.engine.close_all(reason)
             failed = dict(self.engine.close_failures)
-            if orders or had_pending:
+            stuck = sorted(c for c, b in self.engine.brackets.items() if b.status == PENDING)
+            if orders or pending_before:
                 acted = True
-                self.notify(f"Riesgo ({self.risk.halt_reason}): cerrando {len(orders)} posición(es) a mercado.",
-                            logging.CRITICAL, kind="halt")
+            # Se avisa cuando cambia lo que pasa (cierres enviados, entradas que no se pueden cancelar), no en cada
+            # ciclo: con una cancelación que falla siempre, el flatten se repite cada ciclo.
+            state = (tuple(sorted(o.coin for o in orders)), tuple(stuck))
+            if (orders or stuck) and state != self._flatten_seen:
+                parts = []
+                if orders:
+                    parts.append(f"cerrando {len(orders)} posición(es) a mercado ({', '.join(state[0])})")
+                if stuck:
+                    ids = ", ".join(f"{c} {self.engine.brackets[c].entry_order_id or '?'}" for c in stuck)
+                    parts.append(f"entrada(s) pendientes SIN PODER CANCELAR ({ids}): se reintenta en cada ciclo")
+                self.notify(f"Riesgo ({self.risk.halt_reason}): " + "; ".join(parts) + ".", logging.CRITICAL,
+                            kind="halt", key=f"flatten:{reason}")
+            self._flatten_seen = state
             if failed and failed != self._close_failures_seen:
                 self.notify("Riesgo: SIN CERRAR todavía: " + "; ".join(f"{c} ({why})" for c, why in sorted(failed.items()))
                             + ". Se reintenta en cada ciclo.", logging.CRITICAL, kind="halt")
@@ -1562,31 +1612,36 @@ class TradingDesk:
         return out
 
     def _stage_strategies(self) -> None:
+        """Cada ``strategy_seconds`` y, además, en el primer ciclo tras el cierre de una vela de cualquier gráfica en
+        automático (la señal se ejecuta al cierre, como en el backtest, que entra en el open de la vela siguiente).
+
+        Lo que no se puede operar al cierre de la vela (automático OFF, pausa, halt, cooldown, moneda ocupada,
+        ``max_open_positions``) se da por visto en esa vela: igual que en el backtest, una señal que llega con la
+        moneda ocupada se pierde y nunca se ejecuta tarde, a mitad de la vela siguiente."""
         now = self.clock.now()
-        if now - self._last_strategy_ts < self.settings.strategy_seconds:
+        slots = self.auto_slots()
+        last = self._last_strategy_ts
+        if now - last < self.settings.strategy_seconds and not self._candle_closed_between(slots, last, now):
             return
         self._last_strategy_ts = now
-        if not self.auto_enabled:
-            return
-        slots = self.auto_slots()
         if not slots:
             return
-        block = self.risk.block_reason("auto")
+        block = self.risk.block_reason("auto") if self.auto_enabled else "automático OFF"
         if block:
             log.debug("auto en espera: %s", block)
+            self._skip_slots(slots, now)
             return
         account = self.broker.account()
         busy = {c for c, p in account.positions.items() if p.size != 0}
         busy |= {o.coin for o in account.open_orders if o.is_open and not o.reduce_only}
         busy |= set(self.engine.brackets)
-        if len(busy) >= self.settings.max_open_positions:
-            return
         by_coin: dict[str, list[AutoSlot]] = {}
         for slot in slots:
             by_coin.setdefault(slot.coin, []).append(slot)
         failures: list[str] = []
         for coin, coin_slots in by_coin.items():
-            if coin in busy:
+            if coin in busy or len(busy) >= self.settings.max_open_positions:
+                self._skip_slots(coin_slots, now)
                 continue
             try:
                 opened = self._auto_coin(coin, coin_slots, now, failures)
@@ -1599,21 +1654,48 @@ class TradingDesk:
             self._coin_errors.pop(coin, None)
             if opened:
                 busy.add(coin)
-                if len(busy) >= self.settings.max_open_positions:
-                    break
         if failures:
             # Las demás estrategias y monedas ya se evaluaron; la etapa queda marcada como fallida (una vez por vela).
             raise RuntimeError("estrategias con error: " + "; ".join(failures))
 
+    @staticmethod
+    def _candle_closed_between(slots: list[AutoSlot], last: float, now: float) -> bool:
+        """True si entre ``last`` y ``now`` cerró una vela de alguna de las temporalidades de ``slots``."""
+        if not math.isfinite(last):
+            return True
+        for sec in {interval_seconds(sl.strategy.interval) for sl in slots}:
+            if math.floor(now / sec) != math.floor(last / sec):
+                return True
+        return False
+
+    def _skip_slots(self, slots: list[AutoSlot], now: float) -> None:
+        """Da por vista la última vela cerrada de cada ranura (su señal, si la hay, no se ejecutará tarde)."""
+        for slot in slots:
+            sec = interval_seconds(slot.strategy.interval)
+            self._bar_seen[(slot.coin, slot.label)] = math.floor(now / sec) * sec
+
+    def _signal_late_limit(self, sec: float) -> float:
+        """Retraso máximo (s) desde el cierre de la vela para operar su señal."""
+        return min(max(SIGNAL_MAX_LATE_S, 3.0 * float(self.settings.loop_seconds)), sec / 2.0)
+
     def _auto_coin(self, coin: str, slots: list[AutoSlot], now: float, failures: list[str]) -> bool:
         """Evalúa las estrategias de ``coin`` (una vez por vela cerrada cada una). True si abrió una operación.
-        Una estrategia que lanza se apunta en ``failures`` y no frena a las demás."""
+        Una estrategia que lanza se apunta en ``failures`` y no frena a las demás. Una vela que cerró hace más de
+        ``_signal_late_limit`` (reinicio, fallos de datos) no se evalúa: su entrada ya no sería la del backtest."""
         due = []
         for slot in slots:
             sec = interval_seconds(slot.strategy.interval)
-            bar = math.floor(now / sec) * sec            # apertura de la vela en curso
-            if self._bar_seen.get((coin, slot.label)) != bar:
-                due.append((slot, bar))
+            bar = math.floor(now / sec) * sec            # apertura de la vela en curso = cierre de la evaluada
+            if self._bar_seen.get((coin, slot.label)) == bar:
+                continue
+            late = now - bar
+            if late > self._signal_late_limit(sec):
+                self._bar_seen[(coin, slot.label)] = bar
+                log.info("auto %s %s: la vela cerró hace %.0f s (máx. %.0f s): no se evalúa (la entrada ya no sería la "
+                         "del backtest, al open de la vela siguiente)", coin, slot.label, late,
+                         self._signal_late_limit(sec))
+                continue
+            due.append((slot, bar))
         if not due:
             return False
         mid = self.market.mid(coin)
@@ -1670,10 +1752,22 @@ class TradingDesk:
         return ok
 
     def _stage_alerts(self) -> None:
-        """Alarmas del usuario (``AlertManager.evaluate`` nunca lanza) y frescura de los datos de las posiciones."""
+        """Alarmas del usuario (``AlertManager.evaluate`` nunca lanza), frescura de los datos de las posiciones y
+        conflicto del bot de Telegram."""
         self.alerts.evaluate(self.market, self.scanner)
         self._check_stale_data()
+        self._check_telegram_conflict()
 
+    def _check_telegram_conflict(self) -> None:
+        """Crítico si Telegram responde 409 una y otra vez: otro proceso (otra mesa, una simulación) lee este bot y
+        las órdenes que el operador manda pueden estar yendo a esa otra mesa."""
+        bot = self.telegram
+        n = int(getattr(bot, "conflicts", 0) or 0) if bot is not None else 0
+        if n >= TELEGRAM_CONFLICT_WARN:
+            self.notify(f"Telegram: {n} respuestas 409 seguidas: OTRO PROCESO está leyendo este bot (otra mesa, una "
+                        "simulación o un webhook configurado). Tus órdenes por Telegram pueden estar llegando a esa otra "
+                        "mesa y no a esta: para el otro proceso o usa otro bot.", logging.CRITICAL, kind="telegram",
+                        key="telegram_conflict")
     def _check_stale_data(self) -> None:
         """Aviso (warn, con anti-spam por moneda) si el precio de una moneda con posición abierta lleva más de
         ``max_data_age_seconds`` sin actualizarse según el exchange: los SL/TP siguen en el exchange, pero la mesa

@@ -35,8 +35,9 @@ Semántica (lo que el usuario puede esperar):
 - **Velas cerradas.** Los indicadores se calculan con velas cerradas de ``interval`` (la vela en curso se
   descarta) y cada alarma se evalúa una vez por vela; el mercado se consulta una vez por ciclo y moneda
   (caché por ciclo) y sólo cuando alguna alarma tiene una vela nueva pendiente.
-- ``zone``: el precio entra en la zona de liquidez vista en el ciclo anterior (LONG: precio <= borde
-  superior de la zona; SHORT: precio >= borde inferior). Las zonas se recalculan cada ciclo con el precio.
+- ``zone``: el precio llega a la zona de liquidez vista en el ciclo anterior: a su centro, la entrada (LONG:
+  precio <= centro; SHORT: precio >= centro). No basta con el borde: el tramo más cercano empieza en el mid de
+  entonces y dispararía con el precio quieto. Las zonas se recalculan cada ciclo con el precio.
 - ``volume_spike``: volumen de la vela >= ``mult`` veces la media de las ``lookback`` anteriores.
 - ``move_pct``: |cierre / cierre anterior - 1| >= ``pct`` % (la ventana es una vela de ``interval``).
 - ``repeat=False`` (por defecto): dispara una vez y se elimina. ``repeat=True``: puede volver a disparar,
@@ -172,6 +173,16 @@ def _ts(t: Any) -> float:
     return float(pd.Timestamp(t).timestamp())
 
 
+def norm_coin(coin: Any) -> str:
+    """Moneda tal como la usa el exchange: ticker en mayúsculas; un activo HIP-3 conserva el prefijo del dex en
+    minúsculas (``xyz:gold`` -> ``xyz:GOLD``; con ``XYZ:GOLD`` Hyperliquid no devuelve libro)."""
+    c = str(coin or "").strip()
+    if ":" in c:
+        dex, _, name = c.partition(":")
+        return f"{dex.strip().lower()}:{name.strip().upper()}"
+    return c.upper()
+
+
 @dataclass
 class AlertRule:
     id: int
@@ -205,7 +216,7 @@ class AlertRule:
         data = {k: v for k, v in dict(d).items() if k in known}
         rule = cls(**data)
         rule.id = int(rule.id)
-        rule.coin = str(rule.coin).upper()
+        rule.coin = norm_coin(rule.coin)
         rule.params = dict(rule.params or {})
         rule.state = dict(rule.state or {})
         rule.cooldown_s = float(rule.cooldown_s)
@@ -439,7 +450,7 @@ class AlertManager:
         kind = str(spec.get("kind") or "").strip().lower()
         if kind not in KINDS:
             raise ValueError(f"tipo de alarma desconocido: {kind or '(vacío)'!r}. Tipos: {', '.join(KINDS)}")
-        coin = str(coin or spec.get("coin") or "").strip().upper()
+        coin = norm_coin(coin or spec.get("coin") or "")
         if not coin:
             raise ValueError("falta la moneda de la alarma")
         params: dict[str, Any] = {}
@@ -559,8 +570,11 @@ class AlertManager:
                 if z is None:
                     continue
                 low, high, usd, source = z
-                if (px <= high) if side == "long" else (px >= low):
-                    detail = (f"precio {fmt_px(px)} entra en la zona de liquidez {side.upper()} "
+                # Llegar al centro (la entrada) de la zona vista, no a su borde: el tramo más cercano empieza en el
+                # mismo precio (su borde es el mid de entonces) y "entrar" sin moverse sería un falso aviso.
+                center = (low + high) / 2.0
+                if (px <= center) if side == "long" else (px >= center):
+                    detail = (f"precio {fmt_px(px)} llega a la zona de liquidez {side.upper()} "
                               f"{fmt_px(low)}-{fmt_px(high)} ({source}, {fmt_usd(usd, sign=False)})")
                     break
         if zones is not None:
