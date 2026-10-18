@@ -704,3 +704,57 @@ después: `telegram_user_ids` (`TELEGRAM_USER_IDS`) y `telegram_in_sim` (`DESK_T
   simulada del estado (`resume_clock_ts`) o en el ancla; `--csv` = `ReplayMarketData(offset=0)` con el reloj al final
   del CSV. Informes en `<state>/reports` (con datos sim/replay, `state/fast` por defecto: nunca junto a la mesa real).
   Código de salida 0 aunque no haya ganadora; 2 por argumentos inválidos; 1 si no hay datos.
+
+---
+
+# Fase 3: perfil de riesgo agresivo (`DESK_RISK_PROFILE=agresivo`)
+
+Objetivo: crecimiento compuesto agresivo pero controlado de una cuenta pequeña (≈ $500). El perfil por defecto
+(`prop`, tipo evaluación de fondeo) **no cambia**: todos los tests existentes siguen igual.
+
+## Configuración
+- `risk_profile: "prop" | "agresivo"` (`DESK_RISK_PROFILE`). Con `agresivo`, `load_settings` aplica estos valores
+  **salvo los que el usuario fije explícitamente** por entorno u overrides:
+  `risk_ladder=[1.25, 2.0, 2.5, 3.0]` (% de riesgo por operación, niveles L0–L3), `risk_ladder_start=1`,
+  `daily_loss_limit_r=3` (límite diario = 3 × riesgo vigente al inicio del día UTC), `weekly_loss_limit_pct=10`,
+  `max_drawdown_pct=30` (kill), `dd_brakes=[(12,0.75),(18,0.5),(24,0.25)]` (umbral de DD % → multiplicador sobre el
+  riesgo de L1), `max_open_positions=3`, `max_open_risk_pct=6`, `max_same_side_risk_pct=4`, `max_gross_leverage=5`,
+  `min_sl_pct=1.0`, `liq_buffer_mult=2.0`, `ladder_window=60`, `ladder_eval_every=10`, `ladder_up_pf=1.35`,
+  `ladder_down_pf=0.90`, `ladder_up_hwm_frac=0.98`, `ladder_new_strategy_trades=30`, `euphoria_week_pct=25`,
+  `taper_equity_usd=10000` (por encima, techo L2), `max_consecutive_losses=10`, `loss_cooldown_minutes=1440`,
+  `daily_stop_streak_days=3`, `strategy_disable_pf=1.0` (ventana 100), `slippage_alert_mult=2.0`,
+  `auto_default_strategies=False`, `bt_default_days=180`, `bt_min_trades=100`, `bt_min_profit_factor=1.3`,
+  `bt_min_expectancy_r=0.12`.
+- Todos los campos nuevos existen también en `prop` con valores que reproducen el comportamiento actual (escalera
+  desactivada = un solo nivel `risk_per_trade_pct`, sin freno semanal, sin topes nuevos) y tienen variable `DESK_*`
+  documentada en `.env.example`.
+
+## Reglas (RiskManager)
+1. **Riesgo vigente** = `risk_ladder[nivel]`; con DD desde el máximo ≥ umbral de `dd_brakes` → `risk_ladder[1] × mult`
+   (el más severo que aplique). Estrategia con menos de `ladder_new_strategy_trades` operaciones reales → como mucho L0.
+   Equity ≥ `taper_equity_usd` → como mucho L2. Semana anterior ≥ `euphoria_week_pct` → como mucho L2 esa semana.
+2. **Base de tamaño con trinquete**: riesgo en USD = riesgo vigente × `min(equity actual, equity al inicio de la semana
+   UTC (lunes 00:00))`. Baja al instante, sube una vez por semana.
+3. **Escalera**: cada `ladder_eval_every` operaciones cerradas, con las últimas `ladder_window` (en R): PF ≥ `ladder_up_pf`
+   y equity ≥ `ladder_up_hwm_frac` × máximo → +1 nivel (techo L3); PF < `ladder_down_pf` → −1 nivel (suelo L0).
+   Nunca se baja por una racha corta. Comando `nivel N` permite **bajar** manualmente cuando quieras; subir por encima del
+   nivel ganado se rechaza.
+4. **Límites**: diario = `daily_loss_limit_r` × riesgo vigente al inicio del día (sin entradas hasta 00:00 UTC);
+   semanal `weekly_loss_limit_pct` (halt hasta el lunes 00:00 UTC y la semana siguiente empieza un nivel más abajo);
+   `max_drawdown_pct` → kill (cerrar todo, auto off, sólo `reset halt`); `daily_stop_streak_days` días seguidos tocando el
+   stop diario → halt que exige `reset halt`.
+5. **Topes de cartera** en `evaluate`: riesgo abierto total (posiciones + entradas pendientes, distancia al SL × tamaño)
+   ≤ `max_open_risk_pct` del equity; misma dirección ≤ `max_same_side_risk_pct`; notional bruto ≤ `max_gross_leverage` ×
+   equity; SL a menos de `min_sl_pct` → rechazo (las comisiones se comerían el riesgo); liquidación a menos de
+   `liq_buffer_mult` × distancia del SL → bajar apalancamiento o rechazar.
+6. **Por estrategia**: PF de las últimas 100 operaciones < `strategy_disable_pf` → se desactiva esa estrategia/gráfica del
+   automático y se avisa (re-backtest). Deslizamiento medio real > `slippage_alert_mult` × el modelado → aviso y −1 nivel.
+7. `record_trade_result(pnl, r_multiple=None, strategy=None)`: R = PnL / riesgo en USD al entrar (lo aporta la mesa).
+
+## Integración
+- Mesa: tamaño y bloqueos vía RiskManager; avisos (cambio de nivel, frenos, stop semanal, kill, freno de euforia);
+  `estado` y `status.json` muestran nivel, riesgo vigente, base de tamaño, PnL de la semana y consumo de límites; panel.
+- Backtest/optimizador: el simulador aplica el mismo perfil (escalera, trinquete, frenos, límites diario/semanal,
+  topes) leyendo `settings`, para que el informe refleje la operativa real.
+- Persistencia: el estado de la escalera (nivel, nivel ganado, historial R por estrategia, semana, rachas) en `to_dict`,
+  compatible con estados antiguos.
